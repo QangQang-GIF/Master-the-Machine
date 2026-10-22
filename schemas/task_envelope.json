@@ -1,0 +1,96 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "TaskEnvelope",
+  "type": "object",
+  "required": [
+    "task_id",
+    "task_type",
+    "title",
+    "description",
+    "repository_path",
+    "base_revision",
+    "points",
+    "selected_skills",
+    "time_budget_seconds"
+  ],
+  "properties": {
+    "task_id": {
+      "type": "string",
+      "description": "Unique identifier of the task (e.g. BUG-01, CR-05)"
+    },
+    "task_type": {
+      "type": "string",
+      "enum": ["BUG", "CR", "TASK", "PI"],
+      "description": "Classification of the backlog item"
+    },
+    "title": {
+      "type": "string",
+      "description": "Short summary of the task"
+    },
+    "description": {
+      "type": "string",
+      "description": "Detailed task instructions or bug report"
+    },
+    "repository_path": {
+      "type": "string",
+      "description": "Absolute or relative path to the working repository / worktree"
+    },
+    "base_revision": {
+      "type": ["string", "null"],
+      "description": "Base Git commit hash before changes"
+    },
+    "deadline_epoch": {
+      "type": ["number", "null"],
+      "description": "Unix timestamp in seconds when the task deadline expires"
+    },
+    "points": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Maximum points for passing this task"
+    },
+    "mvs": {
+      "type": ["array", "null"],
+      "items": {
+        "type": "object",
+        "required": ["id"],
+        "properties": {
+          "id": { "type": "string" },
+          "description": { "type": "string" }
+        }
+      },
+      "description": "Minimum Viable Solution tests officially announced by Game Master"
+    },
+    "evidence_required": {
+      "type": "array",
+      "items": { "type": "string" },
+      "default": []
+    },
+    "selected_skills": {
+      "type": "array",
+      "items": { "type": "string" },
+      "minItems": 1,
+      "description": "Skills dispatched to the worker"
+    },
+    "model": {
+      "type": ["string", "null"],
+      "description": "LLM model requested for this worker execution"
+    },
+    "reasoning_effort": {
+      "type": "string",
+      "enum": ["low", "medium", "high", "xhigh", "max"],
+      "default": "medium"
+    },
+    "time_budget_seconds": {
+      "type": "integer",
+      "minimum": 10,
+      "default": 420
+    },
+    "limits": {
+      "type": "object",
+      "properties": {
+        "network": { "type": "string", "enum": ["none", "scoped", "full"] },
+        "allowed_paths": { "type": "array", "items": { "type": "string" } }
+      }
+    }
+  }
+}

@@ -1,0 +1,25 @@
+{
+  "task_id": "BUG-01",
+  "task_type": "BUG",
+  "title": "Fix off-by-one division in calculate_discount",
+  "description": "In calculator.py, calculate_discount returns zero when price is equal to discount threshold.",
+  "repository_path": "tests/fixtures/sample_repo",
+  "base_revision": "HEAD",
+  "deadline_epoch": null,
+  "points": 200,
+  "mvs": [
+    {
+      "id": "MVS-1",
+      "description": "test_discount_threshold_exact must pass"
+    }
+  ],
+  "evidence_required": ["test_log"],
+  "selected_skills": ["mtm-bug-worker", "mtm-verification"],
+  "model": "gpt-6.1-sol",
+  "reasoning_effort": "low",
+  "time_budget_seconds": 180,
+  "limits": {
+    "network": "none",
+    "allowed_paths": ["tests/fixtures/sample_repo"]
+  }
+}

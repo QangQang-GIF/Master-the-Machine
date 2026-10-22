@@ -1,0 +1,22 @@
+{
+  "task_id": "BUG-01",
+  "status": "READY_FOR_REVIEW",
+  "skill_ids": ["mtm-bug-worker@0.1.0", "mtm-verification@0.1.0"],
+  "changed_files": ["calculator.py"],
+  "test_results": [
+    {
+      "command": "pytest test_calculator.py",
+      "passed": true
+    }
+  ],
+  "evidence_paths": ["test_evidence.log"],
+  "git_revision": "a1b2c3d4",
+  "unresolved_risks": [],
+  "elapsed_seconds": 12.5,
+  "usage": {
+    "input_tokens": 1200,
+    "cached_input_tokens": 400,
+    "output_tokens": 150,
+    "credits": null
+  }
+}

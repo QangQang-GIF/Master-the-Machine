@@ -1,0 +1,28 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "SkillEvaluation",
+  "type": "object",
+  "required": [
+    "skill_id",
+    "version",
+    "evaluated_at",
+    "metrics",
+    "promoted"
+  ],
+  "properties": {
+    "skill_id": { "type": "string" },
+    "version": { "type": "string" },
+    "evaluated_at": { "type": "string" },
+    "metrics": {
+      "type": "object",
+      "required": ["pass_rate", "avg_elapsed_seconds", "avg_tokens"],
+      "properties": {
+        "pass_rate": { "type": "number", "minimum": 0, "maximum": 1 },
+        "avg_elapsed_seconds": { "type": "number", "minimum": 0 },
+        "avg_tokens": { "type": "number", "minimum": 0 }
+      }
+    },
+    "promoted": { "type": "boolean" },
+    "notes": { "type": "string" }
+  }
+}

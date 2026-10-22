@@ -1,0 +1,68 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "WorkerResult",
+  "type": "object",
+  "required": [
+    "task_id",
+    "status",
+    "skill_ids",
+    "changed_files",
+    "test_results",
+    "evidence_paths",
+    "elapsed_seconds"
+  ],
+  "properties": {
+    "task_id": {
+      "type": "string"
+    },
+    "status": {
+      "type": "string",
+      "enum": ["READY_FOR_REVIEW", "BLOCKED", "TIMED_OUT", "FAILED", "ESCALATE"]
+    },
+    "skill_ids": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "changed_files": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "test_results": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["command", "passed"],
+        "properties": {
+          "command": { "type": "string" },
+          "passed": { "type": "boolean" },
+          "output": { "type": "string" }
+        }
+      }
+    },
+    "evidence_paths": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "git_revision": {
+      "type": ["string", "null"]
+    },
+    "unresolved_risks": {
+      "type": "array",
+      "items": { "type": "string" },
+      "default": []
+    },
+    "elapsed_seconds": {
+      "type": "number",
+      "minimum": 0
+    },
+    "usage": {
+      "type": "object",
+      "properties": {
+        "input_tokens": { "type": ["integer", "null"] },
+        "cached_input_tokens": { "type": ["integer", "null"] },
+        "output_tokens": { "type": ["integer", "null"] },
+        "credits": { "type": ["number", "null"] }
+      }
+    }
+  }
+}

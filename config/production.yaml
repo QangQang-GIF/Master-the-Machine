@@ -1,0 +1,17 @@
+mode: production
+supervisor: none
+skills:
+  registry_dir: .agents/skills
+  mutable: false
+  allow_evolution: false
+  frozen_manifest: releases/prod_manifest.json
+  verify_checksums: true
+runtime:
+  default_timeout_seconds: 420
+  concurrency_limit: 1
+  log_level: INFO
+  trace_logging: true
+  submission:
+    once_only: true
+    require_evidence: true
+    require_mvs_passed: true
