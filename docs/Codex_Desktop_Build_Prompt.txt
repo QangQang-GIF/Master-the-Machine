@@ -1,0 +1,28 @@
+Act as the development supervisor and lead engineer for a Skill-Driven Codex Orchestrator + Worker system targeting Master The Machine 2026.
+
+Read MTM_Orchestrator_Worker_Skills_Plan.md completely before making changes.
+
+Mission:
+- Build an interoperable repo using native Agent Skills under .agents/skills/.
+- Development supervisor is Codex Desktop (or Antigravity 2.0), while workers must execute through Codex CLI in noninteractive mode.
+- No OpenAI API key is assumed. Use existing Codex ChatGPT login via `codex login`; do not require Responses/Decisions API.
+- Production must be fully headless under BTC Game Player, with no GUI, human intervention, or Skill rewriting.
+
+Implement incrementally, in this order:
+1. P0: Initialize repository; AGENTS.md; configs; TaskEnvelope/WorkerResult schemas; CLI adapter; JSONL trace parser; test fixtures; prove one Codex worker run.
+2. P1: Build Worker Skills for BUG, CR, TASK, PI, Verification, Evidence. Give each precise trigger, inputs, steps, failure cases, structured output, tests and at least two positive/negative activation examples.
+3. P2: Build Orchestrator, Skill Finder, Scheduler, Worker Dispatch, Integration Guard and lightweight Repo Bootstrap Skills, with deterministic state gates for deadlines, one-shot submit, git revision and evidence.
+4. P3: Build a Dev-only Skill Evolver that proposes versioned Skill diffs from aggregated training traces and promotes them only after fair A/B validation. Never use benchmark gold patches/hidden tests in prompts.
+5. P4: Integrate selected SWE-Gym Lite tasks first, then a 10-backlog same-repo 40-minute simulation using the full-stack FastAPI template.
+6. P5: Leave Game Player integration as a well-defined adapter placeholder until the official SDK and rules are available.
+7. P6: Export frozen versioned Production Skill bundle and checksums. Validate that the runtime cannot modify skills.
+
+Engineering constraints:
+- Do not recreate the Codex runtime or build a heavy new orchestration framework.
+- Skills are declarative workflows; use small deterministic scripts for subprocesses, events, verification and state.
+- Make all external actions explicit and auditable. Sandbox unfamiliar benchmark repos and restrict permission scope.
+- Do not invent Game Master endpoints, official evidence schemas, hidden MVS, or claimed BTC permissions.
+- Maintain a phase checklist and file-by-file change log. Each phase must pass its own tests before beginning the next phase.
+- Verify actual installed Codex CLI flags, authentication, model allowlist, effort levels and subagent compatibility from the local environment.
+
+Start now with P0 only. Produce a runnable repo and demonstrate a smoke test, then report observed results, any blockers, and the next phase.
