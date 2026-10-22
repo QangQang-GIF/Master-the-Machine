@@ -1,0 +1,46 @@
+{
+  "snapshot_date": "2026-10-22T22:30:00+07:00",
+  "git_tag": "pre-refactor-v1",
+  "git_sha": "6624648",
+  "python_version": "3.13.14",
+  "tests": {
+    "total": 8,
+    "passed": 8,
+    "failed": 0,
+    "test_files": [
+      "tests/test_contracts.py",
+      "tests/test_trace_parser.py"
+    ]
+  },
+  "components": {
+    "runner": {
+      "codex_adapter.py": "181 lines",
+      "trace_parser.py": "108 lines",
+      "qa_gate.py": "81 lines"
+    },
+    "schemas": [
+      "task_envelope.json",
+      "worker_result.json",
+      "skill_evaluation.json"
+    ],
+    "configs": [
+      "config/development.yaml",
+      "config/production.yaml",
+      "config/model_profiles.yaml"
+    ],
+    "arena": {
+      "runner.py": "364 lines",
+      "core.py": "12518 bytes",
+      "cli.py": "24477 bytes",
+      "metrics.py": "9789 bytes",
+      "dashboard.py": "21964 bytes"
+    }
+  },
+  "known_issues": {
+    "duplicate_codex_runner": "runner/codex_adapter.py and AI-Arena/arena/runner.py both implement Codex CLI invocation",
+    "empty_sample_repo": "tests/fixtures/sample_repo was empty (now fixed)",
+    "pycache_in_git": "__pycache__/ was tracked in Git (now removed)",
+    "no_pyproject": "No pyproject.toml existed (now created)",
+    "timeout_semantics": "timeout does not correctly set status=TIMED_OUT in all cases"
+  }
+}

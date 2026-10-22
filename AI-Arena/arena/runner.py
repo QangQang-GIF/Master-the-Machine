@@ -63,16 +63,29 @@ def prepare_run(suite, row, run_dir: Path, port: int):
 
 
 def codex_cmd(agent, run_dir, prompt):
-    cmd = ["codex", "exec", "--json", "--ignore-user-config", "--skip-git-repo-check",
-           "-C", str(run_dir), "-s", "workspace-write",
-           "-c", "sandbox_workspace_write.network_access=true",
-           "-c", 'approval_policy="never"',
-           "-m", agent["model"], "-c", f'model_reasoning_effort="{agent.get("effort", "medium")}"']
-    if sys.platform == "win32":  # the elevated Windows sandbox fails to set up on some machines
-        cmd += ["-c", 'windows.sandbox="unelevated"']
-    for k, v in (agent.get("codex_config") or {}).items():  # e.g. MCP servers a harness adds
-        cmd += ["-c", f"{k}={json.dumps(v)}"]
-    return cmd + [prompt]
+    try:
+        from mtm_core.runtime import CodexRuntime
+        runtime = CodexRuntime()
+        return runtime.build_codex_cmd(
+            workspace=run_dir,
+            prompt=prompt,
+            model=agent["model"],
+            effort=agent.get("effort", "medium"),
+            sandbox_policy="workspace-write",
+            network_access=True,
+            codex_config=agent.get("codex_config"),
+        )
+    except ImportError:
+        cmd = ["codex", "exec", "--json", "--ignore-user-config", "--skip-git-repo-check",
+               "-C", str(run_dir), "-s", "workspace-write",
+               "-c", "sandbox_workspace_write.network_access=true",
+               "-c", 'approval_policy="never"',
+               "-m", agent["model"], "-c", f'model_reasoning_effort="{agent.get("effort", "medium")}"']
+        if sys.platform == "win32":
+            cmd += ["-c", 'windows.sandbox="unelevated"']
+        for k, v in (agent.get("codex_config") or {}).items():
+            cmd += ["-c", f"{k}={json.dumps(v)}"]
+        return cmd + [prompt]
 
 
 KICKOFF = "Read AGENTS.md and TASK.md, then do the backlog item now. Work autonomously until it is done."

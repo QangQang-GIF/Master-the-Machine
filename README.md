@@ -11,9 +11,18 @@ Skill-driven autonomous engineering system designed for the **Master The Machine
 
 ## 2. Directory Layout
 ```text
-mtm-skill-system/
+Master-the-Machine/
 ├── AGENTS.md                         # Rules of engagement & Dev/Prod boundary
 ├── README.md
+├── pyproject.toml
+├── .agents/skills/                   # 7 specialized native Agent Skills
+│   ├── mtm-init/
+│   ├── mtm-bug-worker/
+│   ├── mtm-cr-worker/
+│   ├── mtm-task-worker/
+│   ├── mtm-pi-worker/
+│   ├── mtm-verification/
+│   └── mtm-evidence/
 ├── config/
 │   ├── development.yaml               # Mutable registry & trace tracking
 │   ├── production.yaml                # Locked skills & strict submission gates
@@ -22,29 +31,40 @@ mtm-skill-system/
 │   ├── task_envelope.json             # TaskEnvelope schema
 │   ├── worker_result.json             # WorkerResult schema
 │   └── skill_evaluation.json          # Skill benchmark evaluation schema
-├── runner/
-│   ├── codex_adapter.py               # Worker execution adapter (Codex CLI + agy fallback)
-│   ├── trace_parser.py                # JSONL event parser (tokens, commands, diffs)
-│   └── qa_gate.py                     # Deterministic schema & evidence validator
-└── tests/
-    ├── fixtures/                      # Task envelope & fixture repos
-    ├── test_contracts.py              # Schema contract unit tests
-    ├── test_trace_parser.py           # Trace parser tests
-    └── test_smoke_worker.py           # Autonomous end-to-end worker run
+├── src/
+│   ├── mtm_core/                      # Shared runtime, contracts, Git, config
+│   │   ├── contracts/
+│   │   ├── git/
+│   │   ├── runtime/
+│   │   └── config/
+│   ├── mtm_competition/               # Production Tournament Architecture
+│   │   ├── tasks/
+│   │   ├── scheduling/
+│   │   ├── routing/
+│   │   ├── workers/
+│   │   ├── verification/
+│   │   ├── integration/
+│   │   ├── adapters/
+│   │   └── orchestrator.py
+│   ├── mtm_arena/                     # Benchmark simulation & scoring
+│   │   ├── metrics.py
+│   │   └── simulator.py
+│   └── mtm_training/                  # Offline self-learning & skill evolution
+│       ├── failure_analysis.py
+│       ├── lesson_extractor.py
+│       ├── skill_evolver.py
+│       └── promotion.py
+├── AI-Arena/                          # Benchmark arena harnesses & test suites
+└── tests/                             # 34 automated unit & integration tests
 ```
 
-## 3. Current Phase Status: P0 Complete (Foundation)
-- [x] Initialized repository & Git structure
-- [x] `AGENTS.md` and configuration files (`development.yaml`, `production.yaml`, `model_profiles.yaml`)
-- [x] JSON Schemas for `TaskEnvelope`, `WorkerResult`, and `SkillEvaluation`
-- [x] Deterministic `qa_gate.py` with validation and file/evidence existence verification
-- [x] Resilient `trace_parser.py` supporting both Codex JSONL stream and Antigravity stream
-- [x] Robust `codex_adapter.py` providing headless execution with automated `WorkerResult` extraction
-- [x] Full test suite (8 contract/trace tests + 1 autonomous end-to-end smoke test passed)
+## 3. Architecture Modules
+- **`mtm_core`**: Universal contracts (`TaskEnvelope`, `WorkerResult`), unified headless execution (`CodexRuntime`), Git worktree isolation, and typed config loader.
+- **`mtm_competition`**: Strict tournament pipeline with prioritized backlog scheduling, deterministic state machine, prompt routing, worker isolation, QA gating, and once-only submission guards.
+- **`mtm_arena`**: Dynamic leaderboard evaluation, composite scoring, and offline scenario simulation.
+- **`mtm_training`**: Autonomous failure clustering, lesson extraction, shadow A/B benchmarking, and rollback-safe skill promotion.
 
 ## 4. Running Tests
-```powershell
-$env:PYTHONPATH = "."
-python -m pytest tests/test_contracts.py tests/test_trace_parser.py -v
-python -m pytest tests/test_smoke_worker.py -v -s
+```bash
+pytest tests/ -v
 ```

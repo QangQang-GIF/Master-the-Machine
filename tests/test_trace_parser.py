@@ -1,5 +1,4 @@
-"""Unit tests for JSONL trace parsing."""
-from runner.trace_parser import parse_codex_trace, parse_agy_trace
+from mtm_core.runtime.trace import parse_codex_trace, parse_agy_trace
 
 
 def test_parse_codex_trace():

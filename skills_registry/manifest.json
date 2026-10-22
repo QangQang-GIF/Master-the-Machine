@@ -1,0 +1,46 @@
+{
+  "skills": {
+    "mtm-init": {
+      "version": "1.0.0",
+      "description": "Foundational operating policy, token discipline, and worker contract boundaries",
+      "status": "production",
+      "path": ".agents/skills/mtm-init"
+    },
+    "mtm-bug-worker": {
+      "version": "1.0.0",
+      "description": "Bug diagnosis, minimal surgical patch, and targeted verification",
+      "status": "production",
+      "path": ".agents/skills/mtm-bug-worker"
+    },
+    "mtm-cr-worker": {
+      "version": "1.0.0",
+      "description": "Feature implementation, acceptance criteria, and edge-case testing",
+      "status": "production",
+      "path": ".agents/skills/mtm-cr-worker"
+    },
+    "mtm-task-worker": {
+      "version": "1.0.0",
+      "description": "General backlog tasks, chores, cleanups, and infrastructure updates",
+      "status": "production",
+      "path": ".agents/skills/mtm-task-worker"
+    },
+    "mtm-pi-worker": {
+      "version": "1.0.0",
+      "description": "Emergency triage, fast localization, and rapid stabilization for production incidents",
+      "status": "production",
+      "path": ".agents/skills/mtm-pi-worker"
+    },
+    "mtm-verification": {
+      "version": "1.0.0",
+      "description": "Multi-level test runner, regression analysis, and MVS validation",
+      "status": "production",
+      "path": ".agents/skills/mtm-verification"
+    },
+    "mtm-evidence": {
+      "version": "1.0.0",
+      "description": "Audit evidence collection, diff inspection, and artifact validation",
+      "status": "production",
+      "path": ".agents/skills/mtm-evidence"
+    }
+  }
+}

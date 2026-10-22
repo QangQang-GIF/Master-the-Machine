@@ -63,6 +63,31 @@
         "output_tokens": { "type": ["integer", "null"] },
         "credits": { "type": ["number", "null"] }
       }
+    },
+    "base_revision": {
+      "type": ["string", "null"]
+    },
+    "result_revision": {
+      "type": ["string", "null"]
+    },
+    "mvs_results": {
+      "type": "array",
+      "items": { "type": "object" },
+      "default": []
+    },
+    "confidence": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 1
+    },
+    "model": {
+      "type": ["string", "null"]
+    },
+    "effort": {
+      "type": ["string", "null"]
+    },
+    "notes": {
+      "type": "string"
     }
   }
 }

@@ -1,0 +1,33 @@
+[project]
+name = "master-the-machine"
+version = "0.1.0"
+description = "MTM 2026 Competition Agent — Skill-Driven Codex Orchestrator"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "jsonschema>=4.23,<5",
+    "pyyaml>=6.0,<7",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0,<9",
+    "pytest-timeout>=2.3,<3",
+]
+arena = [
+    "docker>=7.0,<8",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/mtm_core", "src/mtm_competition", "src/mtm_arena", "src/mtm_training"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+norecursedirs = ["tests/fixtures", "fixtures", ".venv", "AI-Arena", ".agents"]
+pythonpath = ["src"]
+addopts = "-v --tb=short"
+

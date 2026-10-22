@@ -91,6 +91,33 @@
         "network": { "type": "string", "enum": ["none", "scoped", "full"] },
         "allowed_paths": { "type": "array", "items": { "type": "string" } }
       }
+    },
+    "match_remaining_time": {
+      "type": ["number", "null"],
+      "description": "Seconds remaining in tournament match"
+    },
+    "token_budget": {
+      "type": ["integer", "null"],
+      "description": "Maximum tokens allocated to this worker attempt"
+    },
+    "sandbox_policy": {
+      "type": "string",
+      "default": "workspace-write"
+    },
+    "allowed_paths": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "attempt_number": {
+      "type": "integer",
+      "minimum": 1,
+      "default": 1
+    },
+    "skill_profile": {
+      "type": ["string", "null"]
+    },
+    "model_profile": {
+      "type": ["string", "null"]
     }
   }
 }

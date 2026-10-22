@@ -287,17 +287,25 @@ def export_repo(image: str, workdir: str, dest: Path):
 
 def git_init_base(path: Path):
     """Make path a fresh repo whose only commit is the handed-over code."""
-    for args in (["init", "-q"], ["config", "core.autocrlf", "false"], ["config", "user.name", "arena"],
-                 ["config", "user.email", "arena@local"], ["add", "-A"], ["commit", "-q", "-m", "base"]):
-        code, out = run(["git", "-C", str(path), *args])
-        if code:
-            raise RuntimeError(f"git {' '.join(args)} failed in {path}: {out}")
+    try:
+        from mtm_core.git import git_init
+        git_init(path, user_name="arena", user_email="arena@local")
+    except ImportError:
+        for args in (["init", "-q"], ["config", "core.autocrlf", "false"], ["config", "user.name", "arena"],
+                     ["config", "user.email", "arena@local"], ["add", "-A"], ["commit", "-q", "-m", "base"]):
+            code, out = run(["git", "-C", str(path), *args])
+            if code:
+                raise RuntimeError(f"git {' '.join(args)} failed in {path}: {out}")
 
 
 def git_diff(path: Path) -> str:
-    run(["git", "-C", str(path), "add", "-A"])
-    p = subprocess.run(["git", "-C", str(path), "diff", "--cached", "--binary", "HEAD"], capture_output=True)
-    return p.stdout.decode("utf-8", "replace")
+    try:
+        from mtm_core.git import git_diff as core_git_diff
+        return core_git_diff(path, base="HEAD", stage_all=True)
+    except ImportError:
+        run(["git", "-C", str(path), "add", "-A"])
+        p = subprocess.run(["git", "-C", str(path), "diff", "--cached", "--binary", "HEAD"], capture_output=True)
+        return p.stdout.decode("utf-8", "replace")
 
 
 def tmpdir() -> Path:

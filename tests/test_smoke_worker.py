@@ -4,13 +4,17 @@ import shutil
 from pathlib import Path
 import pytest
 
-from runner.codex_adapter import WorkerAdapter
-from runner.qa_gate import validate_worker_result
+from mtm_competition.workers import WorkerLauncher
+from mtm_competition.verification import validate_worker_result
 
 ROOT = Path(__file__).resolve().parent.parent
 FIXTURES = ROOT / "tests" / "fixtures"
 
 
+@pytest.mark.skipif(
+    shutil.which("codex") is None and shutil.which("agy") is None,
+    reason="Codex CLI or Antigravity CLI required for live smoke execution",
+)
 def test_smoke_worker_run(tmp_path):
     # 1. Prepare temporary isolated fixture repo
     work_repo = tmp_path / "work_repo"
@@ -39,20 +43,21 @@ def test_smoke_worker_run(tmp_path):
         "limits": {"network": "none", "allowed_paths": [str(work_repo)]}
     }
 
-    # 3. Execute worker autonomously via WorkerAdapter
-    adapter = WorkerAdapter(use_agy_fallback=True)
-    worker_result, trace = adapter.execute(envelope)
+    # 3. Execute worker autonomously via WorkerLauncher
+    launcher = WorkerLauncher(scratch_dir=tmp_path / "scratch")
+    worker_result, trace, ws_path = launcher.launch(envelope)
 
     # 4. Verify outputs
-    assert worker_result["task_id"] == "BUG-SMOKE-01"
-    assert worker_result["status"] in ("READY_FOR_REVIEW", "COMPLETED")
-    assert "calculator.py" in worker_result["changed_files"]
-    assert worker_result["elapsed_seconds"] > 0
+    res_dict = worker_result.to_dict() if hasattr(worker_result, "to_dict") else worker_result
+    assert res_dict["task_id"] == "BUG-SMOKE-01"
+    assert res_dict["status"] in ("READY_FOR_REVIEW", "COMPLETED")
+    assert "calculator.py" in res_dict["changed_files"]
+    assert res_dict["elapsed_seconds"] > 0
     assert trace.turns >= 1
 
     # 5. Deterministic QA Gate validation
-    validate_worker_result(worker_result, workspace_dir=work_repo)
+    validate_worker_result(res_dict, workspace_dir=ws_path)
 
     # 6. Verify the code was actually fixed
-    fixed_code = (work_repo / "calculator.py").read_text(encoding="utf-8")
+    fixed_code = (ws_path / "calculator.py").read_text(encoding="utf-8")
     assert ">=" in fixed_code

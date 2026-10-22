@@ -1,0 +1,13 @@
+db3130e72c4832bfad65f01d623ec49e1690728c5296864de03a181052e0f0f2  .agents/skills/mtm-bug-worker/SKILL.md
+2c971167dfee11479f9d47130d8f15e6075c602fa3343c911a8fcdc05e2a7894  .agents/skills/mtm-cr-worker/SKILL.md
+6c57f088c29da66c6adda0ef81c28cafbb7bc2f4166b927ae0a4307ee6ea871a  .agents/skills/mtm-evidence/SKILL.md
+9453bea637fbd784a492c8905ba88215799c6ed44d9a3d9f55f7fce8a31d82a3  .agents/skills/mtm-init/SKILL.md
+9af94d0c8ad4b7a3ea639b8af4697e0f91ecdd609d61ee2e479bd6c9b1874829  .agents/skills/mtm-init/references/competition-rules.md
+710509c5f1d48626b656660ef508c0786003cae9d54a18bbdeb59e37b1cc1ad5  .agents/skills/mtm-init/references/efficient-repo-reading.md
+f552e27e1966878d76fdc9bec03e0136532981c044f9d04197eca5b7f8e9186d  .agents/skills/mtm-init/references/verification-baseline.md
+4d06f5b41134e54c5748a92479488ba6add41e3af0e3fba5fb97622483ff85e6  .agents/skills/mtm-init/references/worker-contract.md
+b2a89c4c97a33b1bf28fc48d2ee94dddf8124b2099325f54733270cdb16513a4  .agents/skills/mtm-init/tests/negative.md
+038ff1f7a826472017e5010e6e131e5cc78b0a11b8b0c93451ef7fa396864f69  .agents/skills/mtm-init/tests/positive.md
+a1adb8812c61b0b03a54502a911c3ab473b093a981b426baa8e1fb3acd6b9aea  .agents/skills/mtm-pi-worker/SKILL.md
+4a9d352b24aadd6bb2212b88e79bb0811113420458d096d392635e6f61fc169c  .agents/skills/mtm-task-worker/SKILL.md
+ad29b2e2c23eeb8bf43d8d96cd0dad87365d759735dd449e85b581f176e0ef90  .agents/skills/mtm-verification/SKILL.md
