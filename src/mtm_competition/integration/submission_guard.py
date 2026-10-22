@@ -25,6 +25,16 @@ class SubmissionResult:
     error_message: Optional[str] = None
 
 
+def _extract_submission_score(resp_data: Dict[str, Any], envelope_points: int, status: str) -> int:
+    """Extract awarded score distinguishing 0 from None. Only PASSED awards default points if omitted."""
+    raw = resp_data.get("points")
+    if raw is not None:
+        return int(raw)
+    if status == "PASSED":
+        return int(envelope_points)
+    return 0
+
+
 class SubmissionGuard:
     """Enforces zero-duplicate, fully-verified submission gating with server-clock awareness and in-flight reconciliation."""
 
@@ -86,11 +96,11 @@ class SubmissionGuard:
             try:
                 server_status = game_master_status_fn(task_id)
                 st = server_status.get("status")
-                if st in ("ACCEPTED", "PASSED"):
-                    pts = int(server_status.get("points") or envelope.points)
+                if st in ("ACCEPTED", "PASSED", "FAILED"):
+                    pts = _extract_submission_score(server_status, envelope.points, st)
                     self.store.record_submission(task_id, status=st, score=pts, response_json=server_status, git_revision=revision.commit_sha)
                     return SubmissionResult(
-                        success=True,
+                        success=(st in ("ACCEPTED", "PASSED")),
                         task_id=task_id,
                         points_awarded=pts,
                         status=st,
@@ -111,7 +121,7 @@ class SubmissionGuard:
                 evidence=worker_result.evidence_paths,
             )
             status = response.get("status", "ACCEPTED")
-            score = int(response.get("points") or (envelope.points if status == "ACCEPTED" else 0))
+            score = _extract_submission_score(response, envelope.points, status)
             sub_id = response.get("submission_id")
 
             # Record in TaskStore once-only ledger
@@ -137,8 +147,8 @@ class SubmissionGuard:
                 try:
                     reconciled = game_master_status_fn(task_id)
                     st = reconciled.get("status")
-                    if st in ("ACCEPTED", "PASSED"):
-                        score = int(reconciled.get("points") or envelope.points)
+                    if st in ("ACCEPTED", "PASSED", "FAILED"):
+                        score = _extract_submission_score(reconciled, envelope.points, st)
                         self.store.record_submission(
                             task_id=task_id,
                             status=st,
@@ -147,7 +157,7 @@ class SubmissionGuard:
                             git_revision=revision.commit_sha,
                         )
                         return SubmissionResult(
-                            success=True,
+                            success=(st in ("ACCEPTED", "PASSED")),
                             task_id=task_id,
                             points_awarded=score,
                             status=st,

@@ -93,6 +93,7 @@ def validate_qa_gate(
     envelope: Dict[str, Any],
     result: Dict[str, Any],
     workspace_dir: Optional[Path] = None,
+    reverify_tests: bool = False,
 ) -> None:
     """Rigorous QA Gate: Cross-check TaskEnvelope against WorkerResult.
 
@@ -104,6 +105,7 @@ def validate_qa_gate(
     5. Mandatory presence and existence of all required evidence files.
     6. Base revision consistency.
     7. Test verification: READY_FOR_REVIEW status requires all executed tests to pass.
+    8. Optional independent test execution without blindly trusting worker result JSON.
     """
     validate_task_envelope(envelope)
     validate_worker_result(result, workspace_dir=workspace_dir)
@@ -165,6 +167,17 @@ def validate_qa_gate(
                 raise QAGateError(
                     f"Status is READY_FOR_REVIEW but test failed: {tr.get('command')}"
                 )
+
+        if reverify_tests and test_results:
+            test_cmds = [tr.get("command") for tr in test_results if tr.get("command")]
+            env_cmd = envelope.get("verification_cmd")
+            if env_cmd and env_cmd not in test_cmds:
+                test_cmds.append(env_cmd)
+            if test_cmds and ws.exists():
+                if not reverify_tests_independently(ws, test_cmds):
+                    raise QAGateError(
+                        f"Independent test re-verification failed for commands: {test_cmds}"
+                    )
 
 
 def reverify_tests_independently(workspace_dir: Path | str, commands: List[str]) -> bool:

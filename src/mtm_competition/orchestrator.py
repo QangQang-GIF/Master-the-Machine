@@ -35,6 +35,8 @@ class CompetitionOrchestrator:
         verify_skill_integrity: bool = False,
         push_to_remote: bool = True,
         verify_post_integration: bool = True,
+        reverify_worker_tests: bool = False,
+        require_remote: bool = False,
         token_budget: int = 1_000_000,
     ):
         self.gm = gm_adapter
@@ -49,6 +51,8 @@ class CompetitionOrchestrator:
 
         self.store = TaskStore(self.db_path)
         self.scheduler = TournamentScheduler(self.store, concurrency_limit=concurrency_limit)
+        self.verify_post_integration = verify_post_integration
+        self.reverify_worker_tests = reverify_worker_tests
 
         # Resolve backend configuration from argument, env var, or config file
         from mtm_core.config.loader import load_environment_config
@@ -73,18 +77,35 @@ class CompetitionOrchestrator:
             self.repo_path,
             push_to_remote=push_to_remote,
             verify_post_integration=verify_post_integration,
+            require_remote=require_remote,
         )
         self.git_guard = GitGuard(self.repo_path)
         self.submission_guard = SubmissionGuard(self.store)
 
         self.cumulative_billable_tokens: int = 0
         self.token_budget = token_budget
-        self.verify_skill_integrity = verify_skill_integrity
 
-        if verify_skill_integrity:
+        mode = (
+            __import__("os").environ.get("MTM_ENV")
+            or env_cfg.get("mode")
+            or env_cfg.get("orchestrator", {}).get("mode", "development")
+        ).lower()
+        if mode == "production":
+            self.verify_skill_integrity = True
+        else:
+            self.verify_skill_integrity = verify_skill_integrity
+
+        if self.verify_skill_integrity:
             from mtm_core.config.loader import verify_skill_checksums
             project_root = self.repo_path if (self.repo_path / "releases").exists() else Path.cwd()
             verify_skill_checksums(project_root)
+
+        # Reconcile any in-flight submissions remaining from a crash/restart
+        if hasattr(self.gm, "get_submission_status"):
+            try:
+                self.store.reconcile_in_flight_submissions(self.gm.get_submission_status)
+            except Exception as e:
+                logger.warning("Could not reconcile in-flight submissions on startup: %s", e)
 
     def sync_backlog(self) -> int:
         """Poll backlog from Game Master, sync server clock, and register new items into TaskStore."""
@@ -191,9 +212,44 @@ class CompetitionOrchestrator:
         if self.cumulative_billable_tokens > (self.token_budget * 0.85):
             envelope.reasoning_effort = "low"
 
-        # 3. Launch isolated worker
+        # 3. Supervised worker launch with mid-execution preemption and match pause awareness
         t_worker_start = time.time()
-        worker_res, trace, ws_path = self.launcher.launch(envelope)
+        supervised_proc = self.supervisor.launch_async(self.launcher.launch, envelope)
+
+        while not self.supervisor.is_finished(task_id):
+            # Sync match state and clock
+            try:
+                match_state = self.gm.get_match_state()
+                self.scheduler.sync_with_game_master(match_state)
+            except Exception:
+                pass
+
+            if self.scheduler.is_paused:
+                # Extend worker timeout while match clock is paused
+                supervised_proc.timeout_seconds += 0.2
+                time.sleep(0.2)
+                continue
+
+            # Poll backlog to detect if high-priority PI arrived that preempts us
+            self.sync_backlog()
+            if supervised_proc.status == "PREEMPTED":
+                return {"task_id": task_id, "status": "PREEMPTED"}
+
+            if self.supervisor.is_timed_out(task_id):
+                self.supervisor.preempt_worker(task_id)
+                break
+
+            time.sleep(0.05)
+
+        if supervised_proc.status == "PREEMPTED":
+            return {"task_id": task_id, "status": "PREEMPTED"}
+
+        try:
+            worker_res, trace, ws_path = self.supervisor.get_result(task_id, timeout=5.0)
+        except Exception as e:
+            self.scheduler.complete_task(task_id, TaskState.REJECTED)
+            return {"task_id": task_id, "status": "FAILED", "error": str(e)}
+
         worker_duration = round(time.time() - t_worker_start, 2)
 
         self.cumulative_billable_tokens += trace.billable_tokens
@@ -211,7 +267,12 @@ class CompetitionOrchestrator:
         # 4. Deterministic QA Gate validation
         t_qa_start = time.time()
         try:
-            validate_qa_gate(envelope.to_dict(), worker_res.to_dict(), workspace_dir=ws_path)
+            validate_qa_gate(
+                envelope.to_dict(),
+                worker_res.to_dict(),
+                workspace_dir=ws_path,
+                reverify_tests=self.reverify_worker_tests,
+            )
         except QAGateError as e:
             self.scheduler.complete_task(task_id, TaskState.REJECTED)
             self.store.record_event(
@@ -223,7 +284,16 @@ class CompetitionOrchestrator:
         # 5. If Ready for Review, integrate and submit
         if worker_res.status == "READY_FOR_REVIEW":
             t_integ_start = time.time()
-            integ_res = self.integration_guard.integrate(worker_res, ws_path)
+            v_cmd = envelope.verification_cmd or envelope.metadata.get("verification_cmd")
+            if not v_cmd and self.verify_post_integration and self.reverify_worker_tests:
+                if worker_res.test_results:
+                    v_cmd = worker_res.test_results[0].get("command")
+
+            integ_res = self.integration_guard.integrate(
+                worker_res,
+                ws_path,
+                verification_cmd=v_cmd,
+            )
             if not integ_res.success:
                 self.scheduler.complete_task(task_id, TaskState.REJECTED)
                 return {
@@ -232,7 +302,30 @@ class CompetitionOrchestrator:
                     "error": integ_res.error_message,
                 }
 
-            verified_rev = self.git_guard.verify_head(integ_res.commit_sha)
+            # Enforce remote push verification if remote exists and push is enabled
+            remote_configured = self.git_guard.has_remote(self.integration_guard.remote_name)
+            must_verify_pushed = self.integration_guard.push_to_remote and remote_configured
+            if must_verify_pushed and not integ_res.pushed:
+                self.scheduler.complete_task(task_id, TaskState.REJECTED)
+                return {
+                    "task_id": task_id,
+                    "status": "INTEGRATION_FAILED",
+                    "error": f"Commit {integ_res.commit_sha} was not pushed to remote {self.integration_guard.remote_name}",
+                }
+
+            try:
+                verified_rev = self.git_guard.verify_head(
+                    integ_res.commit_sha,
+                    verify_pushed=must_verify_pushed,
+                    remote=self.integration_guard.remote_name,
+                )
+            except Exception as e:
+                self.scheduler.complete_task(task_id, TaskState.REJECTED)
+                return {
+                    "task_id": task_id,
+                    "status": "INTEGRATION_FAILED",
+                    "error": f"Git revision verification failed: {e}",
+                }
             integ_duration = round(time.time() - t_integ_start, 2)
 
             # Guarded Submission with Server Clock & Reconciliation
@@ -250,20 +343,29 @@ class CompetitionOrchestrator:
             # Check grading status if server returned ACCEPTED
             final_status = sub_res.status
             final_points = sub_res.points_awarded
-            if sub_res.success:
+            if sub_res.success and hasattr(self.gm, "get_submission_status"):
                 try:
                     grading = self.gm.get_submission_status(task_id)
                     g_status = grading.get("status")
                     if g_status in ("PASSED", "FAILED"):
                         final_status = g_status
-                        final_points = int(grading.get("points") or final_points)
+                        if g_status == "PASSED":
+                            final_points = int(grading["points"]) if grading.get("points") is not None else (final_points or envelope.points)
+                        else:  # FAILED
+                            final_points = int(grading["points"]) if grading.get("points") is not None else 0
                         self.store.update_submission_status(task_id, g_status, final_points, grading)
                 except Exception:
                     pass
 
-            final_state = TaskState.PASSED if final_status == "PASSED" else (
-                TaskState.SUBMITTED if sub_res.success else TaskState.REJECTED
-            )
+            if final_status == "PASSED":
+                final_state = TaskState.PASSED
+            elif final_status == "FAILED":
+                final_state = TaskState.FAILED
+            elif sub_res.success:
+                final_state = TaskState.SUBMITTED
+            else:
+                final_state = TaskState.REJECTED
+
             self.scheduler.complete_task(task_id, final_state)
 
             # Record stage trace metrics

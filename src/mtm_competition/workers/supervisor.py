@@ -22,6 +22,7 @@ class SupervisedProcess:
     future: Optional[concurrent.futures.Future] = None
     envelope: Optional[TaskEnvelope] = None
     result: Optional[Tuple[WorkerResult, ExecutionTrace, Path]] = None
+    subprocess_handle: Optional[Any] = None
 
 
 class WorkerSupervisor:
@@ -48,6 +49,12 @@ class WorkerSupervisor:
         self._active_workers[task_id] = proc
         return proc
 
+    def register_subprocess(self, task_id: str, proc: Any) -> None:
+        """Register active subprocess handle for mid-execution killing."""
+        active = self._active_workers.get(task_id)
+        if active:
+            active.subprocess_handle = proc
+
     def launch_async(
         self,
         launcher_fn: Callable[..., Tuple[WorkerResult, ExecutionTrace, Path]],
@@ -71,9 +78,23 @@ class WorkerSupervisor:
             envelope=envelope,
         )
 
-        future = self._executor.submit(launcher_fn, envelope, attempt_number)
-        proc.future = future
+        def _runner():
+            import inspect
+            try:
+                sig = inspect.signature(launcher_fn)
+                if "on_process_start" in sig.parameters:
+                    return launcher_fn(
+                        envelope,
+                        attempt_number=attempt_number,
+                        on_process_start=lambda p: self.register_subprocess(task_id, p),
+                    )
+            except Exception:
+                pass
+            return launcher_fn(envelope, attempt_number=attempt_number)
+
         self._active_workers[task_id] = proc
+        future = self._executor.submit(_runner)
+        proc.future = future
         return proc
 
     def is_finished(self, task_id: str) -> bool:
@@ -105,11 +126,17 @@ class WorkerSupervisor:
         return None
 
     def preempt_worker(self, task_id: str) -> Optional[SupervisedProcess]:
-        """Preempt and cancel a running worker process."""
+        """Preempt, terminate process immediately, and cancel a running worker."""
         proc = self._active_workers.get(task_id)
         if not proc:
             return None
         proc.status = "PREEMPTED"
+        if proc.subprocess_handle is not None:
+            try:
+                proc.subprocess_handle.kill()
+                proc.subprocess_handle.wait(timeout=1.0)
+            except Exception:
+                pass
         if proc.future and not proc.future.done():
             proc.future.cancel()
         return self.unregister_worker(task_id)

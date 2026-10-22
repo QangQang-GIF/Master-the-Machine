@@ -192,7 +192,7 @@ class TaskStore:
         if not row:
             return False
         st = row["status"]
-        return st in ("ACCEPTED", "PASSED", "SUBMIT_IN_FLIGHT", "SUBMITTED")
+        return st in ("ACCEPTED", "PASSED", "FAILED", "SUBMIT_IN_FLIGHT", "SUBMITTED")
 
     def is_in_flight(self, task_id: str) -> bool:
         """Check if task has an in-flight network submission pending."""
@@ -208,10 +208,52 @@ class TaskStore:
         row = cursor.fetchone()
         return dict(row) if row else None
 
+    def reconcile_in_flight_submissions(self, status_check_fn: Any) -> List[Dict[str, Any]]:
+        """Scan and reconcile any unresolved SUBMIT_IN_FLIGHT submissions against Game Master."""
+        cursor = self.conn.cursor()
+        cursor.execute("SELECT * FROM submissions WHERE status = 'SUBMIT_IN_FLIGHT'")
+        in_flight_rows = [dict(r) for r in cursor.fetchall()]
+        reconciled = []
+        for sub in in_flight_rows:
+            task_id = sub["task_id"]
+            try:
+                res = status_check_fn(task_id)
+                st = res.get("status")
+                if st in ("ACCEPTED", "PASSED", "FAILED"):
+                    score = int(res["points"]) if (st == "PASSED" and res.get("points") is not None) else 0
+                    self.record_submission(
+                        task_id=task_id,
+                        status=st,
+                        score=score,
+                        response_json=res,
+                        git_revision=sub.get("git_revision"),
+                        submission_id=res.get("submission_id") or sub.get("submission_id"),
+                    )
+                    reconciled.append({"task_id": task_id, "status": st, "score": score})
+                elif st in ("NOT_SUBMITTED", None):
+                    now = time.time()
+                    with self.conn:
+                        self.conn.execute("DELETE FROM submissions WHERE task_id = ?", (task_id,))
+                        self.conn.execute(
+                            "UPDATE tasks SET status = ?, updated_at = ? WHERE task_id = ?",
+                            (TaskState.READY_TO_SUBMIT.value, now, task_id),
+                        )
+                        self.record_event(
+                            task_id,
+                            "RECONCILED_RESET",
+                            TaskState.SUBMIT_IN_FLIGHT.value,
+                            TaskState.READY_TO_SUBMIT.value,
+                            {"reason": "Not submitted on server"},
+                        )
+                    reconciled.append({"task_id": task_id, "status": "RESET_TO_READY_TO_SUBMIT"})
+            except Exception:
+                pass
+        return reconciled
+
     def start_submission(self, task_id: str, git_revision: str) -> bool:
         """Atomically record SUBMIT_IN_FLIGHT marker before network transmission."""
         sub = self.get_submission(task_id)
-        if sub and sub["status"] in ("ACCEPTED", "PASSED"):
+        if sub and sub["status"] in ("ACCEPTED", "PASSED", "FAILED"):
             return False  # Already permanently submitted
 
         now = time.time()
@@ -238,7 +280,7 @@ class TaskStore:
     ) -> bool:
         """Record a submission. Enforces once-only submission invariant."""
         sub = self.get_submission(task_id)
-        if sub and sub["status"] in ("ACCEPTED", "PASSED") and status != "PASSED":
+        if sub and sub["status"] in ("ACCEPTED", "PASSED", "FAILED") and status not in ("PASSED", "FAILED"):
             return False  # Block duplicate submission
 
         now = time.time()
@@ -256,7 +298,16 @@ class TaskStore:
                 now,
                 now,
             ))
-            final_task_state = TaskState.SUBMITTED.value if status in ("ACCEPTED", "PASSED", "SUBMITTED") else TaskState.REJECTED.value
+
+            if status == "PASSED":
+                final_task_state = TaskState.PASSED.value
+            elif status == "FAILED":
+                final_task_state = TaskState.FAILED.value
+            elif status in ("ACCEPTED", "SUBMITTED"):
+                final_task_state = TaskState.SUBMITTED.value
+            else:
+                final_task_state = TaskState.REJECTED.value
+
             self.conn.execute(
                 "UPDATE tasks SET status = ?, updated_at = ? WHERE task_id = ?",
                 (final_task_state, now, task_id),

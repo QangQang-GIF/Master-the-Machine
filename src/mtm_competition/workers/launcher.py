@@ -43,6 +43,7 @@ class WorkerLauncher:
         envelope: TaskEnvelope | Dict[str, Any],
         attempt_number: int = 1,
         backend: Optional[str] = None,
+        on_process_start: Optional[Callable[[Any], None]] = None,
     ) -> Tuple[WorkerResult, ExecutionTrace, Path]:
         """Execute task in an isolated workspace.
 
@@ -84,6 +85,7 @@ class WorkerLauncher:
             timeout=timeout,
             log_file=trace_log,
             backend=routing.backend,
+            on_process_start=on_process_start,
         )
 
         trace = runtime_res.trace

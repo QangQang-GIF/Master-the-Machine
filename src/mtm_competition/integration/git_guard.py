@@ -52,6 +52,8 @@ class GitGuard:
             rem_res = run_git(self.repo, ["branch", "-r", "--contains", sha])
             if f"{remote}/{branch}" in rem_res.stdout:
                 is_pushed = True
+        elif verify_pushed:
+            raise ValueError(f"GitGuard verification failed: remote '{remote}' is not configured")
 
         if verify_pushed and not is_pushed:
             raise ValueError(

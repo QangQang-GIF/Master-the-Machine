@@ -13,8 +13,17 @@ class PriorityQueue:
     def __init__(self):
         self._items: List[Dict[str, Any]] = []
 
-    def push(self, task: Dict[str, Any], match_remaining_seconds: float = 2400.0) -> None:
-        ev = calculate_expected_value(task, match_remaining_seconds=match_remaining_seconds)
+    def push(
+        self,
+        task: Dict[str, Any],
+        match_remaining_seconds: float = 2400.0,
+        current_time: Optional[float] = None,
+    ) -> None:
+        ev = calculate_expected_value(
+            task,
+            match_remaining_seconds=match_remaining_seconds,
+            current_time=current_time,
+        )
         task["calculated_ev"] = ev
         # Use negative EV for max-heap behavior
         heapq.heappush(self._items, (-ev, task["task_id"], task))

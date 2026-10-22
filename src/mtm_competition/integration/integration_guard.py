@@ -29,11 +29,13 @@ class IntegrationGuard:
         push_to_remote: bool = True,
         remote_name: str = "origin",
         verify_post_integration: bool = True,
+        require_remote: bool = False,
     ):
         self.target_repo = Path(target_repo_path).resolve()
         self.push_to_remote = push_to_remote
         self.remote_name = remote_name
         self.verify_post_integration = verify_post_integration
+        self.require_remote = require_remote
 
     def has_remote(self, remote: Optional[str] = None) -> bool:
         """Check if remote is configured."""
@@ -119,19 +121,29 @@ class IntegrationGuard:
 
         # Push commit to remote if configured
         pushed = False
-        if self.push_to_remote and self.has_remote(self.remote_name):
-            branch_res = run_git(self.target_repo, ["rev-parse", "--abbrev-ref", "HEAD"])
-            branch = branch_res.stdout.strip() or "main"
-            push_res = run_git(self.target_repo, ["push", self.remote_name, branch])
-            if push_res.returncode != 0:
-                return IntegrationResult(
-                    success=False,
-                    commit_sha=sha,
-                    applied_files=applied_files,
-                    pushed=False,
-                    error_message=f"Git push to {self.remote_name}/{branch} failed: {push_res.stderr}",
-                )
-            pushed = True
+        if self.push_to_remote:
+            if not self.has_remote(self.remote_name):
+                if self.require_remote:
+                    return IntegrationResult(
+                        success=False,
+                        commit_sha=sha,
+                        applied_files=applied_files,
+                        pushed=False,
+                        error_message=f"Git push required but remote '{self.remote_name}' is not configured",
+                    )
+            else:
+                branch_res = run_git(self.target_repo, ["rev-parse", "--abbrev-ref", "HEAD"])
+                branch = branch_res.stdout.strip() or "main"
+                push_res = run_git(self.target_repo, ["push", self.remote_name, branch])
+                if push_res.returncode != 0:
+                    return IntegrationResult(
+                        success=False,
+                        commit_sha=sha,
+                        applied_files=applied_files,
+                        pushed=False,
+                        error_message=f"Git push to {self.remote_name}/{branch} failed: {push_res.stderr}",
+                    )
+                pushed = True
 
         return IntegrationResult(
             success=True,

@@ -84,14 +84,13 @@ class TournamentScheduler:
         if not self.has_capacity:
             return None
 
+        # Promote newly DISCOVERED tasks to QUEUED
+        discovered = self.store.list_tasks(status=TaskState.DISCOVERED.value)
+        for d in discovered:
+            if not self.store.has_submitted(d["task_id"]):
+                self.store.update_task_status(d["task_id"], TaskState.QUEUED)
+
         queued_tasks = self.store.list_tasks(status=TaskState.QUEUED.value)
-        if not queued_tasks:
-            # Also consider newly DISCOVERED tasks
-            discovered = self.store.list_tasks(status=TaskState.DISCOVERED.value)
-            for d in discovered:
-                if not self.store.has_submitted(d["task_id"]):
-                    self.store.update_task_status(d["task_id"], TaskState.QUEUED)
-            queued_tasks = self.store.list_tasks(status=TaskState.QUEUED.value)
 
         # Strictly ignore any task that has already been submitted
         queued_tasks = [t for t in queued_tasks if not self.store.has_submitted(t["task_id"])]
@@ -101,8 +100,9 @@ class TournamentScheduler:
         # Build priority queue
         pq = PriorityQueue()
         rem_sec = self.match_remaining_seconds
+        cur_time = self.current_server_time
         for t in queued_tasks:
-            pq.push(t, match_remaining_seconds=rem_sec)
+            pq.push(t, match_remaining_seconds=rem_sec, current_time=cur_time)
 
         next_task = pq.pop()
         return next_task

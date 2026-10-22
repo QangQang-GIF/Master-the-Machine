@@ -25,8 +25,9 @@ def calculate_expected_value(
     task: Dict[str, Any],
     match_remaining_seconds: float = 2400.0,
     active_attempts: int = 0,
+    current_time: Optional[float] = None,
 ) -> float:
-    """Compute task priority score based on tournament economics.
+    """Compute task priority score based on tournament economics with server-time awareness.
 
     EV = (P(Pass) * Points * UrgencyFactor * DeadlineFactor) / ExpectedTime
     """
@@ -39,11 +40,12 @@ def calculate_expected_value(
     # Urgency factor: PI tasks have high urgency because faster finish saves points
     urgency = 2.0 if task_type == "PI" else 1.0
 
-    # Deadline factor: if deadline is imminent, prioritize
+    # Deadline factor: if deadline is imminent, prioritize using calibrated server clock
     deadline_epoch = task.get("deadline_epoch")
     deadline_factor = 1.0
+    now = current_time if current_time is not None else time.time()
     if deadline_epoch:
-        seconds_left = max(1.0, deadline_epoch - time.time())
+        seconds_left = max(1.0, deadline_epoch - now)
         if seconds_left < expected_time:
             deadline_factor = 0.5  # Risk of expiry, discount EV
         elif seconds_left < expected_time * 2:

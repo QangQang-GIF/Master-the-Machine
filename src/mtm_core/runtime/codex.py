@@ -126,6 +126,7 @@ class CodexRuntime:
         codex_config: Optional[Dict[str, Any]] = None,
         log_file: Optional[Path | str] = None,
         backend: Optional[str] = None,
+        on_process_start: Optional[Callable[[Any], None]] = None,
     ) -> RuntimeResult:
         """Execute a worker in the given workspace.
 
@@ -191,6 +192,11 @@ class CodexRuntime:
                 encoding="utf-8",
                 errors="replace",
             )
+            if on_process_start is not None:
+                try:
+                    on_process_start(proc)
+                except Exception:
+                    pass
             try:
                 stdout_text, _ = proc.communicate(timeout=timeout)
                 exit_code = proc.returncode
@@ -215,6 +221,11 @@ class CodexRuntime:
                 errors="replace",
                 shell=(sys.platform == "win32"),
             )
+            if on_process_start is not None:
+                try:
+                    on_process_start(proc)
+                except Exception:
+                    pass
             try:
                 stdout_text, _ = proc.communicate(timeout=timeout)
                 exit_code = proc.returncode

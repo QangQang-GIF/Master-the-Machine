@@ -37,6 +37,7 @@ class TaskEnvelope:
     attempt_number: int = 1
     skill_profile: Optional[str] = None
     model_profile: Optional[str] = None
+    verification_cmd: Optional[str] = None
     metadata: Dict[str, Any] = field(default_factory=dict)
 
     @property
