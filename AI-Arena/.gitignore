@@ -1,0 +1,7 @@
+.venv/
+__pycache__/
+mock_gm/data/
+mock_gm/workspace/
+runs/
+arena/data/*
+!arena/data/sets/

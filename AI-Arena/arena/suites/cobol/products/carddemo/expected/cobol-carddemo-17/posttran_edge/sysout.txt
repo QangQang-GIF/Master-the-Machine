@@ -1,0 +1,11 @@
+START OF EXECUTION OF PROGRAM CBTRN02C
+TCATBAL record not found for key : 00000000101010001.. Creating.
+TCATBAL record not found for key : 00000000102010001.. Creating.
+TCATBAL record not found for key : 00000000103010002.. Creating.
+TCATBAL record not found for key : 00000000105030001.. Creating.
+TCATBAL record not found for key : 00000000107040001.. Creating.
+TCATBAL record not found for key : 00000000107010001.. Creating.
+TCATBAL record not found for key : 00000000101030001.. Creating.
+TRANSACTIONS PROCESSED :000000022
+TRANSACTIONS REJECTED  :000000007
+END OF EXECUTION OF PROGRAM CBTRN02C

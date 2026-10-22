@@ -1,0 +1,14 @@
+{
+ "codex-low": {"runner": "codex", "model": "gpt-6.1-sol", "effort": "low"},
+ "codex-medium": {"runner": "codex", "model": "gpt-6.1-sol", "effort": "medium"},
+ "codex-high": {"runner": "codex", "model": "gpt-6.1-sol", "effort": "high"},
+ "agent-test-0": {"runner": "codex", "model": "gpt-6.1-sol", "effort": "low", "note": "frugal: lowest reasoning effort, same model"},
+ "agent-test-1": {"runner": "codex", "model": "gpt-6.1-sol", "effort": "high", "note": "best: highest reasoning effort, same model"},
+ "hermes-low": {"runner": "hermes", "model": "gpt-6.1-sol", "provider": "openai-codex", "effort": "low", "note": "Hermes Agent one-shot via Codex OAuth; needs `hermes` on PATH (see docs/SETUP.md 3.2)"},
+ "codex-ruflo-low": {"runner": "codex", "harness": "ruflo", "model": "gpt-6.1-sol", "effort": "low", "codex_config": {"mcp_servers.ruflo.command": "cmd", "mcp_servers.ruflo.args": ["/c", "npx", "-y", "ruflo@latest", "mcp", "start"], "mcp_servers.ruflo.tool_timeout_sec": 120, "mcp_servers.ruflo.default_tools_approval_mode": "approve", "mcp_servers.ruflo.startup_timeout_sec": 120}, "note": "Codex exec + Ruflo AGENTS.md, skills and MCP server, effort low"},
+ "opencode-low": {"runner": "opencode", "model": "openai/gpt-6.1-sol", "effort": "low", "note": "OpenCode headless via ChatGPT OAuth; needs `opencode` on PATH; set run_root if the clone path contains %"},
+ "codex-lean-low": {"runner": "codex", "model": "gpt-6.1-sol", "effort": "low", "agents_md": "AGENTS_lean.md", "codex_config": {"tool_output_token_limit": 2500, "model_verbosity": "low", "model_reasoning_summary": "none", "include_apps_instructions": false, "include_collaboration_mode_instructions": false, "project_doc_max_bytes": 16384}, "note": "lean: strict AGENTS.md (slices only, no narration, 1 verify) + tool output cap 2.5k tok + low verbosity"},
+ "codex-lean2-low": {"runner": "codex", "model": "gpt-6.1-sol", "effort": "low", "agents_md": "AGENTS_lean.md", "inline_task": true, "codex_config": {"tool_output_token_limit": 2000, "model_verbosity": "low", "model_reasoning_summary": "none", "include_apps_instructions": false, "include_collaboration_mode_instructions": false, "project_doc_max_bytes": 16384}, "note": "lean2: lean + TASK.md inlined in the kickoff, no re-reads, tool output cap 2k tok"},
+ "antigravity-flash": {"runner": "antigravity", "model": "gemini-3.8-flash-high", "effort": "high", "note": "Google Antigravity CLI 1.4 via agy (Gemini 3.8 Flash High)"},
+ "antigravity-sonnet": {"runner": "antigravity", "model": "claude-sonnet-4-6", "note": "Google Antigravity CLI 1.4 via agy (Claude Sonnet 4.6)"}
+}

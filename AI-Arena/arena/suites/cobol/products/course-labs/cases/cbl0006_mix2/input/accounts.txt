@@ -1,0 +1,53 @@
+11088130+0001000.00+0003165.48POLK                Ronald         26 Main St.              Omaha               Virginia              new birth of freedom                              
+11945950+0001000.00+0000447.85GRANT               Lyndon         434 Main St.             Omaha               Texas                 high-pitched voice, jutting jaw, and pounding fist
+12862409+0500000.00+0100160.84TAFT                Martin         476 Lake St.             Hyde Park           Massachusetts         quietly stood for the full dinner pail            
+13690920+0500000.00+0459072.51BUSH                Franklin       219 Lake St.             Plains              Georgia               opposed the compromise                            
+13766028+0100000.00+0101507.20COOLIDGE            Ronald         633 Oak St.              Columbia            Georgia               planning of a United Nations                      
+14014278+0100000.00+0009581.35HARDING             Martin         271 Main St.             Staunton            North Carolina        quietly stood for the full dinner pail            
+14719197+0025000.00+0027246.87HAYES               James          680 Oak St.              Cincinnati          virginia              independent treasury system                       
+15150314+0010000.00+0011676.29HARDING             Zachary        580 Oak St.              Columbia            Texas                                                                   
+18337550+0500000.00+0503567.72JEFFERSON           Theodore       75 Main St.              Honolulu            New Jersey            independent treasury system                       
+19039516+0999999.99+0667368.34HOOVER              Barack H.      298 Oak St.              Cincinnati          Pennslyvania          retired to his farm                               
+21706253+0999999.99+1001572.67MCKINLEY            Benjamin       960 Elm St.              Albemarle County    Pennslyvania          dark horse nominee                                
+22361804+0999999.99+0247505.68FILLMORE            Lyndon         389 Main St.             Braintree           Vermont                                                                 
+22806396+0999999.99+0384102.82CLINTON             Rutherford B.  192 Lake St.             Westmoreland County Illinois              planning of a United Nations                      
+24439470+0010000.00+0012820.73JOHNSON             Aiko           905 Lake St.             Columbia            virginia              quietly stood for the full dinner pail            
+25342934+0005000.00+0005522.56ROOSEVELT           Ronald         598 Elm St.              Staunton            Texas                 opposed the compromise                            
+25610182+0005000.00+0004024.59EISENHOWER          Chester        197 Main St.             Columbia            Kentucky              new birth of freedom                              
+27923147+0025000.00+0002679.66HAYES               Abraham        903 Lake St.             Point Pleasant      New Jersey            high-pitched voice, jutting jaw, and pounding fist
+28343255+0010000.00+0014783.58CLEVELAND           Abraham        233 Lake St.             Columbia            Illinois              retired to his farm                               
+30457316+0010000.00+0013188.87OKONKWO-BRANDTSTETTEMartin         693 Oak St.              Honolulu            Georgia               quietly stood for the full dinner pail            
+31628757+0500000.00+0504323.42WILSON              Thomas         587 Elm St.              Braintree           California            high-pitched voice, jutting jaw, and pounding fist
+35116627+0001000.00+0001083.89CLINTON             Millard        721 Lake St.             Honolulu            California            planning of a United Nations                      
+35504499+0500000.00+0151125.51LINCOLN             Chidi          707 Main St.             Braintree           Texas                 quietly stood for the full dinner pail            
+40932046+0001000.00+0000132.43VAN BUREN           William        712 Oak St.              Hyde Park           Texas                 independent treasury system                       
+41217090+0100000.00+0031457.18LINCOLN             Dwight         168 Elm St.              Staunton            Iowa                  planning of a United Nations                      
+41250039+0010000.00+0006593.55MONROE              Benjamin       891 Main St.             Hope                California            independent treasury system                       
+42495651+0100000.00+0102064.09TRUMAN              Barack H.      848 Elm St.              Cincinnati          Iowa                  opposed the compromise                            
+42921068+0025000.00+0004128.64DE LA CRUZ          Warren         591 Elm St.              Columbia            Hawaii                quietly stood for the full dinner pail            
+44439185+0999999.99+0093253.99NIXON               Maria          178 Elm St.              Braintree           New York              quietly stood for the full dinner pail            
+45254722+0005000.00+0002888.31VANDERBILT-ASHFORD  Lyndon         913 Lake St.             Staunton            Hawaii                dark horse nominee                                
+45910792+0010000.00+0004536.85GRANT               James          954 Elm St.              Braintree           North Carolina        peace through strength                            
+47659519+0001000.00+0000287.09SCHWARZENEGGER      Ulysses S.     887 Oak St.              Staunton            Illinois              dark horse nominee                                
+49893167+0010000.00+0004675.61TAFT                Andrew         401 Main St.             Plains              Illinois              planning of a United Nations                      
+52291443+0010000.00+0004793.99JACKSON             Dwight         337 Lake St.             Cincinnati          Massachusetts         opposed the compromise                            
+53553656+0100000.00+0033005.19POLK                Woodrow        106 Main St.             Plains              California                                                              
+54377212+0500000.00+0197420.97MONROE              William        316 Main St.             Point Pleasant      Virginia              retired to his farm                               
+56825217+0001000.00+0001000.00ADAMS               Gerald         582 Oak St.              Braintree           Texas                                                                   
+59018501+0005000.00+0003744.07SCHWARZENEGGER      Martin         867 Oak St.              Columbia            virginia              high-pitched voice, jutting jaw, and pounding fist
+61589943+0010000.00+0010114.62EISENHOWER          Woodrow        453 Lake St.             Point Pleasant      Illinois              retired to his farm                               
+64490187+0999999.99+0200806.04POLK                Ronald         618 Main St.             Albemarle County    Hawaii                opposed the compromise                            
+70847483+0005000.00+0001762.68JACKSON             George         641 Main St.             Omaha               Iowa                  new birth of freedom                              
+71210446+0005000.00+0007572.65ROOSEVELT           Rutherford B.  147 Oak St.              Hyde Park           New York                                                                
+75169523+0005000.00+0004134.37GRANT               Woodrow        421 Main St.             Omaha               Vermont               new birth of freedom                              
+81783256+0999999.99+0353099.02WILSON              Gerald         161 Lake St.             Omaha               Vermont               high-pitched voice, jutting jaw, and pounding fist
+82747269+0025000.00+0009587.21CLINTON             Grover         942 Oak St.              Plains              Vermont               planning of a United Nations                      
+83183821+0025000.00+0017837.39ADAMS               Grover         682 Lake St.             Omaha               Kentucky              high-pitched voice, jutting jaw, and pounding fist
+85034544+0500000.00+0504966.17WASHINGTON          Maria          727 Lake St.             Honolulu            Ohio                  peace through strength                            
+86208836+0001000.00+0000204.29FILLMORE            Calvin         236 Main St.             Hyde Park           Kentucky              dark horse nominee                                
+89399960+0500000.00+0229178.69MACGILLIVRAY        Ulysses S.     286 Lake St.             Westmoreland County Texas                 retired to his farm                               
+92275367+0500000.00+0168131.26CLINTON             Herbert        268 Elm St.              Braintree           Kentucky                                                                
+92804951+0100000.00+0102841.12MADISON             Chidi          991 Main St.             Braintree           New Jersey            independent treasury system                       
+95101721+0500000.00+0117189.21PIERCE              Dwight         266 Lake St.             Honolulu            Kentucky              peace through strength                            
+95195909+0005000.00+0002072.19OKONKWO-BRANDTSTETTEUlysses S.     746 Elm St.              Omaha               Georgia               independent treasury system                       
+99933541+0999999.99+0365772.91REAGAN              Millard        434 Elm St.              Point Pleasant      Georgia               independent treasury system                       

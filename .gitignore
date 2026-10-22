@@ -4,3 +4,16 @@ __pycache__/
 *.log
 trace.jsonl
 worker_result.json
+
+# AI-Arena environment, cache and heavy dataset files
+AI-Arena/.venv/
+AI-Arena/**/__pycache__/
+AI-Arena/runs/
+AI-Arena/mock_gm/
+AI-Arena/arena/data/*
+!AI-Arena/arena/data/sets/
+AI-Arena/arena/data/sources/
+AI-Arena/arena/data/src/
+AI-Arena/arena/data/runs/
+AI-Arena/arena/data/results/
+AI-Arena/arena/data/catalog.jsonl

@@ -1,0 +1,63 @@
+{
+ "cobol-course-01": {
+  "base": {
+   "cbl0006_base": false,
+   "cbl0006_mix1": false,
+   "cbl0006_mix2": false
+  },
+  "fingerprint": "970d24302a87f9e6"
+ },
+ "cobol-course-02": {
+  "base": {
+   "cbl0011_base": false,
+   "cbl0011_mix1": false,
+   "cbl0011_mix2": false
+  },
+  "fingerprint": "d90d794c5689c531"
+ },
+ "cobol-course-03": {
+  "base": {
+   "cbl0011_base": false,
+   "cbl0011_mix1": false,
+   "cbl0011_mix2": false
+  },
+  "fingerprint": "4fbfb26b4bf673c9"
+ },
+ "cobol-course-04": {
+  "base": {
+   "srchbin_base": false,
+   "srchbin_missing": true,
+   "srchbin_mix1": false,
+   "srchbin_mix2": false,
+   "srchbin_mix3": false,
+   "srchbin_small": true
+  },
+  "fingerprint": "9e4d567b486ea8a6"
+ },
+ "cobol-course-05": {
+  "base": {
+   "cbl0001_base": false,
+   "cbl0001_mix1": false,
+   "cbl0001_mix2": false
+  },
+  "fingerprint": "4b820ac8da51f311"
+ },
+ "cobol-course-06": {
+  "base": {
+   "cbl0011_base": false,
+   "cbl0011_mix1": false,
+   "cbl0011_mix2": false
+  },
+  "fingerprint": "893d6aadb6fc1bc3"
+ },
+ "cobol-course-07": {
+  "base": {
+   "cbl0006_base": true,
+   "cbl0006_mix1": true,
+   "cbl0006_state_newyork": false,
+   "cbl0006_state_ohio": false,
+   "cbl0006_state_virginia": true
+  },
+  "fingerprint": "9685fcc2fa24c06e"
+ }
+}

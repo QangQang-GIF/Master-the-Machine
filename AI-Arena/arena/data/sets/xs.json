@@ -1,0 +1,23 @@
+{
+ "seed": 7,
+ "size": "xs",
+ "per_fpt_stack": 1,
+ "others": 0,
+ "skip_stacks": [
+  "java"
+ ],
+ "excluded": {
+  "multi-swe/elastic__logstash-15928": "MVS check rebuilds and runs the whole logstash suite: >12 min per check"
+ },
+ "missing_stacks": [
+  "dotnet",
+  "angular"
+ ],
+ "deadlines": {
+  "cobol/cobol-carddemo-16": 12
+ },
+ "items": [
+  "swe-pro/instance_element-hq__element-web-ee13e23b156fbad9369d6a656c827b6444343d4f-vnan",
+  "cobol/cobol-carddemo-16"
+ ]
+}

@@ -1,0 +1,8 @@
+       01 WS-I PIC 9(4).
+
+       PROCEDURE DIVISION USING LINKED-ITEMS.
+           PERFORM VARYING WS-I FROM 1 BY 1 UNTIL WS-I > 3
+               COMPUTE RESULT(WS-I) = L-L(WS-I) + 1
+           END-PERFORM
+           GOBACK.
+       END PROGRAM INCR-LIST.
