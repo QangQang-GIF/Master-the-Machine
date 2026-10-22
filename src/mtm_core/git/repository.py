@@ -30,6 +30,7 @@ def git_init(path: Path | str, user_name: str = "mtm-agent", user_email: str = "
         ["config", "user.email", user_email],
         ["add", "-A"],
         ["commit", "-q", "-m", "base", "--allow-empty"],
+        ["branch", "-M", "main"],
     ]
     for args in steps:
         res = run_git(p, args)

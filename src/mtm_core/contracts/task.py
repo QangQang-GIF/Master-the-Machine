@@ -28,8 +28,9 @@ class TaskEnvelope:
     match_remaining_time: Optional[float] = None
     mvs: Optional[List[Dict[str, Any]]] = None
     evidence_required: List[str] = field(default_factory=list)
-    model: Optional[str] = "gpt-6.1-sol"
-    reasoning_effort: str = "medium"
+    model: Optional[str] = None
+    reasoning_effort: Optional[str] = None
+    backend: str = "codex"  # "codex" | "antigravity"
     token_budget: Optional[int] = None
     sandbox_policy: str = "workspace-write"
     allowed_paths: List[str] = field(default_factory=list)

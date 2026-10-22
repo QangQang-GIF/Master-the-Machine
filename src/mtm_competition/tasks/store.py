@@ -39,6 +39,7 @@ class TaskStore:
                 description TEXT,
                 points INTEGER DEFAULT 0,
                 deadline_epoch REAL,
+                time_budget_seconds INTEGER DEFAULT 420,
                 status TEXT NOT NULL,
                 repo_path TEXT,
                 base_revision TEXT,
@@ -65,8 +66,11 @@ class TaskStore:
                 task_id TEXT PRIMARY KEY,
                 status TEXT NOT NULL,
                 score INTEGER DEFAULT 0,
+                git_revision TEXT,
+                submission_id TEXT,
                 response_json TEXT,
-                submitted_at REAL
+                submitted_at REAL,
+                updated_at REAL
             );
 
             CREATE TABLE IF NOT EXISTS events (
@@ -80,6 +84,18 @@ class TaskStore:
             );
             """)
 
+            # Safe column migrations for existing databases
+            for col, col_type in [("git_revision", "TEXT"), ("submission_id", "TEXT"), ("updated_at", "REAL")]:
+                try:
+                    self.conn.execute(f"ALTER TABLE submissions ADD COLUMN {col} {col_type}")
+                except sqlite3.OperationalError:
+                    pass
+
+            try:
+                self.conn.execute("ALTER TABLE tasks ADD COLUMN time_budget_seconds INTEGER DEFAULT 420")
+            except sqlite3.OperationalError:
+                pass
+
     def add_task(self, envelope: TaskEnvelope, match_id: str = "default_match") -> None:
         """Register a new task discovered from Game Master."""
         now = time.time()
@@ -87,9 +103,9 @@ class TaskStore:
             self.conn.execute("""
             INSERT OR REPLACE INTO tasks (
                 task_id, match_id, task_type, title, description, points,
-                deadline_epoch, status, repo_path, base_revision, mvs_json,
+                deadline_epoch, time_budget_seconds, status, repo_path, base_revision, mvs_json,
                 evidence_required_json, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 envelope.task_id,
                 match_id,
@@ -98,6 +114,7 @@ class TaskStore:
                 envelope.description,
                 envelope.points,
                 envelope.deadline_epoch,
+                envelope.time_budget_seconds or 420,
                 TaskState.DISCOVERED.value,
                 envelope.repo_path,
                 envelope.base_revision,
@@ -168,10 +185,47 @@ class TaskStore:
             ))
 
     def has_submitted(self, task_id: str) -> bool:
-        """Check if task has already been submitted (idempotency guard)."""
+        """Check if task has already been submitted or is currently in flight (idempotency guard)."""
         cursor = self.conn.cursor()
-        cursor.execute("SELECT 1 FROM submissions WHERE task_id = ?", (task_id,))
-        return cursor.fetchone() is not None
+        cursor.execute("SELECT status FROM submissions WHERE task_id = ?", (task_id,))
+        row = cursor.fetchone()
+        if not row:
+            return False
+        st = row["status"]
+        return st in ("ACCEPTED", "PASSED", "SUBMIT_IN_FLIGHT", "SUBMITTED")
+
+    def is_in_flight(self, task_id: str) -> bool:
+        """Check if task has an in-flight network submission pending."""
+        cursor = self.conn.cursor()
+        cursor.execute("SELECT status FROM submissions WHERE task_id = ?", (task_id,))
+        row = cursor.fetchone()
+        return bool(row and row["status"] == "SUBMIT_IN_FLIGHT")
+
+    def get_submission(self, task_id: str) -> Optional[Dict[str, Any]]:
+        """Fetch submission record."""
+        cursor = self.conn.cursor()
+        cursor.execute("SELECT * FROM submissions WHERE task_id = ?", (task_id,))
+        row = cursor.fetchone()
+        return dict(row) if row else None
+
+    def start_submission(self, task_id: str, git_revision: str) -> bool:
+        """Atomically record SUBMIT_IN_FLIGHT marker before network transmission."""
+        sub = self.get_submission(task_id)
+        if sub and sub["status"] in ("ACCEPTED", "PASSED"):
+            return False  # Already permanently submitted
+
+        now = time.time()
+        with self.conn:
+            self.conn.execute("""
+            INSERT OR REPLACE INTO submissions (task_id, status, score, git_revision, submitted_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """, (task_id, "SUBMIT_IN_FLIGHT", 0, git_revision, now, now))
+            self.conn.execute(
+                "UPDATE tasks SET status = ?, updated_at = ? WHERE task_id = ?",
+                (TaskState.SUBMIT_IN_FLIGHT.value, now, task_id),
+            )
+            self.record_event(task_id, "SUBMISSION_IN_FLIGHT", TaskState.READY_TO_SUBMIT.value, TaskState.SUBMIT_IN_FLIGHT.value, {"git_revision": git_revision})
+        return True
 
     def record_submission(
         self,
@@ -179,28 +233,68 @@ class TaskStore:
         status: str,
         score: int = 0,
         response_json: Optional[Dict[str, Any]] = None,
+        git_revision: Optional[str] = None,
+        submission_id: Optional[str] = None,
     ) -> bool:
         """Record a submission. Enforces once-only submission invariant."""
-        if self.has_submitted(task_id):
+        sub = self.get_submission(task_id)
+        if sub and sub["status"] in ("ACCEPTED", "PASSED") and status != "PASSED":
             return False  # Block duplicate submission
 
+        now = time.time()
         with self.conn:
             self.conn.execute("""
-            INSERT INTO submissions (task_id, status, score, response_json, submitted_at)
-            VALUES (?, ?, ?, ?, ?)
+            INSERT OR REPLACE INTO submissions (task_id, status, score, git_revision, submission_id, response_json, submitted_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 task_id,
                 status,
                 score,
+                git_revision,
+                submission_id,
                 json.dumps(response_json or {}),
-                time.time(),
+                now,
+                now,
             ))
+            final_task_state = TaskState.SUBMITTED.value if status in ("ACCEPTED", "PASSED", "SUBMITTED") else TaskState.REJECTED.value
             self.conn.execute(
                 "UPDATE tasks SET status = ?, updated_at = ? WHERE task_id = ?",
-                (TaskState.SUBMITTED.value, time.time(), task_id),
+                (final_task_state, now, task_id),
             )
             self.record_event(task_id, "SUBMISSION_RECORDED", None, status, {"score": score})
         return True
+
+    def update_submission_status(
+        self,
+        task_id: str,
+        status: str,
+        score: Optional[int] = None,
+        response_json: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """Update grading status of an existing submission (e.g. GRADING -> PASSED/FAILED)."""
+        sub = self.get_submission(task_id)
+        if not sub:
+            return
+        now = time.time()
+        final_score = score if score is not None else sub.get("score", 0)
+        with self.conn:
+            self.conn.execute("""
+            UPDATE submissions SET status = ?, score = ?, response_json = ?, updated_at = ?
+            WHERE task_id = ?
+            """, (status, final_score, json.dumps(response_json or {}), now, task_id))
+
+            if status == "PASSED":
+                task_state = TaskState.PASSED.value
+            elif status == "FAILED":
+                task_state = TaskState.FAILED.value
+            else:
+                task_state = TaskState.SUBMITTED.value
+
+            self.conn.execute(
+                "UPDATE tasks SET status = ?, updated_at = ? WHERE task_id = ?",
+                (task_state, now, task_id),
+            )
+            self.record_event(task_id, "GRADING_STATUS_UPDATED", sub["status"], status, {"score": final_score})
 
     def record_event(
         self,

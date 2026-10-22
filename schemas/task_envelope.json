@@ -76,9 +76,15 @@
       "description": "LLM model requested for this worker execution"
     },
     "reasoning_effort": {
-      "type": "string",
-      "enum": ["low", "medium", "high", "xhigh", "max"],
+      "type": ["string", "null"],
+      "enum": ["low", "medium", "high", "xhigh", "max", null],
       "default": "medium"
+    },
+    "backend": {
+      "type": "string",
+      "enum": ["codex", "antigravity"],
+      "default": "codex",
+      "description": "Worker execution backend: codex CLI or Antigravity agy CLI"
     },
     "time_budget_seconds": {
       "type": "integer",

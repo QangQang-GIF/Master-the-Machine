@@ -27,8 +27,24 @@ VALID_TRANSITIONS: Dict[TaskState, Set[TaskState]] = {
         TaskState.TIMED_OUT,
         TaskState.ABORTED,
     },
-    TaskState.READY_TO_SUBMIT: {TaskState.SUBMITTED, TaskState.ABORTED},
-    TaskState.SUBMITTED: set(),  # Terminal state
+    TaskState.READY_TO_SUBMIT: {
+        TaskState.SUBMIT_IN_FLIGHT,
+        TaskState.SUBMITTED,
+        TaskState.REJECTED,
+        TaskState.ABORTED,
+    },
+    TaskState.SUBMIT_IN_FLIGHT: {
+        TaskState.SUBMITTED,
+        TaskState.REJECTED,
+        TaskState.ABORTED,
+    },
+    TaskState.SUBMITTED: {
+        TaskState.PASSED,
+        TaskState.FAILED,
+        TaskState.REJECTED,
+    },
+    TaskState.PASSED: set(),  # Terminal state
+    TaskState.FAILED: {TaskState.QUEUED, TaskState.ABORTED},
     TaskState.REJECTED: {TaskState.QUEUED, TaskState.ABORTED},
     TaskState.TIMED_OUT: {TaskState.QUEUED, TaskState.ABORTED},
     TaskState.BLOCKED: {TaskState.QUEUED, TaskState.ABORTED},

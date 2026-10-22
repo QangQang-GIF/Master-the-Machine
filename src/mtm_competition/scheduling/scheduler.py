@@ -26,8 +26,44 @@ class TournamentScheduler:
         self.match_start_time = time.time()
         self.running_tasks: Dict[str, Dict[str, Any]] = {}
 
+        # Server clock synchronization
+        self.clock_offset: float = 0.0
+        self.server_remaining_seconds: Optional[float] = None
+        self.last_sync_time: float = time.time()
+        self.match_status: str = "RUNNING"
+        self.is_paused: bool = False
+
+    def sync_with_game_master(self, match_state: Dict[str, Any]) -> None:
+        """Calibrate server epoch, clock offset, remaining time, and pause state."""
+        server_epoch = match_state.get("server_epoch")
+        if server_epoch is not None:
+            self.clock_offset = float(server_epoch) - time.time()
+
+        if "remaining_seconds" in match_state:
+            self.server_remaining_seconds = float(match_state["remaining_seconds"])
+            self.last_sync_time = time.time()
+
+        if "status" in match_state:
+            self.match_status = str(match_state["status"]).upper()
+            self.is_paused = (self.match_status == "PAUSED")
+
+    @property
+    def current_server_time(self) -> float:
+        """Current epoch timestamp synchronized with Game Master server clock."""
+        return time.time() + self.clock_offset
+
     @property
     def match_remaining_seconds(self) -> float:
+        """Match duration remaining, respecting server clock and pause state."""
+        if self.match_status == "FINISHED":
+            return 0.0
+
+        if self.server_remaining_seconds is not None:
+            if self.is_paused:
+                return self.server_remaining_seconds
+            elapsed_since_sync = time.time() - self.last_sync_time
+            return max(0.0, self.server_remaining_seconds - elapsed_since_sync)
+
         elapsed = time.time() - self.match_start_time
         return max(0.0, self.match_duration - elapsed)
 
@@ -41,6 +77,10 @@ class TournamentScheduler:
 
     def select_next_task(self) -> Optional[Dict[str, Any]]:
         """Select highest EV task from queued backlog."""
+        # Never schedule new tasks while match is PAUSED or FINISHED
+        if self.is_paused or self.match_status == "FINISHED":
+            return None
+
         if not self.has_capacity:
             return None
 
@@ -84,3 +124,19 @@ class TournamentScheduler:
         """Deregister running task upon completion."""
         self.running_tasks.pop(task_id, None)
         self.store.update_task_status(task_id, final_state)
+
+    def check_preemption(self, incoming_task: Dict[str, Any]) -> Optional[str]:
+        """Check if incoming task should preempt any currently running worker.
+
+        Returns task_id to preempt if policy triggers, else None.
+        """
+        for running_id, running_task in list(self.running_tasks.items()):
+            elapsed = time.time() - float(running_task.get("start_time") or time.time())
+            if PreemptionPolicy.should_preempt(incoming_task, running_task, elapsed):
+                return running_id
+        return None
+
+    def requeue_task(self, task_id: str) -> None:
+        """Deregister running task and return back to QUEUED for later execution."""
+        self.running_tasks.pop(task_id, None)
+        self.store.update_task_status(task_id, TaskState.QUEUED)

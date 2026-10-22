@@ -154,8 +154,25 @@ def validate_qa_gate(
 
     # 6. Status and test consistency
     if result["status"] == "READY_FOR_REVIEW":
-        for tr in result.get("test_results", []):
+        task_type = str(envelope.get("task_type", "BUG")).upper()
+        test_results = result.get("test_results", [])
+        if task_type in ("CR", "BUG", "PI") and not test_results:
+            raise QAGateError(
+                f"Task {envelope.get('task_id')} of type '{task_type}' requires test verification, but test_results is empty"
+            )
+        for tr in test_results:
             if not tr.get("passed"):
                 raise QAGateError(
                     f"Status is READY_FOR_REVIEW but test failed: {tr.get('command')}"
                 )
+
+
+def reverify_tests_independently(workspace_dir: Path | str, commands: List[str]) -> bool:
+    """Independently re-run test commands to verify worker's reported claims."""
+    import subprocess
+    ws = Path(workspace_dir).resolve()
+    for cmd in commands:
+        proc = subprocess.run(cmd, shell=True, cwd=str(ws), capture_output=True, text=True)
+        if proc.returncode != 0:
+            return False
+    return True

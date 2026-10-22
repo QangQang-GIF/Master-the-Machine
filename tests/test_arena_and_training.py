@@ -89,7 +89,12 @@ def test_offline_self_learning_lifecycle(tmp_path):
     assert rej.promoted is False
     assert "regressed" in rej.reason
 
-    # Approval scenario: pass rate improves
+    # Rejection scenario: token increase exceeds 10% threshold
+    rej_tokens = gate.evaluate_and_promote(proposal, baseline_pass_rate=0.8, candidate_pass_rate=0.85, candidate_tokens=1150, baseline_tokens=1000)
+    assert rej_tokens.promoted is False
+    assert "increased excessively" in rej_tokens.reason
+
+    # Approval scenario: pass rate improves with acceptable tokens
     app = gate.evaluate_and_promote(proposal, baseline_pass_rate=0.8, candidate_pass_rate=0.9, candidate_tokens=1050, baseline_tokens=1000)
     assert app.promoted is True
     assert app.to_version == "1.1.0"

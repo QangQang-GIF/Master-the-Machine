@@ -55,12 +55,15 @@ Master-the-Machine/
 │       ├── skill_evolver.py
 │       └── promotion.py
 ├── AI-Arena/                          # Benchmark arena harnesses & test suites
-└── tests/                             # 34 automated unit & integration tests
+└── tests/                             # 59 automated unit, integration & E2E scenario tests
 ```
 
 ## 3. Architecture Modules
-- **`mtm_core`**: Universal contracts (`TaskEnvelope`, `WorkerResult`), unified headless execution (`CodexRuntime`), Git worktree isolation, and typed config loader.
-- **`mtm_competition`**: Strict tournament pipeline with prioritized backlog scheduling, deterministic state machine, prompt routing, worker isolation, QA gating, and once-only submission guards.
+- **`mtm_core`**: Universal contracts (`TaskEnvelope`, `WorkerResult`), unified headless execution (`CodexRuntime` supporting `codex` and `agy`), Git worktree isolation, and typed config loader with SHA256 skill verification.
+- **`mtm_competition`**: Strict tournament pipeline with prioritized backlog scheduling, server-clock synchronization, PI preemption, deterministic state machine, prompt routing, worker isolation, QA gating, post-integration verification, Git push verification, and once-only in-flight submission guards.
+  - **`OfficialGameMasterAdapter`**: Production HTTP REST adapter with retry backoff, client error safety, server clock sync, and two-phase grading support (`ACCEPTED` → `PASSED`/`FAILED`).
+  - **`IntegrationGuard`**: Clean file/diff integration, post-integration test verification, and automated push to remote tracking branches (`git push origin <branch>`).
+  - **`SubmissionGuard`**: Zero-duplicate submission gating with atomic in-flight ledger markers and crash/network timeout reconciliation.
 - **`mtm_arena`**: Dynamic leaderboard evaluation, composite scoring, and offline scenario simulation.
 - **`mtm_training`**: Autonomous failure clustering, lesson extraction, shadow A/B benchmarking, and rollback-safe skill promotion.
 

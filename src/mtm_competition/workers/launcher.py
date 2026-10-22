@@ -22,24 +22,37 @@ class WorkerLauncher:
         self,
         scratch_dir: Path | str,
         runtime: Optional[CodexRuntime] = None,
+        backend: str = "codex",
+        strict_backend: bool = True,
+        allow_fallback: bool = False,
     ):
         self.workspace_mgr = WorkspaceManager(scratch_dir)
-        self.runtime = runtime or CodexRuntime(prefer_codex=True, allow_agy_fallback=True)
-        self.model_router = ModelRouter()
+        self.backend = backend
+        self.strict_backend = strict_backend
+        self.allow_fallback = allow_fallback
+        self.runtime = runtime or CodexRuntime(
+            prefer_codex=(backend != "antigravity"),
+            allow_agy_fallback=allow_fallback,
+            default_backend=backend,
+            strict_backend=strict_backend,
+        )
+        self.model_router = ModelRouter(default_backend=backend)
 
     def launch(
         self,
         envelope: TaskEnvelope | Dict[str, Any],
         attempt_number: int = 1,
+        backend: Optional[str] = None,
     ) -> Tuple[WorkerResult, ExecutionTrace, Path]:
         """Execute task in an isolated workspace.
 
         Returns (WorkerResult, ExecutionTrace, isolated_workspace_path).
         """
         env_dict = envelope.to_dict() if isinstance(envelope, TaskEnvelope) else dict(envelope)
+        target_backend = backend or env_dict.get("backend") or self.backend
 
         # Route model, effort, skills
-        routing = self.model_router.route(env_dict, attempt_number=attempt_number)
+        routing = self.model_router.route(env_dict, attempt_number=attempt_number, backend=target_backend)
         model = env_dict.get("model") or routing.model
         effort = env_dict.get("reasoning_effort") or routing.reasoning_effort
         timeout = int(env_dict.get("time_budget_seconds") or routing.timeout_seconds)
@@ -70,6 +83,7 @@ class WorkerLauncher:
             effort=effort,
             timeout=timeout,
             log_file=trace_log,
+            backend=routing.backend,
         )
 
         trace = runtime_res.trace
@@ -98,10 +112,14 @@ class WorkerLauncher:
             try:
                 res_data = json.loads(res_file.read_text(encoding="utf-8"))
                 result = WorkerResult.from_dict(res_data)
+                # If runtime failed with non-zero exit code, don't let it pass as READY_FOR_REVIEW
+                if runtime_res.exit_code != 0 and result.status == WorkerStatus.READY_FOR_REVIEW.value:
+                    result.status = WorkerStatus.FAILED
+                    result.unresolved_risks.append(f"Runtime process exited with non-zero code {runtime_res.exit_code}")
             except Exception:
-                result = self._synthesize_result(env_dict, ws_path, skills, elapsed)
+                result = self._synthesize_result(env_dict, ws_path, skills, elapsed, exit_code=runtime_res.exit_code)
         else:
-            result = self._synthesize_result(env_dict, ws_path, skills, elapsed)
+            result = self._synthesize_result(env_dict, ws_path, skills, elapsed, exit_code=runtime_res.exit_code)
 
         result.elapsed_seconds = elapsed
         result.usage = runtime_res.usage
@@ -116,6 +134,7 @@ class WorkerLauncher:
         ws: Path,
         skills: list[str],
         elapsed: float,
+        exit_code: int = 0,
     ) -> WorkerResult:
         changed = []
         try:
@@ -126,7 +145,26 @@ class WorkerLauncher:
         except Exception:
             pass
 
-        status = WorkerStatus.READY_FOR_REVIEW if changed else WorkerStatus.FAILED
+        task_type = str(env.get("task_type", "BUG")).upper()
+        # Non-zero exit code or CR/BUG/PI without explicit tests cannot be READY_FOR_REVIEW
+        if exit_code != 0 or not changed:
+            status = WorkerStatus.FAILED
+        elif task_type in ("CR", "BUG", "PI"):
+            # Rigorous: CR, BUG, and PI require passing tests, cannot synthesize READY_FOR_REVIEW without tests
+            status = WorkerStatus.FAILED
+        else:
+            # Simple TASK may be reviewable if files changed
+            status = WorkerStatus.READY_FOR_REVIEW
+
+        unresolved = []
+        if status == WorkerStatus.FAILED:
+            if exit_code != 0:
+                unresolved.append(f"Runtime process exited with code {exit_code}")
+            elif not changed:
+                unresolved.append("No files were changed")
+            else:
+                unresolved.append(f"{task_type} requires verified test execution, none was found")
+
         return WorkerResult(
             task_id=env["task_id"],
             status=status,
@@ -135,4 +173,5 @@ class WorkerLauncher:
             test_results=[],
             evidence_paths=["trace.jsonl"] if (ws / "trace.jsonl").exists() else [],
             elapsed_seconds=elapsed,
+            unresolved_risks=unresolved,
         )

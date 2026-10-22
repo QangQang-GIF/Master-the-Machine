@@ -31,9 +31,10 @@ def test_codex_command_builder(tmp_path):
 
 def test_agy_command_builder():
     runtime = CodexRuntime()
-    cmd = runtime.build_agy_cmd(prompt="Hello AGY", effort="medium")
+    cmd = runtime.build_agy_cmd(prompt="Hello AGY", effort="medium", model="gemini-3.8-flash-high")
     assert cmd[0] == "agy"
     assert "-p" in cmd and "Hello AGY" in cmd
+    assert "--model" in cmd and "gemini-3.8-flash-high" in cmd
     assert "--effort" in cmd and "medium" in cmd
     assert "--dangerously-skip-permissions" in cmd
 

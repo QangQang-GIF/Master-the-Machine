@@ -12,6 +12,7 @@ class RoutingDecision:
     model: str = "gpt-6.1-sol"
     reasoning_effort: str = "medium"
     timeout_seconds: int = 420
+    backend: str = "codex"  # "codex" | "antigravity"
     token_budget: Optional[int] = None
     rationale: str = ""
     metadata: Dict[str, Any] = field(default_factory=dict)

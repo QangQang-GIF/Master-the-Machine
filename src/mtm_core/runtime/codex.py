@@ -45,11 +45,15 @@ class CodexRuntime:
         allow_agy_fallback: bool = True,
         codex_path: Optional[str] = None,
         agy_path: Optional[str] = None,
+        default_backend: str = "auto",
+        strict_backend: bool = False,
     ):
         self.prefer_codex = prefer_codex
         self.allow_agy_fallback = allow_agy_fallback
         self.codex_path = codex_path if codex_path is not None else shutil.which("codex")
         self.agy_path = agy_path if agy_path is not None else shutil.which("agy")
+        self.default_backend = default_backend
+        self.strict_backend = strict_backend
 
     @property
     def has_codex(self) -> bool:
@@ -96,13 +100,16 @@ class CodexRuntime:
         self,
         prompt: str,
         effort: Optional[str] = None,
+        model: Optional[str] = None,
     ) -> List[str]:
-        """Construct Antigravity CLI fallback command."""
+        """Construct Antigravity CLI command."""
         cmd = [
             "agy", "-p", prompt,
             "--dangerously-skip-permissions",
             "--output-format", "json"
         ]
+        if model:
+            cmd += ["--model", model]
         if effort:
             cmd += ["--effort", effort]
         return cmd
@@ -118,15 +125,21 @@ class CodexRuntime:
         network_access: bool = True,
         codex_config: Optional[Dict[str, Any]] = None,
         log_file: Optional[Path | str] = None,
+        backend: Optional[str] = None,
     ) -> RuntimeResult:
         """Execute a worker in the given workspace.
 
         Guarantees strict timeout semantics:
         - If the process exceeds timeout, it is killed immediately and timed_out=True.
         - timed_out != READY_FOR_REVIEW.
+        - Backend selection: 'codex' or 'antigravity' (no silent fallbacks if explicitly requested).
         """
         ws = Path(workspace).resolve()
         ws.mkdir(parents=True, exist_ok=True)
+
+        target_backend = (backend or self.default_backend).lower()
+        if self.strict_backend and target_backend not in ("codex", "antigravity"):
+            target_backend = "codex"
 
         timed_out = False
         exit_code = 0
@@ -134,7 +147,31 @@ class CodexRuntime:
         trace = ExecutionTrace()
         t0 = time.time()
 
-        if self.prefer_codex and self.has_codex:
+        if target_backend == "codex":
+            if not self.has_codex:
+                raise RuntimeError(
+                    "Backend 'codex' explicitly selected but `codex` CLI is not available on PATH."
+                )
+            use_codex = True
+        elif target_backend == "antigravity":
+            if not self.has_agy:
+                raise RuntimeError(
+                    "Backend 'antigravity' explicitly selected but `agy` CLI is not available on PATH."
+                )
+            use_codex = False
+        else:
+            # Auto-detection with preference and fallback
+            if self.prefer_codex and self.has_codex:
+                use_codex = True
+            elif self.allow_agy_fallback and self.has_agy:
+                use_codex = False
+            else:
+                raise RuntimeError(
+                    "Neither `codex` nor `agy` CLI is available on PATH. "
+                    "Ensure Codex CLI is installed or configure fallback."
+                )
+
+        if use_codex:
             cmd = self.build_codex_cmd(
                 workspace=ws,
                 prompt=prompt,
@@ -165,8 +202,8 @@ class CodexRuntime:
 
             trace = parse_codex_trace(stdout_text)
 
-        elif self.allow_agy_fallback and self.has_agy:
-            cmd = self.build_agy_cmd(prompt=prompt, effort=effort)
+        else:
+            cmd = self.build_agy_cmd(prompt=prompt, effort=effort, model=model)
             proc = subprocess.Popen(
                 cmd,
                 stdin=subprocess.DEVNULL,
@@ -188,12 +225,6 @@ class CodexRuntime:
                 exit_code = -1
 
             trace = parse_agy_trace(stdout_text)
-
-        else:
-            raise RuntimeError(
-                "Neither `codex` nor `agy` CLI is available on PATH. "
-                "Ensure Codex CLI is installed or configure fallback."
-            )
 
         elapsed = round(time.time() - t0, 2)
 

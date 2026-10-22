@@ -1,5 +1,12 @@
 mode: development
 supervisor: antigravity_or_codex_desktop
+orchestrator:
+  worker_backend: antigravity
+
+worker:
+  strict_backend: true
+  allow_fallback: false
+
 skills:
   registry_dir: .agents/skills
   mutable: true

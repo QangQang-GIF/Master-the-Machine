@@ -1,5 +1,12 @@
 mode: production
 supervisor: none
+orchestrator:
+  worker_backend: codex
+
+worker:
+  strict_backend: true
+  allow_fallback: false
+
 skills:
   registry_dir: .agents/skills
   mutable: false

@@ -25,9 +25,11 @@ class PromotionGate:
         self,
         skills_dir: Path | str = ".agents/skills",
         registry_manifest: Path | str = "skills_registry/manifest.json",
+        max_token_increase_ratio: float = 1.10,
     ):
         self.skills_dir = Path(skills_dir).resolve()
         self.manifest_path = Path(registry_manifest).resolve()
+        self.max_token_increase_ratio = max_token_increase_ratio
 
     def evaluate_and_promote(
         self,
@@ -39,7 +41,7 @@ class PromotionGate:
     ) -> PromotionDecision:
         # Promotion criteria:
         # 1. Pass rate must not regress (candidate_pass_rate >= baseline_pass_rate)
-        # 2. Token efficiency should not degrade by more than 10%
+        # 2. Token efficiency should not degrade by more than allowed threshold (default 10%)
         if candidate_pass_rate < baseline_pass_rate:
             return PromotionDecision(
                 promoted=False,
@@ -49,13 +51,14 @@ class PromotionGate:
                 reason=f"Pass rate regressed from {baseline_pass_rate} to {candidate_pass_rate}",
             )
 
-        if candidate_tokens > (baseline_tokens * 1.15):
+        max_allowed_tokens = baseline_tokens * self.max_token_increase_ratio
+        if candidate_tokens > max_allowed_tokens:
             return PromotionDecision(
                 promoted=False,
                 skill_name=proposal.base_skill,
                 from_version=proposal.base_version,
                 to_version=proposal.candidate_version,
-                reason=f"Candidate token consumption increased excessively ({candidate_tokens} vs {baseline_tokens})",
+                reason=f"Candidate token consumption increased excessively ({candidate_tokens} vs {baseline_tokens}, allowed: {max_allowed_tokens:.0f})",
             )
 
         # Apply promotion to SKILL.md

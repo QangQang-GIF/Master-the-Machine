@@ -26,7 +26,7 @@ class SubmissionResult:
 
 
 class SubmissionGuard:
-    """Enforces zero-duplicate, fully-verified submission gating."""
+    """Enforces zero-duplicate, fully-verified submission gating with server-clock awareness and in-flight reconciliation."""
 
     def __init__(self, task_store: TaskStore):
         self.store = task_store
@@ -36,12 +36,15 @@ class SubmissionGuard:
         envelope: TaskEnvelope,
         worker_result: WorkerResult,
         revision: VerifiedRevision,
+        current_time: Optional[float] = None,
     ) -> None:
         """Run all pre-submission gating checks."""
         task_id = envelope.task_id
+        now = current_time if current_time is not None else time.time()
 
         # 1. Idempotency: Has this task already been submitted?
-        if self.store.has_submitted(task_id):
+        # Note: If it is marked in-flight, execute_guarded_submission reconciles with GM.
+        if self.store.has_submitted(task_id) and not self.store.is_in_flight(task_id):
             raise SubmissionGateError(f"Task {task_id} has already been submitted! Once-only policy blocks re-submission.")
 
         # 2. Worker result status must be READY_FOR_REVIEW
@@ -52,9 +55,9 @@ class SubmissionGuard:
         if not revision or not revision.commit_sha:
             raise SubmissionGateError(f"Cannot submit task {task_id}: missing verified Git revision")
 
-        # 4. Deadline check
-        if envelope.deadline_epoch and time.time() > envelope.deadline_epoch:
-            raise SubmissionGateError(f"Cannot submit task {task_id}: deadline expired at {envelope.deadline_epoch}")
+        # 4. Deadline check using server/calibrated time
+        if envelope.deadline_epoch and now > envelope.deadline_epoch:
+            raise SubmissionGateError(f"Cannot submit task {task_id}: deadline expired at {envelope.deadline_epoch} (current time {now})")
 
         # 5. Required evidence presence check
         for req_ev in envelope.evidence_required:
@@ -72,13 +75,33 @@ class SubmissionGuard:
         worker_result: WorkerResult,
         revision: VerifiedRevision,
         game_master_submit_fn: Any,
+        game_master_status_fn: Optional[Any] = None,
+        current_time: Optional[float] = None,
     ) -> SubmissionResult:
-        """Atomically transition state to SUBMITTING, invoke GM submission, and record outcome."""
-        self.validate_pre_submission(envelope, worker_result, revision)
-
+        """Atomically record SUBMIT_IN_FLIGHT, invoke GM submission, and record outcome with timeout reconciliation."""
         task_id = envelope.task_id
-        # Transition state machine to SUBMITTING / READY_TO_SUBMIT
-        self.store.update_task_status(task_id, TaskState.READY_TO_SUBMIT)
+
+        # Reconciliation: If task is already marked in-flight, check server status first
+        if self.store.is_in_flight(task_id) and game_master_status_fn:
+            try:
+                server_status = game_master_status_fn(task_id)
+                st = server_status.get("status")
+                if st in ("ACCEPTED", "PASSED"):
+                    pts = int(server_status.get("points") or envelope.points)
+                    self.store.record_submission(task_id, status=st, score=pts, response_json=server_status, git_revision=revision.commit_sha)
+                    return SubmissionResult(
+                        success=True,
+                        task_id=task_id,
+                        points_awarded=pts,
+                        status=st,
+                    )
+            except Exception:
+                pass
+
+        self.validate_pre_submission(envelope, worker_result, revision, current_time=current_time)
+
+        # Transition state machine and record atomic in-flight marker
+        self.store.start_submission(task_id, git_revision=revision.commit_sha)
 
         try:
             # Call Game Master adapter
@@ -87,21 +110,58 @@ class SubmissionGuard:
                 git_revision=revision.commit_sha,
                 evidence=worker_result.evidence_paths,
             )
-            score = int(response.get("points") or envelope.points if response.get("status") == "ACCEPTED" else 0)
             status = response.get("status", "ACCEPTED")
+            score = int(response.get("points") or (envelope.points if status == "ACCEPTED" else 0))
+            sub_id = response.get("submission_id")
 
             # Record in TaskStore once-only ledger
-            self.store.record_submission(task_id, status=status, score=score, response_json=response)
-            self.store.update_task_status(task_id, TaskState.SUBMITTED, {"score": score})
+            self.store.record_submission(
+                task_id=task_id,
+                status=status,
+                score=score,
+                response_json=response,
+                git_revision=revision.commit_sha,
+                submission_id=sub_id,
+            )
 
             return SubmissionResult(
                 success=(status in ("ACCEPTED", "PASSED")),
                 task_id=task_id,
+                submission_id=sub_id,
                 points_awarded=score,
                 status=status,
             )
         except Exception as e:
-            self.store.record_event(task_id, "SUBMISSION_FAILED", TaskState.READY_TO_SUBMIT.value, TaskState.REJECTED.value, {"error": str(e)})
+            # Network error or timeout during submit: check server to see if it landed
+            if game_master_status_fn:
+                try:
+                    reconciled = game_master_status_fn(task_id)
+                    st = reconciled.get("status")
+                    if st in ("ACCEPTED", "PASSED"):
+                        score = int(reconciled.get("points") or envelope.points)
+                        self.store.record_submission(
+                            task_id=task_id,
+                            status=st,
+                            score=score,
+                            response_json=reconciled,
+                            git_revision=revision.commit_sha,
+                        )
+                        return SubmissionResult(
+                            success=True,
+                            task_id=task_id,
+                            points_awarded=score,
+                            status=st,
+                        )
+                except Exception:
+                    pass
+
+            self.store.record_event(
+                task_id,
+                "SUBMISSION_FAILED",
+                TaskState.SUBMIT_IN_FLIGHT.value,
+                TaskState.REJECTED.value,
+                {"error": str(e)},
+            )
             return SubmissionResult(
                 success=False,
                 task_id=task_id,

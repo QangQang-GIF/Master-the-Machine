@@ -44,3 +44,41 @@ def load_model_profiles() -> Dict[str, Any]:
         if alt.exists():
             return load_yaml(alt)
     return load_yaml(target)
+
+
+def verify_skill_checksums(
+    root_dir: Path | str,
+    checksum_file: Optional[Path | str] = None,
+) -> bool:
+    """Verify SHA256 integrity of all frozen production skills.
+
+    Raises RuntimeError if any checksum mismatch or missing skill file is detected.
+    """
+    import hashlib
+
+    base = Path(root_dir).resolve()
+    cs_path = Path(checksum_file).resolve() if checksum_file else base / "releases" / "checksums.sha256"
+    if not cs_path.exists():
+        raise FileNotFoundError(f"Skill checksum file not found: {cs_path}")
+
+    lines = cs_path.read_text(encoding="utf-8").splitlines()
+    for line in lines:
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        parts = line.split(None, 1)
+        if len(parts) != 2:
+            continue
+        expected_hash, rel_path = parts[0], parts[1].strip()
+        target_file = base / rel_path
+        if not target_file.exists():
+            raise RuntimeError(f"Skill integrity check failed: missing file {rel_path}")
+
+        file_bytes = target_file.read_bytes()
+        actual_hash = hashlib.sha256(file_bytes).hexdigest()
+        if actual_hash.lower() != expected_hash.lower():
+            raise RuntimeError(
+                f"Skill checksum mismatch for {rel_path}: expected {expected_hash}, calculated {actual_hash}"
+            )
+
+    return True
