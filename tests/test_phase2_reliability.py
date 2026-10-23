@@ -147,3 +147,112 @@ def test_environment_mode_standardization(monkeypatch):
 
     # Explicit argument takes top precedence
     assert get_environment_mode("production") == "production"
+
+
+def test_supervisor_get_result_lifecycle(tmp_path):
+    """P2: Verify WorkerSupervisor.get_result non-blocking, timeout, and preemption behaviors."""
+    supervisor = WorkerSupervisor(max_workers=2)
+
+    # Case 1: Worker currently running -> timeout=0.0 returns None non-blockingly
+    envelope1 = TaskEnvelope(
+        task_id="TASK-POLL-01",
+        task_type="BUG",
+        title="Poll Task",
+        description="Sleeps",
+        repository_path=str(tmp_path),
+        time_budget_seconds=10,
+    )
+
+    def slow_launcher(env, attempt_number=1, on_process_start=None):
+        time.sleep(0.3)
+        return WorkerResult(task_id=env.task_id, status=WorkerStatus.READY_FOR_REVIEW), ExecutionTrace(), tmp_path
+
+    supervisor.launch_async(slow_launcher, envelope1)
+
+    t0 = time.time()
+    res = supervisor.get_result(envelope1.task_id, timeout=0.0)
+    elapsed = time.time() - t0
+    assert res is None
+    assert elapsed < 0.1  # Immediate return, non-blocking
+
+    # Case 2: Worker completes within timeout -> returns result
+    res_completed = supervisor.get_result(envelope1.task_id, timeout=2.0)
+    assert res_completed is not None
+    assert res_completed[0].status == WorkerStatus.READY_FOR_REVIEW
+
+    # Case 3: Worker exceeds timeout window -> returns None, worker continues running
+    envelope2 = TaskEnvelope(
+        task_id="TASK-TIMEOUT-02",
+        task_type="BUG",
+        title="Timeout Task",
+        description="Sleeps longer",
+        repository_path=str(tmp_path),
+        time_budget_seconds=10,
+    )
+
+    def very_slow_launcher(env, attempt_number=1, on_process_start=None):
+        time.sleep(0.5)
+        return WorkerResult(task_id=env.task_id, status=WorkerStatus.READY_FOR_REVIEW), ExecutionTrace(), tmp_path
+
+    proc2 = supervisor.launch_async(very_slow_launcher, envelope2)
+    t0 = time.time()
+    res = supervisor.get_result(envelope2.task_id, timeout=0.05)
+    elapsed = time.time() - t0
+    assert res is None
+    assert 0.04 <= elapsed <= 0.2
+    assert not supervisor.is_finished(envelope2.task_id)
+
+    # Case 4: Worker is preempted while running -> returns None, status is PREEMPTED
+    supervisor.preempt_worker(envelope2.task_id)
+    assert proc2.status == "PREEMPTED"
+    res_preempted = supervisor.get_result(envelope2.task_id, timeout=0.5)
+    assert res_preempted is None
+
+
+def test_terminate_process_tree_cross_platform_and_unix_safety():
+    """Verify terminate_process_tree cleanly terminates child tree and never kills parent process group."""
+    from mtm_core.runtime.process import terminate_process_tree
+    import subprocess
+    import sys
+
+    # 1. Spawn a real background process that sleeps
+    cmd = [sys.executable, "-c", "import time; time.sleep(30)"]
+    proc = subprocess.Popen(
+        cmd,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        start_new_session=True,
+    )
+
+    assert proc.poll() is None
+    terminate_process_tree(proc)
+    assert proc.poll() is not None
+
+    # 2. Test Unix safety guard: mock pgid == parent_pgid
+    mock_proc = MagicMock()
+    mock_proc.pid = 99999
+    mock_proc.poll.return_value = None
+    with patch("sys.platform", "linux"), \
+         patch("os.getpgid", return_value=12345, create=True), \
+         patch("os.getpgrp", return_value=12345, create=True), \
+         patch("signal.SIGKILL", 9, create=True), \
+         patch("os.killpg", create=True) as mock_killpg:
+        terminate_process_tree(mock_proc)
+        # killpg must NEVER be called when child shares parent pgid!
+        mock_killpg.assert_not_called()
+        mock_proc.kill.assert_called()
+
+    # 3. Test Unix group termination: mock pgid != parent_pgid
+    mock_proc_child_group = MagicMock()
+    mock_proc_child_group.pid = 99999
+    mock_proc_child_group.poll.return_value = None
+    with patch("sys.platform", "linux"), \
+         patch("os.getpgid", return_value=99999, create=True), \
+         patch("os.getpgrp", return_value=12345, create=True), \
+         patch("signal.SIGKILL", 9, create=True), \
+         patch("os.killpg", create=True) as mock_killpg:
+        terminate_process_tree(mock_proc_child_group)
+        # killpg MUST be called on child's pgid when distinct from parent!
+        mock_killpg.assert_called_once_with(99999, 9)
+

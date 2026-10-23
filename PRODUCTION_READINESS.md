@@ -11,12 +11,12 @@
 | Requirement | Target Criteria | Actual Status | Verification Method |
 |---|---|:---:|---|
 | **Python Compatibility** | Python 3.12 & 3.13 | **PASS** | CI Matrix on Ubuntu & local Windows 3.12/3.13 verification |
-| **P0/P1 Remediations** | 100% of P0/P1 regression tests passing | **PASS** | 88 core tests + 12 component/tournament E2E tests pass (100 passed, 0 failed) |
+| **P0/P1 Remediations** | 100% of P0/P1 regression tests passing | **PASS** | 90 core tests + 12 component/tournament E2E tests pass (102 passed, 0 failed) |
 | **Independent QA & MVS** | Independent test re-verification in production | **PASS** | `QAGate` re-runs tests with real subprocesses and validates MVS |
 | **Remote Git Verification** | Commit SHA verified on remote before submit | **PASS** | `IntegrationGuard` and `GitGuard.verify_head(verify_pushed=True)` |
 | **Submission Idempotency** | Zero duplicate submissions on network timeouts | **PASS** | `SubmissionGuard` uses UUID idempotency keys and reconciles in-flight |
 | **Two-Phase Grading** | Confirmed points awarded only upon Grader PASSED | **PASS** | `TaskStore` cleanly separates provisional vs confirmed points |
-| **Clean Process Tree** | Preemption/cancel does not leave orphan processes | **PASS** | `_terminate_process_tree` (`taskkill /F /T` on Windows, `killpg` on Unix) |
+| **Clean Process Tree** | Preemption/cancel does not leave orphan processes | **PASS** | `terminate_process_tree` (`taskkill /F /T` on Windows, isolated session groups with parent protection on Unix) |
 | **Real Antigravity CLI** | Live CLI smoke tests executed without mock | **PASS** | `agy` (v1.4.6) passed functional bugfix and timeout termination |
 | **Codex CLI Live Execution** | Codex CLI smoke tests executed without mock | **PENDING** | Marked `BLOCKED`; pending `codex` binary installation on contest runner |
 | **Contest Simulation** | Full 12-event tournament lifecycle simulation | **PASS** | `tests/e2e/test_e2e_b_tournament_sim.py` passed |

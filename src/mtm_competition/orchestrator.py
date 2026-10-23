@@ -272,7 +272,11 @@ class CompetitionOrchestrator:
             return {"task_id": task_id, "status": "PREEMPTED"}
 
         try:
-            worker_res, trace, ws_path = self.supervisor.get_result(task_id, timeout=5.0)
+            res = self.supervisor.get_result(task_id, timeout=5.0)
+            if res is None:
+                self.scheduler.complete_task(task_id, TaskState.REJECTED)
+                return {"task_id": task_id, "status": "FAILED", "error": "No result returned by worker supervisor"}
+            worker_res, trace, ws_path = res
         except Exception as e:
             self.scheduler.complete_task(task_id, TaskState.REJECTED)
             return {"task_id": task_id, "status": "FAILED", "error": str(e)}

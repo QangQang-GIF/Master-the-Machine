@@ -67,21 +67,37 @@ jobs:
   staging-release-gate:
     name: Game Master Staging Live Gate
     runs-on: ubuntu-latest
-    if: "${{ env.MTM_GM_STAGING_URL != '' }}"
-    env:
-      MTM_GM_STAGING_URL: ${{ secrets.MTM_GM_STAGING_URL }}
-      MTM_GM_TOKEN: ${{ secrets.MTM_GM_TOKEN }}
-      MTM_STAGING_GM: "1"
     steps:
     - uses: actions/checkout@v4
+
     - name: Set up Python 3.12
       uses: actions/setup-python@v5
       with:
         python-version: "3.12"
+
     - name: Install dependencies
       run: |
         python -m pip install --upgrade pip
         pip install -e ".[dev]" pytest
-    - name: Run Live Staging Integration (Strict: No Skips Allowed)
+
+    - name: Check Staging Credentials Availability
+      id: check-creds
+      env:
+        STAGING_URL: ${{ secrets.MTM_GM_STAGING_URL }}
       run: |
-        pytest tests/e2e/test_e2e_d_staging_gm.py -m staging_game_master -v
+        if [ -n "$STAGING_URL" ]; then
+          echo "has_creds=true" >> "$GITHUB_OUTPUT"
+        else
+          echo "has_creds=false" >> "$GITHUB_OUTPUT"
+          echo "::notice ::Staging Game Master credentials not configured. Skipping live staging gate."
+        fi
+
+    - name: Run Live Staging Integration (Strict: Zero Skips Allowed)
+      if: steps.check-creds.outputs.has_creds == 'true'
+      env:
+        MTM_GM_STAGING_URL: ${{ secrets.MTM_GM_STAGING_URL }}
+        MTM_GM_TOKEN: ${{ secrets.MTM_GM_TOKEN }}
+        MTM_STAGING_GM: "1"
+      run: |
+        pytest tests/e2e/test_e2e_d_staging_gm.py -m staging_game_master -v --junitxml=staging_results.xml
+        python -c "import xml.etree.ElementTree as ET, sys; root = ET.parse('staging_results.xml').getroot(); suite = root.find('testsuite') or root; skipped = int(suite.attrib.get('skipped', 0)); tests = int(suite.attrib.get('tests', 0)); print(f'Executed: {tests}, Skipped: {skipped}'); sys.exit(1 if (skipped > 0 or tests == 0) else 0)"

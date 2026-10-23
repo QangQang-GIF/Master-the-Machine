@@ -13,8 +13,9 @@ import sys
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
+from .process import terminate_process_tree
 from .trace import ExecutionTrace, parse_codex_trace, parse_agy_trace
 
 
@@ -38,26 +39,8 @@ class RuntimeResult:
 
 _DEFAULT = object()
 
+_terminate_process_tree = terminate_process_tree
 
-
-def _terminate_process_tree(proc: subprocess.Popen) -> None:
-    """Cross-platform termination of a process and all its children."""
-    try:
-        if sys.platform == "win32":
-            subprocess.run(
-                ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
-                capture_output=True,
-                timeout=5,
-            )
-        else:
-            import signal
-            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-    except Exception:
-        pass
-    try:
-        proc.kill()
-    except Exception:
-        pass
 
 class CodexRuntime:
     """Manages spawning, sandboxing, timing, and harvesting of Codex / Antigravity runs."""
@@ -214,6 +197,7 @@ class CodexRuntime:
                 text=True,
                 encoding="utf-8",
                 errors="replace",
+                start_new_session=True,
             )
             if on_process_start is not None:
                 try:
@@ -243,6 +227,7 @@ class CodexRuntime:
                 encoding="utf-8",
                 errors="replace",
                 shell=(sys.platform == "win32"),
+                start_new_session=True,
             )
             if on_process_start is not None:
                 try:

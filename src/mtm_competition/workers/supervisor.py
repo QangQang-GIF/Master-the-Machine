@@ -9,6 +9,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from mtm_core.contracts import TaskEnvelope, WorkerResult
 from mtm_core.runtime import ExecutionTrace
+from mtm_core.runtime.process import terminate_process_tree
 
 
 @dataclass
@@ -38,6 +39,7 @@ class WorkerSupervisor:
         attempt_number: int,
         timeout_seconds: float,
         workspace_path: Path | str,
+        envelope: Optional[TaskEnvelope] = None,
     ) -> SupervisedProcess:
         proc = SupervisedProcess(
             task_id=task_id,
@@ -45,48 +47,40 @@ class WorkerSupervisor:
             started_at=time.time(),
             timeout_seconds=timeout_seconds,
             workspace_path=Path(workspace_path),
+            envelope=envelope,
         )
         self._active_workers[task_id] = proc
         return proc
 
-    def register_subprocess(self, task_id: str, proc: Any) -> None:
+    def register_subprocess(self, task_id: str, handle: Any) -> None:
         """Register active subprocess handle for mid-execution killing."""
-        active = self._active_workers.get(task_id)
-        if active:
-            active.subprocess_handle = proc
+        proc = self._active_workers.get(task_id)
+        if proc:
+            proc.subprocess_handle = handle
+
+    def get_process(self, task_id: str) -> Optional[SupervisedProcess]:
+        return self._active_workers.get(task_id)
 
     def launch_async(
         self,
         launcher_fn: Callable[..., Tuple[WorkerResult, ExecutionTrace, Path]],
         envelope: TaskEnvelope,
         attempt_number: int = 1,
-        backend: Optional[str] = None,
     ) -> SupervisedProcess:
-        """Launch worker asynchronously in a supervised background execution thread."""
-        task_id = envelope.task_id
-        timeout_sec = float(envelope.time_budget_seconds or 420)
-        repo_path = Path(envelope.repository_path)
-        workspace_path = repo_path.parent / "scratch" / task_id
+        """Asynchronously dispatch worker execution wrapped in a supervised future."""
+        import inspect
 
-        proc = SupervisedProcess(
+        task_id = envelope.task_id
+        proc = self.register_worker(
             task_id=task_id,
             attempt_number=attempt_number,
-            started_at=time.time(),
-            timeout_seconds=timeout_sec,
-            workspace_path=workspace_path,
-            status="RUNNING",
+            timeout_seconds=envelope.time_budget_seconds,
+            workspace_path=envelope.repository_path,
             envelope=envelope,
         )
 
-        # Inspect launcher_fn signature safely outside _runner so exceptions during
-        # execution NEVER trigger a second invocation (P1.1 Supervisor Reliability)
-        import inspect
-        has_on_proc = False
-        try:
-            sig = inspect.signature(launcher_fn)
-            has_on_proc = "on_process_start" in sig.parameters
-        except (ValueError, TypeError):
-            has_on_proc = False
+        sig = inspect.signature(launcher_fn)
+        has_on_proc = "on_process_start" in sig.parameters
 
         def _runner():
             if has_on_proc:
@@ -125,7 +119,10 @@ class WorkerSupervisor:
                 proc.result = proc.future.result(timeout=timeout)
                 proc.status = "COMPLETED"
                 return proc.result
-            except TimeoutError:
+            except (TimeoutError, concurrent.futures.TimeoutError):
+                return None
+            except concurrent.futures.CancelledError:
+                proc.status = "PREEMPTED"
                 return None
             except Exception as e:
                 proc.status = "FAILED"
@@ -144,24 +141,7 @@ class WorkerSupervisor:
 
         proc.status = "PREEMPT_REQUESTED"
         if proc.subprocess_handle is not None:
-            try:
-                import sys
-                if sys.platform == "win32":
-                    import subprocess
-                    subprocess.run(
-                        ["taskkill", "/F", "/T", "/PID", str(proc.subprocess_handle.pid)],
-                        capture_output=True,
-                        timeout=5,
-                    )
-                else:
-                    import os, signal
-                    os.killpg(os.getpgid(proc.subprocess_handle.pid), signal.SIGKILL)
-            except Exception:
-                try:
-                    proc.subprocess_handle.kill()
-                    proc.subprocess_handle.wait(timeout=1.0)
-                except Exception:
-                    pass
+            terminate_process_tree(proc.subprocess_handle)
 
         if proc.future and not proc.future.done():
             proc.future.cancel()

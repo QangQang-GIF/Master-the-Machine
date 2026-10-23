@@ -156,7 +156,7 @@ def test_e2e_c_agy_multifile_cr(tmp_path, pytestconfig):
         description="Add tax calculation across cart and pricing modules.",
         repository_path=str(work_repo),
         selected_skills=["mtm-cr-worker@0.1.0"],
-        model="gemini-3.8-flash-medium",
+        model="gemini-3.8-flash-high",
         reasoning_effort="medium",
         time_budget_seconds=180,
         backend="antigravity",
