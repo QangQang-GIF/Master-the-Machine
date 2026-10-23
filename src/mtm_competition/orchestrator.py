@@ -60,8 +60,14 @@ class CompetitionOrchestrator:
         self.worker_backend = (
             worker_backend
             or __import__("os").environ.get("MTM_WORKER_BACKEND")
+            or __import__("os").environ.get("MTM_BACKEND")
             or env_cfg.get("orchestrator", {}).get("worker_backend", "codex")
         ).lower()
+
+        if self.worker_backend not in ("codex", "antigravity", "auto"):
+            raise ValueError(
+                f"Invalid backend '{self.worker_backend}'. Explicit backend must be 'codex' or 'antigravity'"
+            )
 
         strict_backend = env_cfg.get("worker", {}).get("strict_backend", True)
         allow_fallback = env_cfg.get("worker", {}).get("allow_fallback", False)
@@ -72,7 +78,7 @@ class CompetitionOrchestrator:
             strict_backend=strict_backend,
             allow_fallback=allow_fallback,
         )
-        self.supervisor = WorkerSupervisor()
+        self.supervisor = WorkerSupervisor(max_workers=concurrency_limit)
         self.integration_guard = IntegrationGuard(
             self.repo_path,
             push_to_remote=push_to_remote,
@@ -220,9 +226,18 @@ class CompetitionOrchestrator:
             backend=self.worker_backend,
         )
 
-        # 2. Token Budget Watchdog: enforce lower effort if approaching limit
+        # 2. Token Budget Watchdog: block launch if hard budget reached, or downshift effort
+        if self.cumulative_billable_tokens >= self.token_budget:
+            self.scheduler.complete_task(task_id, TaskState.REJECTED)
+            return {
+                "task_id": task_id,
+                "status": "BUDGET_EXCEEDED",
+                "error": f"Match token budget exceeded: {self.cumulative_billable_tokens} >= {self.token_budget}",
+            }
+
         if self.cumulative_billable_tokens > (self.token_budget * 0.85):
             envelope.reasoning_effort = "low"
+            envelope.model = "gpt-5.3-codex" if self.worker_backend == "codex" else "gemini-3.8-flash-high"
 
         # 3. Supervised worker launch with mid-execution preemption and match pause awareness
         t_worker_start = time.time()
@@ -266,11 +281,14 @@ class CompetitionOrchestrator:
 
         self.cumulative_billable_tokens += trace.billable_tokens
 
-        # Record attempt
+        # Record attempt with unique attempt ID
+        att_num = getattr(supervised_proc, "attempt_number", 1)
+        unique_att_id = f"{task_id}_att{att_num}_{int(time.time() * 1000)}"
         self.store.record_attempt(
             task_id=task_id,
-            attempt_id=f"{task_id}_att1",
+            attempt_id=unique_att_id,
             status=worker_res.status,
+            attempt_number=att_num,
             elapsed_seconds=worker_res.elapsed_seconds,
             billable_tokens=trace.billable_tokens,
             result_json=worker_res.to_dict(),
@@ -339,6 +357,16 @@ class CompetitionOrchestrator:
                     "error": f"Git revision verification failed: {e}",
                 }
             integ_duration = round(time.time() - t_integ_start, 2)
+
+            # Re-check deadline immediately before submission (P1.2)
+            current_server_now = self.scheduler.current_server_time
+            if envelope.deadline_epoch and current_server_now > envelope.deadline_epoch:
+                self.scheduler.complete_task(task_id, TaskState.REJECTED)
+                return {
+                    "task_id": task_id,
+                    "status": "DEADLINE_EXPIRED",
+                    "error": f"Task deadline expired before submission: {current_server_now} > {envelope.deadline_epoch}",
+                }
 
             # Guarded Submission with Server Clock & Reconciliation
             t_submit_start = time.time()

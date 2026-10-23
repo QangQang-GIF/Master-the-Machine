@@ -22,12 +22,25 @@ def get_config_dir() -> Path:
     return CONFIG_DIR
 
 
+PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent.parent
+
+
+def get_project_root() -> Path:
+    """Return canonical project root directory."""
+    return PROJECT_ROOT
+
+
+def get_environment_mode(explicit_mode: Optional[str] = None) -> str:
+    """Resolve environment mode: explicit argument -> MTM_ENV -> MTM_MODE -> 'development'."""
+    if explicit_mode:
+        return explicit_mode.lower()
+    return (os.environ.get("MTM_ENV") or os.environ.get("MTM_MODE") or "development").lower()
+
+
 def load_environment_config(mode: Optional[str] = None) -> Dict[str, Any]:
     """Load configuration for specified mode ('development' or 'production')."""
-    if mode is None:
-        mode = os.environ.get("MTM_MODE", "development").lower()
-
-    filename = f"{mode}.yaml"
+    resolved_mode = get_environment_mode(mode)
+    filename = f"{resolved_mode}.yaml"
     target = CONFIG_DIR / filename
     if not target.exists():
         # Fallback to development if missing
@@ -56,7 +69,7 @@ def verify_skill_checksums(
     """
     import hashlib
 
-    base = Path(root_dir).resolve()
+    base = get_project_root() if not root_dir or str(root_dir) == "." else Path(root_dir).resolve()
     cs_path = Path(checksum_file).resolve() if checksum_file else base / "releases" / "checksums.sha256"
     if not cs_path.exists():
         raise FileNotFoundError(f"Skill checksum file not found: {cs_path}")

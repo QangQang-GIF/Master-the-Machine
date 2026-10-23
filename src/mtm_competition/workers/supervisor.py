@@ -78,18 +78,23 @@ class WorkerSupervisor:
             envelope=envelope,
         )
 
+        # Inspect launcher_fn signature safely outside _runner so exceptions during
+        # execution NEVER trigger a second invocation (P1.1 Supervisor Reliability)
+        import inspect
+        has_on_proc = False
+        try:
+            sig = inspect.signature(launcher_fn)
+            has_on_proc = "on_process_start" in sig.parameters
+        except (ValueError, TypeError):
+            has_on_proc = False
+
         def _runner():
-            import inspect
-            try:
-                sig = inspect.signature(launcher_fn)
-                if "on_process_start" in sig.parameters:
-                    return launcher_fn(
-                        envelope,
-                        attempt_number=attempt_number,
-                        on_process_start=lambda p: self.register_subprocess(task_id, p),
-                    )
-            except Exception:
-                pass
+            if has_on_proc:
+                return launcher_fn(
+                    envelope,
+                    attempt_number=attempt_number,
+                    on_process_start=lambda p: self.register_subprocess(task_id, p),
+                )
             return launcher_fn(envelope, attempt_number=attempt_number)
 
         self._active_workers[task_id] = proc
@@ -103,7 +108,7 @@ class WorkerSupervisor:
             return False
         if proc.future:
             return proc.future.done()
-        return proc.status in ("FINISHED", "FAILED", "PREEMPTED", "TIMED_OUT")
+        return proc.status in ("COMPLETED", "FINISHED", "FAILED", "PREEMPTED", "TIMED_OUT")
 
     def get_result(
         self,
@@ -118,7 +123,7 @@ class WorkerSupervisor:
         if proc.future and proc.future.done():
             try:
                 proc.result = proc.future.result(timeout=timeout)
-                proc.status = "FINISHED"
+                proc.status = "COMPLETED"
                 return proc.result
             except Exception as e:
                 proc.status = "FAILED"
@@ -126,19 +131,40 @@ class WorkerSupervisor:
         return None
 
     def preempt_worker(self, task_id: str) -> Optional[SupervisedProcess]:
-        """Preempt, terminate process immediately, and cancel a running worker."""
+        """Preempt, terminate process tree immediately, and cancel running worker."""
         proc = self._active_workers.get(task_id)
         if not proc:
             return None
-        proc.status = "PREEMPTED"
+
+        # Avoid race condition if worker already completed
+        if proc.future and proc.future.done() and proc.status == "COMPLETED":
+            return proc
+
+        proc.status = "PREEMPT_REQUESTED"
         if proc.subprocess_handle is not None:
             try:
-                proc.subprocess_handle.kill()
-                proc.subprocess_handle.wait(timeout=1.0)
+                import sys
+                if sys.platform == "win32":
+                    import subprocess
+                    subprocess.run(
+                        ["taskkill", "/F", "/T", "/PID", str(proc.subprocess_handle.pid)],
+                        capture_output=True,
+                        timeout=5,
+                    )
+                else:
+                    import os, signal
+                    os.killpg(os.getpgid(proc.subprocess_handle.pid), signal.SIGKILL)
             except Exception:
-                pass
+                try:
+                    proc.subprocess_handle.kill()
+                    proc.subprocess_handle.wait(timeout=1.0)
+                except Exception:
+                    pass
+
         if proc.future and not proc.future.done():
             proc.future.cancel()
+
+        proc.status = "PREEMPTED"
         return self.unregister_worker(task_id)
 
     def unregister_worker(self, task_id: str) -> Optional[SupervisedProcess]:
