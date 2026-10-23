@@ -88,7 +88,7 @@ class CompetitionOrchestrator:
         self.git_guard = GitGuard(self.repo_path)
         self.submission_guard = SubmissionGuard(self.store)
 
-        self.cumulative_billable_tokens: int = 0
+        self.cumulative_billable_tokens: int = self.store.get_total_billable_tokens()
         self.token_budget = token_budget
 
         mode = (
@@ -478,3 +478,56 @@ class CompetitionOrchestrator:
             "tokens_consumed": self.cumulative_billable_tokens,
             "match_status": final_match_state.get("status"),
         }
+
+    def generate_match_report(self) -> Dict[str, Any]:
+        """Generate structured final tournament match report with task states, score, tokens, git SHA, and errors."""
+        from mtm_core.git import get_head_sha
+        try:
+            head_sha = get_head_sha(self.repo_path)
+        except Exception:
+            head_sha = "unknown"
+
+        match_state = {}
+        try:
+            match_state = self.gm.get_match_state()
+        except Exception:
+            pass
+
+        tasks_summary = []
+        errors = []
+        for t in self.store.list_tasks():
+            tid = t["task_id"]
+            sub = self.store.get_submission(tid)
+            events = self.store.get_events(tid)
+
+            task_errs = [
+                e.get("payload")
+                for e in events
+                if e.get("event_type") in ("QA_GATE_FAILED", "SUBMISSION_FAILED", "TASK_REJECTED", "INTEGRATION_FAILED")
+            ]
+            if task_errs:
+                errors.append({"task_id": tid, "errors": task_errs})
+
+            tasks_summary.append({
+                "task_id": tid,
+                "task_type": t.get("task_type"),
+                "state": t.get("status") or t.get("state"),
+                "points": t.get("points", 0),
+                "provisional_points": sub.get("provisional_points", 0) if sub else 0,
+                "confirmed_points": sub.get("confirmed_points", 0) if sub else 0,
+                "submission_status": sub.get("status") if sub else None,
+                "commit_sha": sub.get("commit_sha") if sub else None,
+            })
+
+        return {
+            "match_status": match_state.get("status", self.scheduler.match_status),
+            "total_score": self.store.get_total_confirmed_points(),
+            "provisional_score": self.store.get_total_provisional_points(),
+            "gm_reported_score": match_state.get("total_score", 0),
+            "tokens_consumed": self.cumulative_billable_tokens,
+            "token_budget": self.token_budget,
+            "git_head_sha": head_sha,
+            "tasks": tasks_summary,
+            "errors": errors,
+        }
+

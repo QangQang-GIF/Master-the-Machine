@@ -387,6 +387,14 @@ class TaskStore:
         row = cursor.fetchone()
         return int(row["total"] or 0) if row else 0
 
+    def get_total_billable_tokens(self) -> int:
+        """Return total billable tokens consumed across all recorded attempts."""
+        cursor = self.conn.cursor()
+        cursor.execute("SELECT SUM(billable_tokens) AS total FROM attempts")
+        row = cursor.fetchone()
+        return int(row["total"] or 0) if row else 0
+
+
     def get_total_provisional_points(self) -> int:
         """Return sum of provisional points (including in-progress grading)."""
         cursor = self.conn.cursor()

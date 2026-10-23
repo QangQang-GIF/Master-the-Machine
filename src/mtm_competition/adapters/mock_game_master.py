@@ -43,6 +43,11 @@ class MockGameMasterAdapter(GameMasterAdapter):
             self.is_paused = False
             self.pause_start_time = None
 
+    def finish_match(self) -> None:
+        """End tournament match immediately."""
+        self.is_paused = False
+        self.duration_seconds = 0.0
+
     def add_wave(self, tasks: List[Dict[str, Any]]) -> None:
         """Dynamically add new backlog items during match execution."""
         for t in tasks:
