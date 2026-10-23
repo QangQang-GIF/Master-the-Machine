@@ -310,7 +310,7 @@ def test_qa_gate_blocks_fake_worker_test_claims(tmp_path):
         task_id="BUG-FAKE-01",
         status=WorkerStatus.READY_FOR_REVIEW,
         changed_files=["solution.py"],
-        test_results=[{"command": f"{sys.executable} -c 'import sys; sys.exit(1)'", "passed": True}],
+        test_results=[{"command": f'{sys.executable} -c "import sys; sys.exit(1)"', "passed": True}],
         evidence_paths=[],
     ).to_dict()
 

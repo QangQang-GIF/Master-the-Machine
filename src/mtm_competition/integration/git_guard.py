@@ -48,10 +48,17 @@ class GitGuard:
 
         is_pushed = False
         if self.has_remote(remote):
-            # Check if remote tracking ref points to or contains this commit
-            rem_res = run_git(self.repo, ["branch", "-r", "--contains", sha])
-            if f"{remote}/{branch}" in rem_res.stdout:
-                is_pushed = True
+            # Direct verification against remote using git ls-remote
+            ls_res = run_git(self.repo, ["ls-remote", remote, f"refs/heads/{branch}"])
+            if ls_res.returncode == 0 and ls_res.stdout.strip():
+                remote_sha = ls_res.stdout.split()[0].strip()
+                if remote_sha.startswith(sha) or sha.startswith(remote_sha):
+                    is_pushed = True
+            if not is_pushed:
+                # Fallback check on remote branch
+                rem_res = run_git(self.repo, ["branch", "-r", "--contains", sha])
+                if f"{remote}/{branch}" in rem_res.stdout:
+                    is_pushed = True
         elif verify_pushed:
             raise ValueError(f"GitGuard verification failed: remote '{remote}' is not configured")
 

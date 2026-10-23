@@ -171,15 +171,23 @@ class OfficialGameMasterAdapter(GameMasterAdapter):
         task_id: str,
         git_revision: str,
         evidence: Optional[List[str]] = None,
+        idempotency_key: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """Submit completed solution revision for scoring."""
+        """Submit completed solution revision for scoring.
+        
+        Phase 1 P0.3: Vô hiệu hóa retry tự động cho POST /submit, trừ khi có idempotency key.
+        """
         encoded_id = urllib.parse.quote(task_id)
         payload = {
             "task_id": task_id,
             "git_revision": git_revision,
             "evidence": evidence or [],
         }
-        return self._request("POST", f"/tasks/{encoded_id}/submit", data=payload)
+        if idempotency_key:
+            payload["idempotency_key"] = idempotency_key
+
+        retries = self.max_retries if idempotency_key else 1
+        return self._request("POST", f"/tasks/{encoded_id}/submit", data=payload, retries=retries)
 
     def get_submission_status(self, task_id: str) -> Dict[str, Any]:
         """Check grading status (ACCEPTED, GRADING, PASSED, FAILED)."""

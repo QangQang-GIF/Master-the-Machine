@@ -89,6 +89,25 @@ def validate_worker_result(result: Dict[str, Any], workspace_dir: Optional[Path]
                 raise QAGateError(f"Evidence path declared but missing on disk: {ef} ({ef_path})")
 
 
+def map_mvs_to_test_command(mvs_item: Dict[str, Any] | str) -> str:
+    """Map an MVS declaration from Game Master to an executable test command."""
+    if isinstance(mvs_item, str):
+        desc = mvs_item
+        cmd = None
+    else:
+        desc = mvs_item.get("description", "")
+        cmd = mvs_item.get("command")
+
+    if cmd:
+        return cmd
+    desc = desc.strip()
+    if desc.startswith("pytest ") or desc.startswith("python "):
+        return desc
+    if desc.startswith("test_") or "::test_" in desc:
+        return f"pytest -k {desc}"
+    return f"pytest -k {desc}" if desc else "pytest"
+
+
 def validate_qa_gate(
     envelope: Dict[str, Any],
     result: Dict[str, Any],
@@ -168,11 +187,55 @@ def validate_qa_gate(
                     f"Status is READY_FOR_REVIEW but test failed: {tr.get('command')}"
                 )
 
+        # 7. Mandatory Minimum Viable Solution (MVS) Enforcement
+        mvs_list = envelope.get("mvs") or []
+        if mvs_list:
+            for mvs in mvs_list:
+                mvs_id = mvs.get("id") if isinstance(mvs, dict) else str(mvs)
+                mvs_desc = mvs.get("description", "") if isinstance(mvs, dict) else str(mvs)
+                mvs_cmd = map_mvs_to_test_command(mvs)
+
+                matched = False
+                for tr in test_results:
+                    if not tr.get("passed"):
+                        continue
+                    tr_cmd = tr.get("command", "")
+                    tr_mvs = tr.get("mvs_id")
+                    if tr_mvs and tr_mvs == mvs_id:
+                        matched = True
+                        break
+                    if mvs_id and mvs_id in tr_cmd:
+                        matched = True
+                        break
+                    if mvs_desc and mvs_desc in tr_cmd:
+                        matched = True
+                        break
+                    if mvs_cmd and (mvs_cmd == tr_cmd or mvs_cmd in tr_cmd):
+                        matched = True
+                        break
+                    if tr_cmd.strip() in ("pytest", "python -m pytest", "pytest -v", "pytest -q"):
+                        matched = True
+                        break
+
+                if not matched and reverify_tests and ws.exists():
+                    if reverify_tests_independently(ws, [mvs_cmd]):
+                        matched = True
+
+                if not matched:
+                    raise QAGateError(
+                        f"Mandatory MVS requirement '{mvs_id}' ({mvs_desc}) was not verified or failed"
+                    )
+
+        # 8. Independent test execution
         if reverify_tests and test_results:
             test_cmds = [tr.get("command") for tr in test_results if tr.get("command")]
             env_cmd = envelope.get("verification_cmd")
             if env_cmd and env_cmd not in test_cmds:
                 test_cmds.append(env_cmd)
+            for mvs in mvs_list:
+                m_cmd = map_mvs_to_test_command(mvs)
+                if m_cmd and m_cmd not in test_cmds:
+                    test_cmds.append(m_cmd)
             if test_cmds and ws.exists():
                 if not reverify_tests_independently(ws, test_cmds):
                     raise QAGateError(

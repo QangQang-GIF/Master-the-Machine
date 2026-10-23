@@ -92,6 +92,10 @@ class CompetitionOrchestrator:
         ).lower()
         if mode == "production":
             self.verify_skill_integrity = True
+            self.reverify_worker_tests = True
+            self.verify_post_integration = True
+            self.integration_guard.push_to_remote = True
+            self.integration_guard.require_remote = True
         else:
             self.verify_skill_integrity = verify_skill_integrity
 
@@ -100,10 +104,11 @@ class CompetitionOrchestrator:
             project_root = self.repo_path if (self.repo_path / "releases").exists() else Path.cwd()
             verify_skill_checksums(project_root)
 
-        # Reconcile any in-flight submissions remaining from a crash/restart
+        # Reconcile any in-flight submissions and grading lifecycle remaining from crash/restart
         if hasattr(self.gm, "get_submission_status"):
             try:
                 self.store.reconcile_in_flight_submissions(self.gm.get_submission_status)
+                self.store.reconcile_grading_lifecycle(self.gm.get_submission_status)
             except Exception as e:
                 logger.warning("Could not reconcile in-flight submissions on startup: %s", e)
 
@@ -162,6 +167,13 @@ class CompetitionOrchestrator:
         5. Integrate patch, verify git revision, and submit via Submission Guard.
         6. Confirm two-phase grading status.
         """
+        # Periodic grading reconciliation loop
+        if hasattr(self.gm, "get_submission_status"):
+            try:
+                self.store.reconcile_grading_lifecycle(self.gm.get_submission_status)
+            except Exception as e:
+                logger.debug("Grading reconciliation error: %s", e)
+
         # 0. Sync match state before step
         try:
             match_state = self.gm.get_match_state()

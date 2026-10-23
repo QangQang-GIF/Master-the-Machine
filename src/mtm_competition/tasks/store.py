@@ -66,6 +66,8 @@ class TaskStore:
                 task_id TEXT PRIMARY KEY,
                 status TEXT NOT NULL,
                 score INTEGER DEFAULT 0,
+                provisional_points INTEGER DEFAULT 0,
+                confirmed_points INTEGER DEFAULT 0,
                 git_revision TEXT,
                 submission_id TEXT,
                 response_json TEXT,
@@ -85,7 +87,13 @@ class TaskStore:
             """)
 
             # Safe column migrations for existing databases
-            for col, col_type in [("git_revision", "TEXT"), ("submission_id", "TEXT"), ("updated_at", "REAL")]:
+            for col, col_type in [
+                ("git_revision", "TEXT"),
+                ("submission_id", "TEXT"),
+                ("updated_at", "REAL"),
+                ("provisional_points", "INTEGER DEFAULT 0"),
+                ("confirmed_points", "INTEGER DEFAULT 0"),
+            ]:
                 try:
                     self.conn.execute(f"ALTER TABLE submissions ADD COLUMN {col} {col_type}")
                 except sqlite3.OperationalError:
@@ -278,20 +286,35 @@ class TaskStore:
         git_revision: Optional[str] = None,
         submission_id: Optional[str] = None,
     ) -> bool:
-        """Record a submission. Enforces once-only submission invariant."""
+        """Record a submission. Enforces once-only submission invariant and scoring separation."""
         sub = self.get_submission(task_id)
         if sub and sub["status"] in ("ACCEPTED", "PASSED", "FAILED") and status not in ("PASSED", "FAILED"):
             return False  # Block duplicate submission
 
         now = time.time()
+        # Separate provisional from confirmed points (P0.4)
+        if status == "PASSED":
+            confirmed = int(score)
+            provisional = int(score)
+        elif status in ("ACCEPTED", "SUBMITTED", "GRADING"):
+            confirmed = 0
+            provisional = int(score)
+        else:  # FAILED, REJECTED
+            confirmed = 0
+            provisional = 0
+
         with self.conn:
             self.conn.execute("""
-            INSERT OR REPLACE INTO submissions (task_id, status, score, git_revision, submission_id, response_json, submitted_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT OR REPLACE INTO submissions (
+                task_id, status, score, provisional_points, confirmed_points,
+                git_revision, submission_id, response_json, submitted_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 task_id,
                 status,
                 score,
+                provisional,
+                confirmed,
                 git_revision,
                 submission_id,
                 json.dumps(response_json or {}),
@@ -327,12 +350,22 @@ class TaskStore:
         if not sub:
             return
         now = time.time()
-        final_score = score if score is not None else sub.get("score", 0)
+        final_score = int(score if score is not None else sub.get("score", 0))
+        if status == "PASSED":
+            confirmed = final_score
+            provisional = final_score
+        elif status == "FAILED":
+            confirmed = 0
+            provisional = 0
+        else:  # GRADING, ACCEPTED
+            confirmed = 0
+            provisional = final_score
+
         with self.conn:
             self.conn.execute("""
-            UPDATE submissions SET status = ?, score = ?, response_json = ?, updated_at = ?
+            UPDATE submissions SET status = ?, score = ?, provisional_points = ?, confirmed_points = ?, response_json = ?, updated_at = ?
             WHERE task_id = ?
-            """, (status, final_score, json.dumps(response_json or {}), now, task_id))
+            """, (status, final_score, provisional, confirmed, json.dumps(response_json or {}), now, task_id))
 
             if status == "PASSED":
                 task_state = TaskState.PASSED.value
@@ -346,6 +379,59 @@ class TaskStore:
                 (task_state, now, task_id),
             )
             self.record_event(task_id, "GRADING_STATUS_UPDATED", sub["status"], status, {"score": final_score})
+
+    def get_total_confirmed_points(self) -> int:
+        """Return sum of confirmed points awarded by Grader (PASSED submissions only)."""
+        cursor = self.conn.cursor()
+        cursor.execute("SELECT SUM(confirmed_points) AS total FROM submissions WHERE status = 'PASSED'")
+        row = cursor.fetchone()
+        return int(row["total"] or 0) if row else 0
+
+    def get_total_provisional_points(self) -> int:
+        """Return sum of provisional points (including in-progress grading)."""
+        cursor = self.conn.cursor()
+        cursor.execute("SELECT SUM(provisional_points) AS total FROM submissions")
+        row = cursor.fetchone()
+        return int(row["total"] or 0) if row else 0
+
+    def reconcile_grading_lifecycle(
+        self,
+        status_check_fn: Any,
+        timeout_seconds: float = 300.0,
+    ) -> List[Dict[str, Any]]:
+        """Poll GM for submissions in ACCEPTED/SUBMITTED/GRADING state until PASSED, FAILED, or timeout."""
+        cursor = self.conn.cursor()
+        cursor.execute("""
+            SELECT * FROM submissions
+            WHERE status IN ('ACCEPTED', 'SUBMITTED', 'GRADING')
+        """)
+        rows = [dict(r) for r in cursor.fetchall()]
+        reconciled = []
+        now = time.time()
+
+        for sub in rows:
+            task_id = sub["task_id"]
+            submitted_at = sub.get("submitted_at") or now
+            try:
+                res = status_check_fn(task_id)
+                st = res.get("status")
+                if st in ("PASSED", "FAILED"):
+                    pts = int(res["points"]) if (st == "PASSED" and res.get("points") is not None) else 0
+                    self.update_submission_status(task_id, status=st, score=pts, response_json=res)
+                    reconciled.append({"task_id": task_id, "status": st, "points": pts})
+                elif (now - submitted_at) > timeout_seconds:
+                    self.record_event(
+                        task_id,
+                        "GRADING_TIMEOUT_UNRESOLVED",
+                        sub["status"],
+                        "UNRESOLVED",
+                        {"elapsed_waiting": round(now - submitted_at, 1)},
+                    )
+                    reconciled.append({"task_id": task_id, "status": "UNRESOLVED"})
+            except Exception:
+                pass
+
+        return reconciled
 
     def record_event(
         self,

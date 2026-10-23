@@ -114,7 +114,7 @@ class SubmissionGuard:
         self.store.start_submission(task_id, git_revision=revision.commit_sha)
 
         try:
-            # Call Game Master adapter
+            # Call Game Master adapter (single-shot, no automatic retry on POST /submit)
             response = game_master_submit_fn(
                 task_id=task_id,
                 git_revision=revision.commit_sha,
@@ -142,7 +142,24 @@ class SubmissionGuard:
                 status=status,
             )
         except Exception as e:
-            # Network error or timeout during submit: check server to see if it landed
+            # 1. Distinguish 4xx server rejection from network timeout/loss
+            status_code = getattr(e, "status_code", None)
+            if status_code is not None and 400 <= status_code < 500:
+                self.store.record_submission(
+                    task_id=task_id,
+                    status="REJECTED",
+                    score=0,
+                    response_json=getattr(e, "payload", {"error": str(e)}),
+                    git_revision=revision.commit_sha,
+                )
+                return SubmissionResult(
+                    success=False,
+                    task_id=task_id,
+                    error_message=str(e),
+                    status="REJECTED",
+                )
+
+            # 2. Timeout or network error: check server to see if it landed
             if game_master_status_fn:
                 try:
                     reconciled = game_master_status_fn(task_id)
@@ -155,6 +172,7 @@ class SubmissionGuard:
                             score=score,
                             response_json=reconciled,
                             git_revision=revision.commit_sha,
+                            submission_id=reconciled.get("submission_id"),
                         )
                         return SubmissionResult(
                             success=(st in ("ACCEPTED", "PASSED")),
@@ -165,16 +183,17 @@ class SubmissionGuard:
                 except Exception:
                     pass
 
+            # 3. Server status indeterminate: keep in SUBMIT_IN_FLIGHT for reconciliation loop
             self.store.record_event(
                 task_id,
-                "SUBMISSION_FAILED",
+                "SUBMISSION_TIMEOUT_IN_FLIGHT",
                 TaskState.SUBMIT_IN_FLIGHT.value,
-                TaskState.REJECTED.value,
-                {"error": str(e)},
+                TaskState.SUBMIT_IN_FLIGHT.value,
+                {"error": str(e), "action": "retain_in_flight_for_reconciliation"},
             )
             return SubmissionResult(
                 success=False,
                 task_id=task_id,
-                error_message=str(e),
-                status="FAILED",
+                error_message=f"Submission timeout/network error; preserved in SUBMIT_IN_FLIGHT: {e}",
+                status="SUBMIT_IN_FLIGHT",
             )
