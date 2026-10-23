@@ -15,6 +15,66 @@ def is_cli_available(cli_name: str) -> bool:
     return shutil.which(cli_name) is not None
 
 
+def is_pid_alive(pid: int) -> bool:
+    """Check whether a process with the given PID is currently alive across Windows and POSIX."""
+    if pid <= 0:
+        return False
+    if sys.platform == "win32":
+        try:
+            res = subprocess.run(
+                ["tasklist", "/FI", f"PID eq {pid}", "/NH"],
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+            return str(pid) in (res.stdout or "")
+        except Exception:
+            return False
+    else:
+        try:
+            os.kill(pid, 0)
+            # On Linux, also check if it is a zombie process
+            stat_file = Path(f"/proc/{pid}/stat")
+            if stat_file.exists():
+                content = stat_file.read_text(encoding="utf-8", errors="ignore")
+                # Format: pid (comm) state ...
+                rparen = content.rfind(")")
+                if rparen != -1 and len(content) > rparen + 2:
+                    state_char = content[rparen + 2]
+                    if state_char == "Z":
+                        return False
+            return True
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+        except Exception:
+            return False
+
+
+def _kill_unix_descendants(pid: int) -> None:
+    """Recursively find and SIGKILL descendant processes of `pid` on Unix without using killpg."""
+    try:
+        res = subprocess.run(
+            ["pgrep", "-P", str(pid)],
+            capture_output=True,
+            text=True,
+            timeout=2,
+        )
+        if res.returncode == 0 and res.stdout:
+            for line in res.stdout.strip().splitlines():
+                line = line.strip()
+                if line.isdigit():
+                    child_pid = int(line)
+                    _kill_unix_descendants(child_pid)
+                    try:
+                        os.kill(child_pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+    except Exception:
+        pass
+
+
 def run_command(
     cmd: List[str],
     cwd: Path | str,
@@ -43,11 +103,12 @@ def terminate_process_tree(proc: subprocess.Popen) -> None:
     """Cross-platform termination of a process and all its children.
 
     Guarantees:
-    - On Windows: Uses taskkill /F /T to terminate child trees.
+    - On Windows: Uses taskkill /F /T to terminate child and grandchild trees.
     - On Unix:
         * If proc has its own process group (distinct from caller/parent), terminates
           the entire process group via os.killpg.
-        * If proc shares caller's process group, terminates ONLY the child process via proc.kill().
+        * If proc shares caller's process group, recursively kills all descendants via pgrep -P
+          and then kills the child process via proc.kill().
           Guarantees os.killpg is NEVER dispatched to the parent's process group (e.g. orchestrator).
     - Always issues proc.kill() as final fallback.
     """
@@ -68,7 +129,8 @@ def terminate_process_tree(proc: subprocess.Popen) -> None:
                 if pgid != parent_pgid:
                     os.killpg(pgid, signal.SIGKILL)
                 else:
-                    # Child is in the caller's process group - kill child directly without killing caller
+                    # Child shares caller's process group - recursively kill descendants, then child
+                    _kill_unix_descendants(proc.pid)
                     proc.kill()
             except ProcessLookupError:
                 pass

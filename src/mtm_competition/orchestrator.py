@@ -110,7 +110,12 @@ class CompetitionOrchestrator:
             project_root = self.repo_path if (self.repo_path / "releases").exists() else Path.cwd()
             verify_skill_checksums(project_root)
 
-        # Reconcile any in-flight submissions and grading lifecycle remaining from crash/restart
+        # Reconcile any orphaned tasks, in-flight submissions, and grading lifecycle remaining from crash/restart
+        try:
+            self.store.reconcile_orphaned_tasks()
+        except Exception as e:
+            logger.warning("Could not reconcile orphaned tasks on startup: %s", e)
+
         if hasattr(self.gm, "get_submission_status"):
             try:
                 self.store.reconcile_in_flight_submissions(self.gm.get_submission_status)
@@ -151,15 +156,16 @@ class CompetitionOrchestrator:
                 preempt_task_id = self.scheduler.check_preemption(item)
                 if preempt_task_id:
                     logger.warning("Preemption triggered by %s on %s", task_id, preempt_task_id)
-                    self.supervisor.preempt_worker(preempt_task_id)
-                    self.scheduler.requeue_task(preempt_task_id)
-                    self.store.record_event(
-                        preempt_task_id,
-                        "TASK_PREEMPTED",
-                        TaskState.RUNNING.value,
-                        TaskState.QUEUED.value,
-                        {"preempted_by": task_id},
-                    )
+                    preempted_proc = self.supervisor.preempt_worker(preempt_task_id)
+                    if not preempted_proc or preempted_proc.status != "COMPLETED":
+                        self.scheduler.requeue_task(preempt_task_id)
+                        self.store.record_event(
+                            preempt_task_id,
+                            "TASK_PREEMPTED",
+                            TaskState.RUNNING.value,
+                            TaskState.QUEUED.value,
+                            {"preempted_by": task_id},
+                        )
 
         return count
 
@@ -187,6 +193,7 @@ class CompetitionOrchestrator:
             if self.scheduler.is_paused:
                 return {"status": "PAUSED"}
             if self.scheduler.match_status == "FINISHED":
+                self.supervisor.terminate_all("CANCELLED")
                 return {"status": "FINISHED"}
         except Exception:
             pass
@@ -200,9 +207,16 @@ class CompetitionOrchestrator:
 
         t_stage_start = time.time()
 
-        # 1. Signal Game Master and unlock MVS
-        self.gm.start_working(task_id)
-        mvs = self.gm.get_mvs(task_id)
+        # 1. Signal Game Master and unlock MVS (guarded so running_tasks never leaks on failure)
+        try:
+            self.gm.start_working(task_id)
+            mvs = self.gm.get_mvs(task_id)
+        except Exception as e:
+            self.scheduler.complete_task(task_id, TaskState.REJECTED)
+            self.store.record_event(
+                task_id, "START_WORKING_FAILED", TaskState.RUNNING.value, TaskState.REJECTED.value, {"error": str(e)}
+            )
+            return {"task_id": task_id, "status": "FAILED", "error": f"Failed to start working on Game Master: {e}"}
 
         evidence_req = []
         if task_data.get("evidence_required_json"):
@@ -237,11 +251,12 @@ class CompetitionOrchestrator:
 
         if self.cumulative_billable_tokens > (self.token_budget * 0.85):
             envelope.reasoning_effort = "low"
-            envelope.model = "gpt-5.3-codex" if self.worker_backend == "codex" else "gemini-3.8-flash-high"
+            envelope.model = "gpt-6.1-sol" if self.worker_backend == "codex" else "gemini-3.8-flash-low"
 
         # 3. Supervised worker launch with mid-execution preemption and match pause awareness
         t_worker_start = time.time()
-        supervised_proc = self.supervisor.launch_async(self.launcher.launch, envelope)
+        attempt_num = self.store.get_attempt_count(task_id) + 1
+        supervised_proc = self.supervisor.launch_async(self.launcher.launch, envelope, attempt_number=attempt_num)
 
         while not self.supervisor.is_finished(task_id):
             # Sync match state and clock
@@ -250,6 +265,11 @@ class CompetitionOrchestrator:
                 self.scheduler.sync_with_game_master(match_state)
             except Exception:
                 pass
+
+            if self.scheduler.match_status == "FINISHED":
+                self.supervisor.cancel_worker(task_id)
+                self.scheduler.complete_task(task_id, TaskState.ABORTED)
+                return {"task_id": task_id, "status": "FINISHED"}
 
             if self.scheduler.is_paused:
                 # Extend worker timeout while match clock is paused
@@ -263,7 +283,7 @@ class CompetitionOrchestrator:
                 return {"task_id": task_id, "status": "PREEMPTED"}
 
             if self.supervisor.is_timed_out(task_id):
-                self.supervisor.preempt_worker(task_id)
+                self.supervisor.timeout_worker(task_id)
                 break
 
             time.sleep(0.05)
@@ -271,22 +291,61 @@ class CompetitionOrchestrator:
         if supervised_proc.status == "PREEMPTED":
             return {"task_id": task_id, "status": "PREEMPTED"}
 
+        # Retrieve result with status-aware handling
+        supervised_proc = self.supervisor.get_process(task_id) or supervised_proc
         try:
             res = self.supervisor.get_result(task_id, timeout=5.0)
-            if res is None:
-                self.scheduler.complete_task(task_id, TaskState.REJECTED)
-                return {"task_id": task_id, "status": "FAILED", "error": "No result returned by worker supervisor"}
-            worker_res, trace, ws_path = res
         except Exception as e:
             self.scheduler.complete_task(task_id, TaskState.REJECTED)
+            self.supervisor.unregister_worker(task_id)
             return {"task_id": task_id, "status": "FAILED", "error": str(e)}
+
+        if res is None:
+            # Distinguish based on supervisor's tracked status
+            terminal_status = supervised_proc.status
+            self.supervisor.unregister_worker(task_id)
+            att_num = getattr(supervised_proc, "attempt_number", attempt_num)
+            unique_att_id = f"{task_id}_att{att_num}_{int(time.time() * 1000)}"
+            if terminal_status == "TIMED_OUT":
+                self.store.record_attempt(
+                    task_id=task_id,
+                    attempt_id=unique_att_id,
+                    status="TIMED_OUT",
+                    attempt_number=att_num,
+                    elapsed_seconds=round(time.time() - t_worker_start, 2),
+                    billable_tokens=0,
+                    result_json={"task_id": task_id, "status": "TIMED_OUT"},
+                )
+                self.scheduler.complete_task(task_id, TaskState.TIMED_OUT)
+                self.store.record_event(
+                    task_id,
+                    "TASK_TIMED_OUT",
+                    TaskState.RUNNING.value,
+                    TaskState.TIMED_OUT.value,
+                    {"error": "Worker exceeded time budget"},
+                )
+                return {"task_id": task_id, "status": "TIMED_OUT", "error": "Worker exceeded time budget"}
+            elif terminal_status == "PREEMPTED":
+                # Ensure running_tasks is cleaned up if preemption occurred outside sync_backlog
+                if task_id in self.scheduler.running_tasks:
+                    self.scheduler.requeue_task(task_id)
+                return {"task_id": task_id, "status": "PREEMPTED"}
+            elif terminal_status == "CANCELLED":
+                self.scheduler.complete_task(task_id, TaskState.ABORTED)
+                return {"task_id": task_id, "status": "CANCELLED", "error": "Worker execution was cancelled"}
+            else:
+                self.scheduler.complete_task(task_id, TaskState.REJECTED)
+                return {"task_id": task_id, "status": "FAILED", "error": f"No result from worker (status: {terminal_status})"}
+
+        worker_res, trace, ws_path = res
+        self.supervisor.unregister_worker(task_id)
 
         worker_duration = round(time.time() - t_worker_start, 2)
 
         self.cumulative_billable_tokens += trace.billable_tokens
 
         # Record attempt with unique attempt ID
-        att_num = getattr(supervised_proc, "attempt_number", 1)
+        att_num = getattr(supervised_proc, "attempt_number", attempt_num)
         unique_att_id = f"{task_id}_att{att_num}_{int(time.time() * 1000)}"
         self.store.record_attempt(
             task_id=task_id,
@@ -297,6 +356,18 @@ class CompetitionOrchestrator:
             billable_tokens=trace.billable_tokens,
             result_json=worker_res.to_dict(),
         )
+
+        # If worker itself reported TIMED_OUT, transition directly to TIMED_OUT without QA Gate rejection
+        if worker_res.status == "TIMED_OUT":
+            self.scheduler.complete_task(task_id, TaskState.TIMED_OUT)
+            self.store.record_event(
+                task_id,
+                "TASK_TIMED_OUT",
+                TaskState.RUNNING.value,
+                TaskState.TIMED_OUT.value,
+                {"elapsed_seconds": worker_res.elapsed_seconds},
+            )
+            return {"task_id": task_id, "status": "TIMED_OUT", "error": "Worker execution timed out"}
 
         # 4. Deterministic QA Gate validation
         t_qa_start = time.time()
@@ -436,7 +507,10 @@ class CompetitionOrchestrator:
             }
 
         else:
-            self.scheduler.complete_task(task_id, TaskState.REJECTED)
+            if worker_res.status == "BLOCKED":
+                self.scheduler.complete_task(task_id, TaskState.BLOCKED)
+            else:
+                self.scheduler.complete_task(task_id, TaskState.REJECTED)
             return {"task_id": task_id, "status": worker_res.status}
 
     def run_loop(
@@ -462,6 +536,7 @@ class CompetitionOrchestrator:
                 state = self.gm.get_match_state()
                 if state.get("status") == "FINISHED":
                     logger.info("Tournament match FINISHED.")
+                    self.supervisor.terminate_all("CANCELLED")
                     break
                 if state.get("status") == "PAUSED":
                     logger.info("Tournament match PAUSED. Waiting...")
@@ -507,7 +582,14 @@ class CompetitionOrchestrator:
             task_errs = [
                 e.get("payload")
                 for e in events
-                if e.get("event_type") in ("QA_GATE_FAILED", "SUBMISSION_FAILED", "TASK_REJECTED", "INTEGRATION_FAILED")
+                if e.get("event_type") in (
+                    "QA_GATE_FAILED",
+                    "SUBMISSION_FAILED",
+                    "TASK_REJECTED",
+                    "INTEGRATION_FAILED",
+                    "TASK_TIMED_OUT",
+                    "START_WORKING_FAILED",
+                )
             ]
             if task_errs:
                 errors.append({"task_id": tid, "errors": task_errs})

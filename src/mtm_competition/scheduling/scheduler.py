@@ -84,11 +84,12 @@ class TournamentScheduler:
         if not self.has_capacity:
             return None
 
-        # Promote newly DISCOVERED tasks to QUEUED
-        discovered = self.store.list_tasks(status=TaskState.DISCOVERED.value)
-        for d in discovered:
-            if not self.store.has_submitted(d["task_id"]):
-                self.store.update_task_status(d["task_id"], TaskState.QUEUED)
+        # Promote newly DISCOVERED (or recovered READY_TO_SUBMIT) tasks to QUEUED
+        for state_val in (TaskState.DISCOVERED.value, TaskState.READY_TO_SUBMIT.value):
+            candidates = self.store.list_tasks(status=state_val)
+            for d in candidates:
+                if not self.store.has_submitted(d["task_id"]):
+                    self.store.update_task_status(d["task_id"], TaskState.QUEUED)
 
         queued_tasks = self.store.list_tasks(status=TaskState.QUEUED.value)
 

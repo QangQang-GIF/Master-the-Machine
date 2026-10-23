@@ -5,7 +5,15 @@ on:
     branches: [ main ]
   pull_request:
     branches: [ main ]
+  release:
+    types: [ published ]
   workflow_dispatch:
+    inputs:
+      require_live_gates:
+        description: "Strictly require live Staging GM & CLI credentials (fail if missing)"
+        required: false
+        default: false
+        type: boolean
 
 jobs:
   test-core:
@@ -56,9 +64,10 @@ jobs:
         python -m pip install --upgrade pip
         pip install -e ".[dev]" pytest
 
-    - name: Run E2E Component & Tournament Simulation (No Skips)
+    - name: Run E2E Component & Tournament Simulation (Strict: Zero Skips)
       run: |
-        pytest tests/e2e/test_e2e_a_components.py tests/e2e/test_e2e_b_tournament_sim.py -v
+        pytest tests/e2e/test_e2e_a_components.py tests/e2e/test_e2e_b_tournament_sim.py -v --junitxml=e2e_sim_results.xml
+        python -c "import xml.etree.ElementTree as ET, sys; root = ET.parse('e2e_sim_results.xml').getroot(); suite = root.find('testsuite') or root; skipped = int(suite.attrib.get('skipped', 0)); tests = int(suite.attrib.get('tests', 0)); failed = int(suite.attrib.get('failures', 0)); errors = int(suite.attrib.get('errors', 0)); sys.exit(1 if (skipped > 0 or tests == 0 or failed > 0 or errors > 0) else 0)"
 
     - name: Run E2E Production Target Safety Check
       run: |
@@ -84,12 +93,23 @@ jobs:
       id: check-creds
       env:
         STAGING_URL: ${{ secrets.MTM_GM_STAGING_URL }}
+        STAGING_TOKEN: ${{ secrets.MTM_GM_TOKEN }}
+        REQUIRE_LIVE: ${{ inputs.require_live_gates }}
       run: |
-        if [ -n "$STAGING_URL" ]; then
+        if [ -n "$STAGING_URL" ] && [ -n "$STAGING_TOKEN" ]; then
           echo "has_creds=true" >> "$GITHUB_OUTPUT"
+        elif [ -n "$STAGING_URL" ] && [ -z "$STAGING_TOKEN" ]; then
+          echo "::error ::MTM_GM_STAGING_URL is set but MTM_GM_TOKEN is missing. Both are required for staging gate."
+          exit 1
+        elif [ -z "$STAGING_URL" ] && [ -n "$STAGING_TOKEN" ]; then
+          echo "::error ::MTM_GM_TOKEN is set but MTM_GM_STAGING_URL is missing. Both are required for staging gate."
+          exit 1
+        elif [ "$GITHUB_EVENT_NAME" = "release" ] || [ "$REQUIRE_LIVE" = "true" ]; then
+          echo "::error ::Official release gate requires both MTM_GM_STAGING_URL and MTM_GM_TOKEN secrets to be configured."
+          exit 1
         else
           echo "has_creds=false" >> "$GITHUB_OUTPUT"
-          echo "::notice ::Staging Game Master credentials not configured. Skipping live staging gate."
+          echo "::notice ::Staging Game Master credentials not configured. Gate deferred to pre-tournament release checklist."
         fi
 
     - name: Run Live Staging Integration (Strict: Zero Skips Allowed)
@@ -100,4 +120,4 @@ jobs:
         MTM_STAGING_GM: "1"
       run: |
         pytest tests/e2e/test_e2e_d_staging_gm.py -m staging_game_master -v --junitxml=staging_results.xml
-        python -c "import xml.etree.ElementTree as ET, sys; root = ET.parse('staging_results.xml').getroot(); suite = root.find('testsuite') or root; skipped = int(suite.attrib.get('skipped', 0)); tests = int(suite.attrib.get('tests', 0)); print(f'Executed: {tests}, Skipped: {skipped}'); sys.exit(1 if (skipped > 0 or tests == 0) else 0)"
+        python -c "import xml.etree.ElementTree as ET, sys; root = ET.parse('staging_results.xml').getroot(); suite = root.find('testsuite') or root; skipped = int(suite.attrib.get('skipped', 0)); tests = int(suite.attrib.get('tests', 0)); failed = int(suite.attrib.get('failures', 0)); errors = int(suite.attrib.get('errors', 0)); print(f'Executed: {tests}, Skipped: {skipped}, Failed: {failed}, Errors: {errors}'); sys.exit(1 if (skipped > 0 or tests == 0 or failed > 0 or errors > 0) else 0)"

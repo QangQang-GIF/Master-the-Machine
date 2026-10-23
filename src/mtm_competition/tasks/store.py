@@ -192,6 +192,42 @@ class TaskStore:
                 time.time(),
             ))
 
+    def get_attempt_count(self, task_id: str) -> int:
+        """Return the number of recorded attempts for a task."""
+        cursor = self.conn.cursor()
+        cursor.execute("SELECT COUNT(*) AS cnt FROM attempts WHERE task_id = ?", (task_id,))
+        row = cursor.fetchone()
+        return int(row["cnt"] or 0) if row else 0
+
+    def reconcile_orphaned_tasks(self) -> List[Dict[str, Any]]:
+        """Requeue tasks left in ASSIGNED, RUNNING, or VERIFYING state after an abrupt process crash."""
+        cursor = self.conn.cursor()
+        cursor.execute("""
+            SELECT * FROM tasks
+            WHERE status IN ('ASSIGNED', 'RUNNING', 'VERIFYING')
+        """)
+        rows = [dict(r) for r in cursor.fetchall()]
+        requeued = []
+        now = time.time()
+        for t in rows:
+            tid = t["task_id"]
+            if not self.has_submitted(tid):
+                old_state = t["status"]
+                with self.conn:
+                    self.conn.execute(
+                        "UPDATE tasks SET status = ?, updated_at = ? WHERE task_id = ?",
+                        (TaskState.QUEUED.value, now, tid),
+                    )
+                    self.record_event(
+                        tid,
+                        "CRASH_RECOVERY_REQUEUED",
+                        old_state,
+                        TaskState.QUEUED.value,
+                        {"reason": "Task was active during process restart without submission"},
+                    )
+                requeued.append({"task_id": tid, "from_state": old_state, "to_state": TaskState.QUEUED.value})
+        return requeued
+
     def has_submitted(self, task_id: str) -> bool:
         """Check if task has already been submitted or is currently in flight (idempotency guard)."""
         cursor = self.conn.cursor()

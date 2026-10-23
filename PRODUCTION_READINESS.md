@@ -11,7 +11,7 @@
 | Requirement | Target Criteria | Actual Status | Verification Method |
 |---|---|:---:|---|
 | **Python Compatibility** | Python 3.12 & 3.13 | **PASS** | CI Matrix on Ubuntu & local Windows 3.12/3.13 verification |
-| **P0/P1 Remediations** | 100% of P0/P1 regression tests passing | **PASS** | 90 core tests + 12 component/tournament E2E tests pass (102 passed, 0 failed) |
+| **P0/P1 Remediations** | 100% of P0/P1 regression tests passing | **PASS** | 96 core tests + 12 component/tournament E2E tests pass (108 passed, 0 failed) |
 | **Independent QA & MVS** | Independent test re-verification in production | **PASS** | `QAGate` re-runs tests with real subprocesses and validates MVS |
 | **Remote Git Verification** | Commit SHA verified on remote before submit | **PASS** | `IntegrationGuard` and `GitGuard.verify_head(verify_pushed=True)` |
 | **Submission Idempotency** | Zero duplicate submissions on network timeouts | **PASS** | `SubmissionGuard` uses UUID idempotency keys and reconciles in-flight |

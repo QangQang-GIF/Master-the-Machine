@@ -28,7 +28,7 @@ class WorkspaceManager:
         ws_path = self.scratch_dir / ws_name
 
         if ws_path.exists():
-            shutil.rmtree(ws_path, ignore_errors=True)
+            self.cleanup_workspace(repo, ws_path)
 
         def _ignore(directory, files):
             ignored = set()
