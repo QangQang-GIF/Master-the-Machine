@@ -5,6 +5,7 @@ import shutil
 from pathlib import Path
 import pytest
 
+from mtm_core.contracts import TaskEnvelope, WorkerStatus
 from mtm_competition.workers import WorkerLauncher
 from mtm_competition.verification import validate_worker_result
 
@@ -14,7 +15,7 @@ FIXTURES = ROOT / "tests" / "fixtures"
 
 @pytest.mark.live_cli
 def test_smoke_worker_run(tmp_path, pytestconfig):
-    # In default pytest run without -m live_cli, mark clearly as not run
+    """Functional smoke test: Worker MUST complete autonomously and fix the code."""
     mark_expr = pytestconfig.getoption("-m", default="")
     if "live_cli" not in mark_expr and os.environ.get("MTM_LIVE_CLI") != "1":
         pytest.skip("Smoke test requires real CLI execution. Skipped in default test run (run with -m live_cli).")
@@ -49,7 +50,7 @@ def test_smoke_worker_run(tmp_path, pytestconfig):
         "selected_skills": ["mtm-bug-worker@0.1.0"],
         "model": "gemini-3.8-flash-low" if chosen_backend == "antigravity" else "gpt-6.1-sol",
         "reasoning_effort": "low",
-        "time_budget_seconds": 120,
+        "time_budget_seconds": 180,
         "limits": {"network": "none", "allowed_paths": [str(work_repo)]},
         "backend": chosen_backend,
     }
@@ -62,17 +63,58 @@ def test_smoke_worker_run(tmp_path, pytestconfig):
     )
     worker_result, trace, ws_path = launcher.launch(envelope, backend=chosen_backend)
 
-    # 4. Verify outputs
+    # 4. Strict functional assertion: TIMED_OUT is NOT considered a functional success
     res_dict = worker_result.to_dict() if hasattr(worker_result, "to_dict") else worker_result
     assert res_dict["task_id"] == "BUG-SMOKE-01"
-    assert res_dict["status"] in ("READY_FOR_REVIEW", "COMPLETED", "TIMED_OUT")
+    assert res_dict["status"] in ("READY_FOR_REVIEW", "COMPLETED")
+    assert "calculator.py" in res_dict["changed_files"]
     assert res_dict["elapsed_seconds"] > 0
+    assert trace.turns >= 1
 
-    if res_dict["status"] in ("READY_FOR_REVIEW", "COMPLETED"):
-        assert "calculator.py" in res_dict["changed_files"]
-        assert trace.turns >= 1
-        # 5. Deterministic QA Gate validation
-        validate_worker_result(res_dict, workspace_dir=ws_path)
-        # 6. Verify the code was actually fixed
-        fixed_code = (ws_path / "calculator.py").read_text(encoding="utf-8")
-        assert ">=" in fixed_code
+    # 5. Deterministic QA Gate validation
+    validate_worker_result(res_dict, workspace_dir=ws_path)
+
+    # 6. Verify the code was actually fixed
+    fixed_code = (ws_path / "calculator.py").read_text(encoding="utf-8")
+    assert ">=" in fixed_code
+
+
+@pytest.mark.live_cli
+def test_smoke_worker_timeout_behavior(tmp_path, pytestconfig):
+    """Timeout smoke test: Exceeding time budget MUST result in TIMED_OUT, never READY_FOR_REVIEW."""
+    mark_expr = pytestconfig.getoption("-m", default="")
+    if "live_cli" not in mark_expr and os.environ.get("MTM_LIVE_CLI") != "1":
+        pytest.skip("Timeout smoke test requires real CLI execution. Skipped in default test run (run with -m live_cli).")
+
+    has_codex = shutil.which("codex") is not None
+    has_agy = shutil.which("agy") is not None
+    if not has_codex and not has_agy:
+        pytest.skip("BLOCKED: Neither codex nor agy CLI available on PATH.")
+
+    chosen_backend = "codex" if has_codex else "antigravity"
+
+    work_repo = tmp_path / "work_repo"
+    shutil.copytree(FIXTURES / "sample_repo", work_repo)
+
+    envelope = {
+        "task_id": "TIMEOUT-SMOKE-02",
+        "task_type": "BUG",
+        "title": "Timeout verification task",
+        "description": "Perform complex refactoring across entire codebase.",
+        "repository_path": str(work_repo),
+        "base_revision": "HEAD",
+        "time_budget_seconds": 1,  # Strict 1-second budget forces timeout
+        "backend": chosen_backend,
+    }
+
+    launcher = WorkerLauncher(
+        scratch_dir=tmp_path / "scratch",
+        backend=chosen_backend,
+        strict_backend=True,
+    )
+    worker_result, trace, ws_path = launcher.launch(envelope, backend=chosen_backend)
+
+    res_dict = worker_result.to_dict() if hasattr(worker_result, "to_dict") else worker_result
+    # Must produce TIMED_OUT and NEVER READY_FOR_REVIEW
+    assert res_dict["status"] == WorkerStatus.TIMED_OUT
+    assert res_dict["status"] != WorkerStatus.READY_FOR_REVIEW

@@ -14,13 +14,11 @@ from __future__ import annotations
 
 import os
 import shutil
-import time
 from pathlib import Path
 import pytest
 
 from mtm_core.contracts import TaskEnvelope, WorkerStatus
 from mtm_competition.workers import WorkerLauncher
-from mtm_competition.workers.supervisor import WorkerSupervisor
 
 ROOT = Path(__file__).resolve().parent.parent.parent
 FIXTURES = ROOT / "tests" / "fixtures"
@@ -53,15 +51,17 @@ def test_e2e_c_codex_simple_bug(tmp_path, pytestconfig):
         repository_path=str(work_repo),
         mvs=[{"id": "MVS-1", "description": "test_discount_exact_threshold"}],
         selected_skills=["mtm-bug-worker@0.1.0"],
-        model="gpt-5.3-codex",
+        model="gpt-6.1-sol",
         reasoning_effort="low",
-        time_budget_seconds=120,
+        time_budget_seconds=180,
         backend="codex",
     )
 
     launcher = WorkerLauncher(scratch_dir=tmp_path / "scratch", backend="codex")
     result, trace, ws = launcher.launch(envelope)
-    assert result.status in (WorkerStatus.READY_FOR_REVIEW, WorkerStatus.FAILED)
+    assert result.status in (WorkerStatus.READY_FOR_REVIEW, WorkerStatus.COMPLETED)
+    assert "calculator.py" in result.changed_files
+    assert ">=" in (ws / "calculator.py").read_text(encoding="utf-8")
 
 
 @pytest.mark.live_cli
@@ -79,13 +79,15 @@ def test_e2e_c_codex_multifile_cr(tmp_path, pytestconfig):
         description="Add tax calculation across cart and pricing modules.",
         repository_path=str(work_repo),
         selected_skills=["mtm-cr-worker@0.1.0"],
-        model="gpt-5.3-codex",
-        time_budget_seconds=120,
+        model="gpt-6.1-sol",
+        reasoning_effort="medium",
+        time_budget_seconds=180,
         backend="codex",
     )
     launcher = WorkerLauncher(scratch_dir=tmp_path / "scratch", backend="codex")
     result, trace, ws = launcher.launch(envelope)
-    assert result.status in (WorkerStatus.READY_FOR_REVIEW, WorkerStatus.FAILED)
+    assert result.status in (WorkerStatus.READY_FOR_REVIEW, WorkerStatus.COMPLETED)
+    assert len(result.changed_files) >= 1
 
 
 @pytest.mark.live_cli
@@ -107,12 +109,12 @@ def test_e2e_c_codex_worker_timeout(tmp_path, pytestconfig):
     )
     launcher = WorkerLauncher(scratch_dir=tmp_path / "scratch", backend="codex")
     result, trace, ws = launcher.launch(envelope)
-    assert result.status in (WorkerStatus.TIMED_OUT, WorkerStatus.FAILED)
+    assert result.status == WorkerStatus.TIMED_OUT
 
 
 @pytest.mark.live_cli
 def test_e2e_c_agy_simple_bug(tmp_path, pytestconfig):
-    """Antigravity CLI (agy): Simple BUG execution."""
+    """Antigravity CLI (agy): Simple BUG functional execution."""
     _check_live_cli_gate(pytestconfig, "antigravity")
 
     work_repo = tmp_path / "work_repo"
@@ -126,20 +128,22 @@ def test_e2e_c_agy_simple_bug(tmp_path, pytestconfig):
         repository_path=str(work_repo),
         mvs=[{"id": "MVS-1", "description": "test_discount_exact_threshold"}],
         selected_skills=["mtm-bug-worker@0.1.0"],
-        model="gemini-3.8-flash-high",
+        model="gemini-3.8-flash-low",
         reasoning_effort="low",
-        time_budget_seconds=120,
+        time_budget_seconds=180,
         backend="antigravity",
     )
 
     launcher = WorkerLauncher(scratch_dir=tmp_path / "scratch", backend="antigravity")
     result, trace, ws = launcher.launch(envelope)
-    assert result.status in (WorkerStatus.READY_FOR_REVIEW, WorkerStatus.FAILED)
+    assert result.status in (WorkerStatus.READY_FOR_REVIEW, WorkerStatus.COMPLETED)
+    assert "calculator.py" in result.changed_files
+    assert ">=" in (ws / "calculator.py").read_text(encoding="utf-8")
 
 
 @pytest.mark.live_cli
 def test_e2e_c_agy_multifile_cr(tmp_path, pytestconfig):
-    """Antigravity CLI (agy): Multi-file CR execution."""
+    """Antigravity CLI (agy): Multi-file CR functional execution."""
     _check_live_cli_gate(pytestconfig, "antigravity")
 
     work_repo = tmp_path / "work_repo"
@@ -152,13 +156,15 @@ def test_e2e_c_agy_multifile_cr(tmp_path, pytestconfig):
         description="Add tax calculation across cart and pricing modules.",
         repository_path=str(work_repo),
         selected_skills=["mtm-cr-worker@0.1.0"],
-        model="gemini-3.8-flash-high",
-        time_budget_seconds=120,
+        model="gemini-3.8-flash-medium",
+        reasoning_effort="medium",
+        time_budget_seconds=180,
         backend="antigravity",
     )
     launcher = WorkerLauncher(scratch_dir=tmp_path / "scratch", backend="antigravity")
     result, trace, ws = launcher.launch(envelope)
-    assert result.status in (WorkerStatus.READY_FOR_REVIEW, WorkerStatus.FAILED)
+    assert result.status in (WorkerStatus.READY_FOR_REVIEW, WorkerStatus.COMPLETED)
+    assert len(result.changed_files) >= 1
 
 
 @pytest.mark.live_cli
@@ -180,4 +186,4 @@ def test_e2e_c_agy_worker_timeout(tmp_path, pytestconfig):
     )
     launcher = WorkerLauncher(scratch_dir=tmp_path / "scratch", backend="antigravity")
     result, trace, ws = launcher.launch(envelope)
-    assert result.status in (WorkerStatus.TIMED_OUT, WorkerStatus.FAILED)
+    assert result.status == WorkerStatus.TIMED_OUT

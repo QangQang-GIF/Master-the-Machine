@@ -1,8 +1,8 @@
 # MTM 2026 Skill System — Production Readiness & Runbook
 
-**Document Version:** 1.0.0  
+**Document Version:** 1.1.0  
 **Target Tournament:** MTM 2026 Live Contest  
-**Status:** **RELEASE-READY**
+**Status:** **SIMULATION-VERIFIED | LIVE STAGING & CODEX-CLI PENDING ENVIRONMENT PROVISIONING**
 
 ---
 
@@ -11,25 +11,61 @@
 | Requirement | Target Criteria | Actual Status | Verification Method |
 |---|---|:---:|---|
 | **Python Compatibility** | Python 3.12 & 3.13 | **PASS** | CI Matrix on Ubuntu & local Windows 3.12/3.13 verification |
-| **P0/P1 Remediations** | 100% of P0/P1 tests passing | **PASS** | 88 core regression tests + 12 component E2E tests pass (0 failures) |
+| **P0/P1 Remediations** | 100% of P0/P1 regression tests passing | **PASS** | 88 core tests + 12 component/tournament E2E tests pass (100 passed, 0 failed) |
 | **Independent QA & MVS** | Independent test re-verification in production | **PASS** | `QAGate` re-runs tests with real subprocesses and validates MVS |
 | **Remote Git Verification** | Commit SHA verified on remote before submit | **PASS** | `IntegrationGuard` and `GitGuard.verify_head(verify_pushed=True)` |
 | **Submission Idempotency** | Zero duplicate submissions on network timeouts | **PASS** | `SubmissionGuard` uses UUID idempotency keys and reconciles in-flight |
 | **Two-Phase Grading** | Confirmed points awarded only upon Grader PASSED | **PASS** | `TaskStore` cleanly separates provisional vs confirmed points |
-| **Clean Process Tree** | Preemption/cancel does not leave orphan processes | **PASS** | `WorkerSupervisor` cross-platform process tree termination |
-| **Real CLI Execution** | Live CLI smoke tests executed without mock | **PASS** | `agy` (v1.4.6) passed live tests; `codex` properly marked BLOCKED |
+| **Clean Process Tree** | Preemption/cancel does not leave orphan processes | **PASS** | `_terminate_process_tree` (`taskkill /F /T` on Windows, `killpg` on Unix) |
+| **Real Antigravity CLI** | Live CLI smoke tests executed without mock | **PASS** | `agy` (v1.4.6) passed functional bugfix and timeout termination |
+| **Codex CLI Live Execution** | Codex CLI smoke tests executed without mock | **PENDING** | Marked `BLOCKED`; pending `codex` binary installation on contest runner |
 | **Contest Simulation** | Full 12-event tournament lifecycle simulation | **PASS** | `tests/e2e/test_e2e_b_tournament_sim.py` passed |
+| **Game Master Staging** | Live connection & grading against staging GM | **PENDING** | Safety guard passed; live tests pending staging URL & token from organizers |
 | **Skill Checksums** | Checksums locked and frozen in release gate | **PASS** | `verify_skill_checksums('.')` returns 0 mismatches |
 | **Structured E2E Report** | Comprehensive test evidence across all tiers | **PASS** | `E2E_REPORT.md` |
 | **Operational Runbook** | Config, operating instructions, rollback procedures | **PASS** | `PRODUCTION_READINESS.md` |
 
 ---
 
-## 2. Production Environment Configuration
+## 2. Release Gate Procedure (Two-Phase Gating)
+
+To ensure zero risk during contest execution, release gating is split into two formal phases:
+
+### Phase A: Architecture & Simulation Gate (STATUS: COMPLETED & VERIFIED)
+- 100% of P0/P1 audit fixes implemented and passing.
+- 100% of deterministic E2E simulation tests passing (`test_e2e_a_components.py`, `test_e2e_b_tournament_sim.py`).
+- Real Antigravity CLI live execution verified against fixture repositories.
+- Zero duplicate submissions in fault-injection tests.
+- Skill SHA-256 checksums verified against `releases/checksums.sha256`.
+
+### Phase B: Live Environment Gate (STATUS: PENDING ORGANIZER PROVISIONING)
+Must be executed on the official contest machine immediately upon receiving tournament credentials:
+
+```bash
+# Step 1: Ensure worker CLI binary is available
+which codex   # If competing under Codex backend
+which agy     # If competing under Antigravity backend
+
+# Step 2: Configure Staging Environment Credentials
+export MTM_GM_STAGING_URL="https://staging.mtm2026.org/api/v1"
+export MTM_GM_TOKEN="your_staging_contest_token"
+export MTM_STAGING_GM="1"
+
+# Step 3: Run Live CLI Verification (Strict: No Skips Allowed for active backend)
+python -m pytest tests/e2e/test_e2e_c_live_cli.py -m live_cli -v
+python -m pytest tests/test_smoke_worker.py -m live_cli -v
+
+# Step 4: Run Game Master Staging Integration (Strict: No Skips Allowed)
+python -m pytest tests/e2e/test_e2e_d_staging_gm.py -m staging_game_master -v
+```
+
+Only when both Phase A and Phase B are completely green should the system be launched against the official contest endpoint.
+
+---
+
+## 3. Production Environment Configuration
 
 ### Required Environment Variables
-
-Set the following environment variables prior to launching the orchestrator:
 
 ```bash
 # 1. Environment Mode
@@ -52,7 +88,7 @@ export MTM_CONCURRENCY=1
 
 ### Pre-Flight Verification Commands
 
-Run these four commands on the contest machine before the match begins:
+Run these commands on the contest machine before the match begins:
 
 ```bash
 # 1. Install dependencies in editable mode
@@ -61,10 +97,10 @@ python -m pip install -e ".[dev]"
 # 2. Verify frozen skill package SHA-256 checksums
 python -c "from mtm_core.config.loader import verify_skill_checksums; verify_skill_checksums('.')"
 
-# 3. Run full automated test suite
-python -m pytest -v
+# 3. Run core test suite (90 tests)
+python -m pytest tests --ignore=tests/e2e -v
 
-# 4. Run E2E tournament suite
+# 4. Run E2E tournament simulation suite (21 tests)
 python -m pytest tests/e2e/ -v
 ```
 
@@ -72,11 +108,9 @@ All commands must exit with returncode `0`.
 
 ---
 
-## 3. Operational Runbook
+## 4. Operational Runbook
 
 ### Starting the Orchestrator
-
-To start the autonomous competition loop:
 
 ```python
 from pathlib import Path
@@ -114,7 +148,7 @@ print("Tournament Report:", report)
 
 ---
 
-## 4. Rollback and Disaster Recovery Procedures
+## 5. Rollback and Disaster Recovery Procedures
 
 ### Scenario A: Network Drop During Submission
 - **Symptom:** Submission HTTP request times out; connection reset.
@@ -153,7 +187,7 @@ print("Tournament Report:", report)
 
 ---
 
-## 5. Security & Verification Guardrails
+## 6. Security & Verification Guardrails
 
 1. **Path Containment:** `IntegrationGuard` rejects any patch touching files outside the repository root or attempting relative path traversal (`../`).
 2. **Symlink Prohibition:** `validate_qa_gate` inspects all changed files and rejects any symlinks or symbolic link targets.

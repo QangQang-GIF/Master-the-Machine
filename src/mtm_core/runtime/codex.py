@@ -39,6 +39,26 @@ class RuntimeResult:
 _DEFAULT = object()
 
 
+
+def _terminate_process_tree(proc: subprocess.Popen) -> None:
+    """Cross-platform termination of a process and all its children."""
+    try:
+        if sys.platform == "win32":
+            subprocess.run(
+                ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                capture_output=True,
+                timeout=5,
+            )
+        else:
+            import signal
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+    except Exception:
+        pass
+    try:
+        proc.kill()
+    except Exception:
+        pass
+
 class CodexRuntime:
     """Manages spawning, sandboxing, timing, and harvesting of Codex / Antigravity runs."""
 
@@ -205,7 +225,7 @@ class CodexRuntime:
                 exit_code = proc.returncode
             except subprocess.TimeoutExpired:
                 timed_out = True
-                proc.kill()
+                _terminate_process_tree(proc)
                 stdout_text, _ = proc.communicate()
                 exit_code = -1
 
@@ -234,7 +254,7 @@ class CodexRuntime:
                 exit_code = proc.returncode
             except subprocess.TimeoutExpired:
                 timed_out = True
-                proc.kill()
+                _terminate_process_tree(proc)
                 stdout_text, _ = proc.communicate()
                 exit_code = -1
 

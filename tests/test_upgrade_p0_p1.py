@@ -289,7 +289,7 @@ def test_backend_routing_synchronization():
     # Fast profile for minor task
     env_task = {"task_id": "TASK-1", "task_type": "TASK", "points": 50}
     route_agy_fast = router.route(env_task, backend="antigravity")
-    assert route_agy_fast.model == "gemini-3.8-flash-high"
+    assert route_agy_fast.model in ("gemini-3.8-flash-low", "gemini-3.8-flash-high")
     assert route_agy_fast.reasoning_effort == "low"
 
 

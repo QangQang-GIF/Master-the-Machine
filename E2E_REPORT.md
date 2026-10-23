@@ -1,9 +1,10 @@
 # MTM 2026 Skill System — End-to-End Verification Report (E2E)
 
 **Generated:** 2026-10-23  
-**Branch:** `feat/upgrade2-remediation`  
+**Branch:** `main`  
 **Test Runner:** `pytest 9.1.1` on Python 3.12 (win32)  
-**Status:** **100 PASSED, 10 SKIPPED (BLOCKED/MARKER), 0 FAILED** (100% Success Rate)
+**Readiness Status:** **SIMULATION-VERIFIED | LIVE STAGING & CODEX-CLI GATED ON ENVIRONMENT PROVISIONING**  
+**Default CI/Offline Suite:** **100 PASSED, 11 SKIPPED (GATED), 0 FAILED** (111 Collected)
 
 ---
 
@@ -13,14 +14,27 @@ This report documents the end-to-end verification and remediation of the MTM 202
 
 ### Key Architectural Assurances
 1. **Remote Git Verification (`IntegrationGuard` & `GitGuard`):** No commit can be submitted unless pushed to the canonical remote and confirmed via `git ls-remote`.
-2. **Mandatory MVS & QA Gate (`QAGate`):** Independent test execution prevents workers from faking test results; all Minimum Viable Solutions (MVS) are verified before submission.
+2. **Mandatory MVS & Independent QA Gate (`QAGate`):** Independent test execution prevents workers from faking test results; all Minimum Viable Solutions (MVS) are verified before submission.
 3. **Strict Once-Only Submission Idempotency (`SubmissionGuard`):** Submissions require UUID idempotency keys; HTTP 4xx errors are permanently rejected; timeouts enter `SUBMIT_IN_FLIGHT` and reconcile without duplicate attempts.
 4. **Grading & Scoring Separation (`TaskStore`):** Provisional points from server `ACCEPTED` are strictly isolated from confirmed points; points are only awarded upon Grader `PASSED`.
-5. **Preemption & Clock Awareness (`WorkerSupervisor` & `TournamentScheduler`):** Emergency Production Incidents (PI) immediately preempt running tasks; match `PAUSED` freezes match clock without burning task budget; process trees terminate cleanly without orphan processes.
+5. **Preemption & Clock Awareness (`WorkerSupervisor` & `TournamentScheduler`):** Emergency Production Incidents (PI) immediately preempt running tasks; match `PAUSED` freezes match clock without burning task budget; process trees terminate cleanly without orphan processes (`taskkill /F /T` on Windows).
 
 ---
 
-## 2. Test Execution Tiers
+## 2. Test Execution Tiers & Evidence
+
+### Tier Breakdown & Metrics Taxonomy
+
+| Tier | Category | Collected | Passed (Default) | Skipped (Default) | Failed | Notes |
+|---|---|:---:|:---:|:---:|:---:|---|
+| **Core** | Unit, Contracts, Scheduler, Store, Runtime | 90 | 88 | 2 | 0 | 2 live smoke tests skipped in default run (run via `-m live_cli`) |
+| **E2E-A** | Component Integration & Fault-Injection | 10 | 10 | 0 | 0 | 100% deterministic pass, 0 skips |
+| **E2E-B** | Full 12-Event Tournament Lifecycle | 1 | 1 | 0 | 0 | Full match lifecycle simulation passed, 0 skips |
+| **E2E-C** | Real CLI Execution | 6 | 0 | 6 | 0 | Marker-gated (`-m live_cli`); 3 agy passed live, 3 codex blocked |
+| **E2E-D** | Game Master Staging Integration | 4 | 1 | 3 | 0 | Production safety check passed; 3 staging-gated |
+| **TOTAL** | **All Categories** | **111** | **100** | **11** | **0** | **100% pass rate in CI/default suite** |
+
+---
 
 ### Tier E2E-A: Component Integration & Fault-Injection Tests (10/10 PASSED)
 
@@ -41,7 +55,7 @@ Suite: `tests/e2e/test_e2e_a_components.py`
 
 ---
 
-### Tier E2E-B: Full 12-Event Tournament Lifecycle Simulation (PASSED)
+### Tier E2E-B: Full 12-Event Tournament Lifecycle Simulation (1/1 PASSED)
 
 Suite: `tests/e2e/test_e2e_b_tournament_sim.py`  
 Method: `test_e2e_b_complete_12_event_tournament_simulation`
@@ -64,19 +78,21 @@ Simulates the complete 12-event tournament sequence against a live bare Git remo
 
 ### Tier E2E-C: Real CLI Execution Matrix
 
-Suite: `tests/e2e/test_e2e_c_live_cli.py` (run with `-m live_cli`)
+Suite: `tests/e2e/test_e2e_c_live_cli.py` & `tests/test_smoke_worker.py` (run with `-m live_cli`)
 
 | Backend | Task Type | Scenario | Observed Status | Result |
 |---|---|---|---|:---:|
 | **Codex CLI** | BUG | Simple bugfix | `codex` binary not on PATH | **BLOCKED (SKIPPED)** |
 | **Codex CLI** | CR | Multi-file feature | `codex` binary not on PATH | **BLOCKED (SKIPPED)** |
 | **Codex CLI** | TIMEOUT | Timeout enforcement | `codex` binary not on PATH | **BLOCKED (SKIPPED)** |
-| **Anti CLI (`agy`)** | BUG | Simple bugfix | Autonomous prompt & execution | **PASSED** |
-| **Anti CLI (`agy`)** | CR | Multi-file feature | Autonomous prompt & execution | **PASSED** |
-| **Anti CLI (`agy`)** | TIMEOUT | Timeout enforcement | Subprocess killed cleanly | **PASSED** |
+| **Anti CLI (`agy`)** | BUG | Functional code fix & test | Autonomous bugfix verified (`>=`) | **PASSED** |
+| **Anti CLI (`agy`)** | CR | Multi-file feature patch | Autonomous patch verified | **PASSED** |
+| **Anti CLI (`agy`)** | TIMEOUT | Timeout enforcement | Terminated in 1.43s via `taskkill` | **PASSED** |
+| **Smoke Worker** | Functional | Code fix & QA gate | Fixed calculator.py, QA gate passed | **PASSED** |
+| **Smoke Timeout** | Timeout | Time budget expiration | Strictly returns `TIMED_OUT` (1.34s) | **PASSED** |
 
-> [!NOTE]
-> Per Upgrade2.md specification: *"Không dùng mocked Worker cho tầng này. Nếu một CLI không sẵn có, đánh dấu BLOCKED; không chuyển thành PASS."* The Codex CLI tests are properly marked BLOCKED (skipped with explicit diagnostic notice) on systems where the binary is not installed, while the live Antigravity CLI (`agy` 1.4.6) completes all scenarios successfully.
+> [!IMPORTANT]
+> Smoke tests and functional tests strictly demand `READY_FOR_REVIEW` or `COMPLETED` and verify real code changes. `TIMED_OUT` is never considered a functional pass; timeout behavior is tested independently.
 
 ---
 
@@ -87,31 +103,4 @@ Suite: `tests/e2e/test_e2e_d_staging_gm.py` (run with `-m staging_game_master`)
 - **Safety Target Verification (`test_e2e_d_staging_safe_target_verification`):** **PASSED**  
   Guarantees test runners never connect to production tournament hosts (`prod.mtm2026.org`, `contest.mtm2026.org`).
 - **Live Staging Endpoint Contract:** **BLOCKED (SKIPPED)**  
-  Cleanly skipped until staging credentials (`MTM_GM_STAGING_URL`, `MTM_GM_TOKEN`) are provisioned by the tournament organizers.
-
----
-
-## 3. Full Test Suite Summary
-
-Total Test Count: **110 Collected**
-- **100 Passed**
-- **10 Skipped** (9 marker-gated for live staging / missing CLI, 1 smoke test gated by live_cli)
-- **0 Failed**
-
-All regression suites pass cleanly:
-- `tests/test_audit_fixes.py` (14/14 PASSED)
-- `tests/test_competition_pipeline.py` (12/12 PASSED)
-- `tests/test_contracts.py` (13/13 PASSED)
-- `tests/test_git_and_config.py` (5/5 PASSED)
-- `tests/test_mini_plan_backend.py` (6/6 PASSED)
-- `tests/test_phase1_hardening.py` (5/5 PASSED)
-- `tests/test_phase2_reliability.py` (5/5 PASSED)
-- `tests/test_phase3_gm_contract.py` (4/4 PASSED)
-- `tests/test_runtime.py` (7/7 PASSED)
-- `tests/test_trace_parser.py` (2/2 PASSED)
-- `tests/test_upgrade_p0_p1.py` (10/10 PASSED)
-- `tests/test_arena_and_training.py` (3/3 PASSED)
-- `tests/test_e2e_contest_scenario.py` (1/1 PASSED)
-- `tests/e2e/test_e2e_a_components.py` (10/10 PASSED)
-- `tests/e2e/test_e2e_b_tournament_sim.py` (1/1 PASSED)
-- `tests/e2e/test_e2e_d_staging_gm.py` (1/1 PASSED safety check)
+  Cleanly gated until staging credentials (`MTM_GM_STAGING_URL`, `MTM_GM_TOKEN`) are provisioned by the tournament organizers.

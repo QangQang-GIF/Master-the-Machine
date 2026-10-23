@@ -3,7 +3,7 @@ profiles:
   fast:
     codex_model: gpt-6.1-sol
     codex_effort: low
-    agy_model: gemini-3.8-flash-high
+    agy_model: gemini-3.8-flash-low
     agy_effort: low
     use_case: "narrow tasks, minor bug fixes, verification"
   standard:
@@ -22,6 +22,7 @@ allowlist:
   models:
     - gpt-6.1-sol
     - gpt-6.1-luna
+    - gemini-3.8-flash-low
     - gemini-3.8-flash-high
     - claude-sonnet-4-6
   effort_levels:

@@ -120,11 +120,13 @@ class WorkerSupervisor:
             return None
         if proc.result:
             return proc.result
-        if proc.future and proc.future.done():
+        if proc.future:
             try:
                 proc.result = proc.future.result(timeout=timeout)
                 proc.status = "COMPLETED"
                 return proc.result
+            except TimeoutError:
+                return None
             except Exception as e:
                 proc.status = "FAILED"
                 raise e
