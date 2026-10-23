@@ -30,6 +30,10 @@ jobs:
       run: |
         python -c "from mtm_core.config.loader import verify_skill_checksums; verify_skill_checksums('.')"
 
-    - name: Run Test Suite
+    - name: Run Core Test Suite
       run: |
         pytest -v
+
+    - name: Run E2E Test Suite
+      run: |
+        pytest tests/e2e/ -v
