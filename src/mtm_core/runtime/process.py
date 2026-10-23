@@ -15,6 +15,92 @@ def is_cli_available(cli_name: str) -> bool:
     return shutil.which(cli_name) is not None
 
 
+def get_process_create_time(pid: int) -> Optional[float]:
+    """Return the OS process creation timestamp (Unix epoch seconds) for `pid`, or None if unavailable/dead."""
+    if not pid or pid <= 0:
+        return None
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+            kernel32 = ctypes.windll.kernel32
+            handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, int(pid))
+            if not handle:
+                return None
+            try:
+                creation_time = wintypes.FILETIME()
+                exit_time = wintypes.FILETIME()
+                kernel_time = wintypes.FILETIME()
+                user_time = wintypes.FILETIME()
+                ok = kernel32.GetProcessTimes(
+                    handle,
+                    ctypes.byref(creation_time),
+                    ctypes.byref(exit_time),
+                    ctypes.byref(kernel_time),
+                    ctypes.byref(user_time),
+                )
+                if not ok:
+                    return None
+                ft = (creation_time.dwHighDateTime << 32) | creation_time.dwLowDateTime
+                if ft <= 0:
+                    return None
+                # Convert Windows FILETIME (100-ns intervals since 1601-01-01) to Unix epoch seconds
+                return (ft - 116444736000000000) / 10_000_000.0
+            finally:
+                kernel32.CloseHandle(handle)
+        except Exception:
+            return None
+    else:
+        try:
+            proc_dir = Path(f"/proc/{int(pid)}")
+            if proc_dir.exists():
+                return float(proc_dir.stat().st_ctime)
+            res = subprocess.run(
+                ["ps", "-p", str(int(pid)), "-o", "etimes="],
+                capture_output=True,
+                text=True,
+                timeout=2,
+            )
+            if res.returncode == 0 and res.stdout.strip().isdigit():
+                import time as _time
+
+                return _time.time() - float(res.stdout.strip())
+        except Exception:
+            return None
+    return None
+
+
+def is_expected_worker_pid(
+    pid: int,
+    recorded_start_time: Optional[float],
+    task_updated_at: Optional[float] = None,
+    tolerance_sec: float = 5.0,
+) -> bool:
+    """Verify that `pid` still belongs to the recorded worker process and was not recycled by the OS."""
+    if not pid or pid <= 1 or pid == os.getpid():
+        return False
+    ppid = getattr(os, "getppid", lambda: None)()
+    if ppid and pid == ppid:
+        return False
+    if not is_pid_alive(pid):
+        return False
+
+    actual_start = get_process_create_time(pid)
+    if actual_start is None:
+        return False
+
+    if recorded_start_time is not None:
+        return abs(actual_start - float(recorded_start_time)) <= tolerance_sec
+
+    if task_updated_at is not None:
+        # Legacy fallback when only task_updated_at is present: process must not have started after last update
+        return actual_start <= float(task_updated_at) + tolerance_sec
+
+    return False
+
+
 def is_pid_alive(pid: int) -> bool:
     """Check whether a process with the given PID is currently alive across Windows and POSIX."""
     if pid <= 0:

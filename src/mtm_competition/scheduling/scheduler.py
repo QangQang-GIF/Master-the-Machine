@@ -131,13 +131,14 @@ class TournamentScheduler:
         if not queued_tasks:
             return None
 
-        # Prefer tasks not currently on a transient retry cooldown
+        # Strictly exclude tasks currently on a transient retry cooldown
         eligible_tasks = [t for t in queued_tasks if not self.is_on_cooldown(t["task_id"])]
-        pool = eligible_tasks if eligible_tasks else queued_tasks
+        if not eligible_tasks:
+            return None
 
         # Build priority queue
         pq = PriorityQueue()
-        for t in pool:
+        for t in eligible_tasks:
             pq.push(t, match_remaining_seconds=rem_sec, current_time=cur_time)
 
         next_task = pq.pop()

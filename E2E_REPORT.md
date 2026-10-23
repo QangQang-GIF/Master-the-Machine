@@ -4,7 +4,7 @@
 **Branch:** `main`  
 **Test Runner:** `pytest 9.1.1` on Python 3.12 (win32)  
 **Readiness Status:** **SIMULATION-VERIFIED | LIVE STAGING & CODEX-CLI GATED ON ENVIRONMENT PROVISIONING**  
-**Default CI/Offline Suite:** **113 PASSED, 13 SKIPPED (GATED), 0 FAILED** (126 Collected)
+**Default CI/Offline Suite:** **117 PASSED, 13 SKIPPED (GATED), 0 FAILED** (130 Collected)
 
 ---
 
@@ -19,9 +19,9 @@ This report documents the end-to-end verification and remediation of the MTM 202
 4. **Grading & Scoring Separation (`TaskStore`):** Provisional points from server `ACCEPTED` are strictly isolated from confirmed points; points are only awarded upon Grader `PASSED`.
 5. **Preemption, Thread Quiescence & Clock Awareness (`WorkerSupervisor` & `TournamentScheduler`):** Emergency Production Incidents (PI) immediately preempt running tasks; match `PAUSED` freezes match clock without burning task budget; process trees terminate cleanly across parent -> child -> grandchild hierarchies (`taskkill /F /T` on Windows; isolated session groups with `os.killpg` and `pgrep -P` descendant fallback on Unix); `SupervisedProcess.cancel_event` and `_quiesce_worker` join the worker future and block post-cancellation workspace/trace writes and startup-race `Popen` spawns.
 6. **Supervisor & Orchestrator State Machine, Retry & Fencing Integrity:**
-   - **Transient vs Permanent `start_working` / `get_mvs` Classification:** Transient errors (HTTP 429/5xx/408, network timeouts, `MVSLockedError`) retry with exponential backoff and requeue to `QUEUED` with a cooldown (freeing scheduler capacity so other ready tasks execute without losing scoring opportunities), only transitioning to `REJECTED` on permanent 4xx errors or after exhausting `start_working_max_requeues`.
-   - **Server-First Crash Reconciliation & Fencing Tokens:** `TaskStore.reconcile_orphaned_tasks` terminates lingering zombie worker PIDs (`active_pid`), rotates per-attempt `fencing_token` values (enforced across `RUNNING -> VERIFYING -> READY_TO_SUBMIT -> SUBMIT_IN_FLIGHT`), and reconciles `ASSIGNED`/`RUNNING`/`VERIFYING` tasks against Game Master `get_submission_status` before requeuing.
-   - **Direct `READY_TO_SUBMIT` Recovery:** `TournamentScheduler` preserves `READY_TO_SUBMIT` tasks without downgrading them to `QUEUED`, and `CompetitionOrchestrator._resume_ready_to_submit` resumes them directly at integration/submission without re-running the LLM worker.
+   - **Transient vs Permanent `start_working` / `get_mvs` Classification & Strict Cooldown Enforcement:** Transient errors (HTTP 429/5xx/408, network timeouts, `MVSLockedError`) retry with exponential backoff and requeue to `QUEUED` with a strict cooldown (`select_next_task()` returns `None` if all queued tasks are on cooldown, preventing retry budget burn during outages), only transitioning to `REJECTED` on permanent 4xx errors or after exhausting `start_working_max_requeues`.
+   - **Server-First Crash Reconciliation, PID Reuse Protection & Fencing Tokens:** `TaskStore.reconcile_orphaned_tasks` verifies OS process creation timestamps (`active_pid_started_at` via `is_expected_worker_pid`) before terminating orphaned worker PIDs (preventing false-positive kills if the OS recycles a stale PID), rotates per-attempt `fencing_token` values (enforced across `RUNNING -> VERIFYING -> READY_TO_SUBMIT -> SUBMIT_IN_FLIGHT`), and reconciles `ASSIGNED`/`RUNNING`/`VERIFYING` tasks against Game Master `get_submission_status` before requeuing.
+   - **Fail-Closed `READY_TO_SUBMIT` Recovery with Git Re-verification:** `TournamentScheduler` preserves `READY_TO_SUBMIT` tasks without downgrading them to `QUEUED`, and `CompetitionOrchestrator._resume_ready_to_submit` validates `verified_result_json`, required evidence on disk, and Git commit integrity via `GitGuard.verify_head` (failing closed by clearing corrupted checkpoints and requeuing to `QUEUED` rather than fabricating unverified submissions).
 
 ---
 
@@ -31,12 +31,12 @@ This report documents the end-to-end verification and remediation of the MTM 202
 
 | Tier | Category | Collected | Passed (Default) | Skipped (Default) | Failed | Notes |
 |---|---|:---:|:---:|:---:|:---:|---|
-| **Core** | Unit, Contracts, Scheduler, Store, Runtime | 103 | 101 | 2 | 0 | 2 live smoke tests skipped in default run (run via `-m live_cli`) |
+| **Core** | Unit, Contracts, Scheduler, Store, Runtime | 107 | 105 | 2 | 0 | 2 live smoke tests skipped in default run (run via `-m live_cli`) |
 | **E2E-A** | Component Integration & Fault-Injection | 10 | 10 | 0 | 0 | 100% deterministic pass, 0 skips |
 | **E2E-B** | Full 12-Event Tournament Lifecycle | 1 | 1 | 0 | 0 | Full match lifecycle simulation passed, 0 skips |
 | **E2E-C** | Real CLI Execution | 8 | 0 | 8 | 0 | Marker-gated (`-m live_cli`); 4 agy passed live, 4 codex blocked |
 | **E2E-D** | Game Master Staging Integration | 4 | 1 | 3 | 0 | Production safety check passed; 3 staging-gated |
-| **TOTAL** | **All Categories** | **126** | **113** | **13** | **0** | **100% pass rate in CI/default suite** |
+| **TOTAL** | **All Categories** | **130** | **117** | **13** | **0** | **100% pass rate in CI/default suite** |
 
 ---
 

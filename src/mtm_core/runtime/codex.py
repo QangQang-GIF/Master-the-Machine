@@ -158,7 +158,9 @@ class CodexRuntime:
                 },
                 commands=0,
                 file_changes=0,
+                last_message="",
                 elapsed=0.0,
+                raw_stdout="",
             )
         ws.mkdir(parents=True, exist_ok=True)
 
@@ -225,6 +227,11 @@ class CodexRuntime:
                     pass
             if cancel_event is not None and cancel_event.is_set():
                 _terminate_process_tree(proc)
+                try:
+                    out, _ = proc.communicate(timeout=2)
+                    stdout_text = out or ""
+                except Exception:
+                    stdout_text = ""
                 timed_out = True
                 exit_code = -1
             else:
@@ -260,6 +267,11 @@ class CodexRuntime:
                     pass
             if cancel_event is not None and cancel_event.is_set():
                 _terminate_process_tree(proc)
+                try:
+                    out, _ = proc.communicate(timeout=2)
+                    stdout_text = out or ""
+                except Exception:
+                    stdout_text = ""
                 timed_out = True
                 exit_code = -1
             else:

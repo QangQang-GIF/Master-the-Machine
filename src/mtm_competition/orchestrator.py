@@ -192,10 +192,33 @@ class CompetitionOrchestrator:
         return None
 
     def _resume_ready_to_submit(self, task_data: Dict[str, Any]) -> Dict[str, Any]:
-        """Resume a task already in READY_TO_SUBMIT directly at integration/submission without re-running worker."""
+        """Resume a task already in READY_TO_SUBMIT directly at integration/submission without re-running worker.
+
+        Fails closed (clearing the corrupted checkpoint and requeuing to QUEUED) if:
+        - `verified_result_json` is missing, malformed, or does not represent a READY_FOR_REVIEW result
+        - Required evidence files or declared evidence paths are missing on disk
+        - Neither a verified Git revision nor an integrable workspace is valid
+        """
         task_id = task_data["task_id"]
         fencing_token = self.store.issue_fencing_token(task_id)
         t_stage_start = time.time()
+
+        def _fail_closed_checkpoint(reason: str) -> Dict[str, Any]:
+            self.store.clear_verified_checkpoint(task_id)
+            self.store.invalidate_fencing_token(task_id, reason="invalid_ready_to_submit_checkpoint")
+            self.scheduler.requeue_task(task_id)
+            self.store.record_event(
+                task_id,
+                "CHECKPOINT_INVALID_REQUEUED",
+                TaskState.READY_TO_SUBMIT.value,
+                TaskState.QUEUED.value,
+                {"error": reason},
+            )
+            return {
+                "task_id": task_id,
+                "status": "CHECKPOINT_INVALID_REQUEUED",
+                "error": reason,
+            }
 
         evidence_req = []
         if task_data.get("evidence_required_json"):
@@ -218,32 +241,137 @@ class CompetitionOrchestrator:
         )
 
         raw_res_json = task_data.get("verified_result_json")
-        if raw_res_json:
-            try:
-                worker_res = WorkerResult.from_dict(json.loads(raw_res_json))
-            except Exception:
-                worker_res = WorkerResult(task_id=task_id, status="READY_FOR_REVIEW")
-        else:
-            worker_res = WorkerResult(task_id=task_id, status="READY_FOR_REVIEW")
+        if not raw_res_json or not str(raw_res_json).strip():
+            return _fail_closed_checkpoint("Missing verified_result_json in READY_TO_SUBMIT checkpoint")
+
+        try:
+            parsed_res = json.loads(raw_res_json)
+            if not isinstance(parsed_res, dict):
+                return _fail_closed_checkpoint("Corrupted verified_result_json: payload is not a JSON object")
+            worker_res = WorkerResult.from_dict(parsed_res)
+        except Exception as e:
+            return _fail_closed_checkpoint(f"Corrupted verified_result_json: {e}")
+
+        if worker_res.task_id != task_id or worker_res.status != "READY_FOR_REVIEW":
+            return _fail_closed_checkpoint(
+                f"Invalid checkpoint WorkerResult status='{worker_res.status}' or task_id='{worker_res.task_id}'"
+            )
+
+        if not worker_res.changed_files and not worker_res.evidence_paths:
+            return _fail_closed_checkpoint(
+                "Invalid checkpoint WorkerResult: neither changed_files nor evidence_paths present"
+            )
+
+        if envelope.task_type.upper() in ("CR", "BUG", "PI") and not worker_res.test_results:
+            return _fail_closed_checkpoint(
+                f"Invalid checkpoint WorkerResult: task type '{envelope.task_type}' requires non-empty test_results"
+            )
+
+        for tr in worker_res.test_results:
+            if not tr.get("passed"):
+                return _fail_closed_checkpoint(
+                    f"Invalid checkpoint WorkerResult: failing test recorded ({tr.get('command')})"
+                )
 
         saved_rev = task_data.get("verified_revision")
         saved_ws = task_data.get("verified_workspace")
+        ws_dir = Path(saved_ws) if saved_ws else self.repo_path
+
+        # Verify required evidence presence and physical existence on disk
+        for req_ev in envelope.evidence_required:
+            if req_ev not in worker_res.evidence_paths:
+                return _fail_closed_checkpoint(
+                    f"Required evidence '{req_ev}' missing from checkpoint WorkerResult.evidence_paths"
+                )
+        for ev_path_str in worker_res.evidence_paths:
+            ev_candidates = (
+                [Path(ev_path_str)]
+                if Path(ev_path_str).is_absolute()
+                else [ws_dir / ev_path_str, self.repo_path / ev_path_str]
+            )
+            if not any(p.exists() for p in ev_candidates):
+                return _fail_closed_checkpoint(
+                    f"Checkpoint evidence file missing on disk: '{ev_path_str}'"
+                )
+
+        remote_configured = self.git_guard.has_remote(self.integration_guard.remote_name)
+        must_verify_pushed = self.integration_guard.push_to_remote and remote_configured
         pushed_flag = True
 
         if saved_rev:
-            verified_rev = VerifiedRevision(commit_sha=saved_rev, branch="main", is_clean=True)
+            try:
+                verified_rev = self.git_guard.verify_head(
+                    saved_rev,
+                    verify_pushed=must_verify_pushed,
+                    remote=self.integration_guard.remote_name,
+                )
+                pushed_flag = verified_rev.is_pushed or not must_verify_pushed
+            except Exception as e:
+                return _fail_closed_checkpoint(
+                    f"Saved Git revision '{saved_rev}' failed GitGuard verification: {e}"
+                )
         else:
-            ws_dir = Path(saved_ws) if saved_ws else self.repo_path
-            integ_res = self.integration_guard.integrate(worker_res, ws_dir)
+            if not saved_ws or not ws_dir.exists():
+                return _fail_closed_checkpoint(
+                    "Checkpoint missing both verified_revision and an existing verified_workspace"
+                )
+            v_cmd = envelope.verification_cmd or envelope.metadata.get("verification_cmd")
+            if not v_cmd and self.verify_post_integration and self.reverify_worker_tests:
+                if worker_res.test_results:
+                    v_cmd = worker_res.test_results[0].get("command")
+            integ_res = self.integration_guard.integrate(worker_res, ws_dir, verification_cmd=v_cmd)
             if not integ_res.success:
+                self.store.invalidate_fencing_token(task_id, reason="integration_failed")
                 self.scheduler.complete_task(task_id, TaskState.REJECTED)
                 return {
                     "task_id": task_id,
                     "status": "INTEGRATION_FAILED",
                     "error": integ_res.error_message,
                 }
+            if must_verify_pushed and not integ_res.pushed:
+                self.store.invalidate_fencing_token(task_id, reason="push_failed")
+                self.scheduler.complete_task(task_id, TaskState.REJECTED)
+                return {
+                    "task_id": task_id,
+                    "status": "INTEGRATION_FAILED",
+                    "error": f"Commit {integ_res.commit_sha} was not pushed to remote {self.integration_guard.remote_name}",
+                }
+            try:
+                verified_rev = self.git_guard.verify_head(
+                    integ_res.commit_sha,
+                    verify_pushed=must_verify_pushed,
+                    remote=self.integration_guard.remote_name,
+                )
+            except Exception as e:
+                self.store.invalidate_fencing_token(task_id, reason="verify_head_failed")
+                self.scheduler.complete_task(task_id, TaskState.REJECTED)
+                return {
+                    "task_id": task_id,
+                    "status": "INTEGRATION_FAILED",
+                    "error": f"Git revision verification failed: {e}",
+                }
             pushed_flag = integ_res.pushed
-            verified_rev = VerifiedRevision(commit_sha=integ_res.commit_sha or "HEAD", branch="main", is_clean=True)
+            try:
+                self.store.save_verified_checkpoint(
+                    task_id,
+                    worker_result_json=raw_res_json,
+                    workspace_path=str(ws_dir),
+                    revision_sha=verified_rev.commit_sha,
+                    fencing_token=fencing_token,
+                )
+            except ValueError as e:
+                self.scheduler.requeue_task(task_id)
+                return {"task_id": task_id, "status": "FENCED_OFF", "error": str(e)}
+
+        current_server_now = self.scheduler.current_server_time
+        if envelope.deadline_epoch and current_server_now > envelope.deadline_epoch:
+            self.store.invalidate_fencing_token(task_id, reason="deadline_expired")
+            self.scheduler.complete_task(task_id, TaskState.REJECTED)
+            return {
+                "task_id": task_id,
+                "status": "DEADLINE_EXPIRED",
+                "error": f"Task deadline expired before submission: {current_server_now} > {envelope.deadline_epoch}",
+            }
 
         if not self.store.validate_fencing_token(task_id, fencing_token):
             self.scheduler.requeue_task(task_id)

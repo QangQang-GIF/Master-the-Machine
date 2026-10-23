@@ -753,8 +753,19 @@ def test_crash_recovery_reconciles_with_gm_and_enforces_fencing_tokens(tmp_path)
 
 def test_ready_to_submit_resumes_directly_without_rerunning_worker(tmp_path):
     """P2 Scheduler & Orchestrator: Tasks in READY_TO_SUBMIT are NOT downgraded to QUEUED,
-    and Orchestrator.step() resumes them directly at integration/submission without re-running the LLM worker.
+    and Orchestrator.step() resumes them directly at integration/submission without re-running the LLM worker,
+    while still verifying the Git commit via GitGuard.verify_head.
     """
+    from mtm_core.git import get_head_sha, git_init, run_git
+
+    repo_dir = tmp_path / "repo"
+    git_init(repo_dir)
+    (repo_dir / "src").mkdir(parents=True, exist_ok=True)
+    (repo_dir / "src" / "app.py").write_text("x = 42\n", encoding="utf-8")
+    run_git(repo_dir, ["add", "."])
+    run_git(repo_dir, ["commit", "-m", "verified commit"])
+    real_head_sha = get_head_sha(repo_dir)
+
     db_file = tmp_path / "ready_to_submit.db"
     gm = MagicMock()
     gm.get_match_state.return_value = {"status": "RUNNING", "remaining_seconds": 1800}
@@ -763,7 +774,7 @@ def test_ready_to_submit_resumes_directly_without_rerunning_worker(tmp_path):
 
     orch = CompetitionOrchestrator(
         gm_adapter=gm,
-        repository_path=tmp_path,
+        repository_path=repo_dir,
         scratch_dir=tmp_path / "scratch",
         db_path=str(db_file),
         push_to_remote=False,
@@ -784,7 +795,7 @@ def test_ready_to_submit_resumes_directly_without_rerunning_worker(tmp_path):
             task_type="CR",
             title="Already QA Verified",
             description="Should not re-run worker",
-            repository_path=str(tmp_path),
+            repository_path=str(repo_dir),
             points=350,
         )
     )
@@ -793,7 +804,7 @@ def test_ready_to_submit_resumes_directly_without_rerunning_worker(tmp_path):
         "CR-READY-01",
         worker_result_json=json.dumps(verified_res.to_dict()),
         workspace_path=str(ws_path),
-        revision_sha="sha-verified-ready-01",
+        revision_sha=real_head_sha,
     )
     orch.store.update_task_status("CR-READY-01", TaskState.READY_TO_SUBMIT)
 
@@ -816,7 +827,7 @@ def test_ready_to_submit_resumes_directly_without_rerunning_worker(tmp_path):
     assert orch.store.get_task("CR-READY-01")["status"] == TaskState.PASSED.value
     gm.submit.assert_called_once_with(
         task_id="CR-READY-01",
-        git_revision="sha-verified-ready-01",
+        git_revision=real_head_sha,
         evidence=[],
     )
 
@@ -1029,3 +1040,283 @@ def test_real_codex_cli_binary_pipeline_timeout_and_preemption_quiescence(tmp_pa
         assert snap_before == snap_after, "Child process modified workspace after preempt_worker returned!"
     finally:
         supervisor.shutdown_all()
+
+
+def test_codex_runtime_cancellation_before_and_after_popen_has_no_unbound_local(tmp_path, monkeypatch):
+    """P1 CodexRuntime Fault Injection:
+    1. When cancel_event is already set BEFORE subprocess.Popen, CodexRuntime.run() returns a valid
+       RuntimeResult with last_message='' and raw_stdout='' (no TypeError).
+    2. When cancel_event is set immediately AFTER subprocess.Popen (inside on_process_start callback)
+       for both 'codex' and 'antigravity' backends, CodexRuntime.run() terminates and reaps the process,
+       assigns stdout_text='', does not raise UnboundLocalError, and does not write log_file.
+    """
+    import threading
+    from mtm_core.runtime.codex import CodexRuntime
+
+    bin_dir = tmp_path / "bin_cancel"
+    bin_dir.mkdir(parents=True, exist_ok=True)
+    sleeper_script = bin_dir / "cli_sleeper.py"
+    sleeper_script.write_text("import time\ntime.sleep(30)\n", encoding="utf-8")
+
+    for cli_name in ("codex", "agy"):
+        if sys.platform == "win32":
+            wrapper = bin_dir / f"{cli_name}.cmd"
+            wrapper.write_text(f'@"{sys.executable}" "{sleeper_script}" %*\r\n', encoding="utf-8")
+        else:
+            wrapper = bin_dir / cli_name
+            wrapper.write_text(f'#!/bin/sh\nexec "{sys.executable}" "{sleeper_script}" "$@"\n', encoding="utf-8")
+            wrapper.chmod(0o755)
+
+    monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ.get('PATH', '')}")
+
+    rt = CodexRuntime(default_backend="codex", allow_agy_fallback=True)
+    ws = tmp_path / "ws_cancel"
+
+    # Case 1: cancel_event set BEFORE Popen
+    pre_cancel = threading.Event()
+    pre_cancel.set()
+    res_pre = rt.run(workspace=ws, prompt="noop", cancel_event=pre_cancel)
+    assert res_pre.timed_out is True
+    assert res_pre.exit_code == -1
+    assert res_pre.last_message == ""
+    assert res_pre.raw_stdout == ""
+
+    # Case 2: cancel_event set immediately AFTER Popen (inside on_process_start) for both backends
+    for backend_name in ("codex", "antigravity"):
+        post_cancel = threading.Event()
+        log_file = tmp_path / f"trace_{backend_name}.jsonl"
+        spawned = []
+
+        def _trigger_cancel_on_start(proc):
+            spawned.append(proc.pid)
+            post_cancel.set()
+
+        res_post = rt.run(
+            workspace=ws,
+            prompt="noop",
+            backend=backend_name,
+            log_file=log_file,
+            on_process_start=_trigger_cancel_on_start,
+            cancel_event=post_cancel,
+        )
+        assert len(spawned) == 1
+        assert res_post.timed_out is True
+        assert res_post.exit_code == -1
+        assert res_post.last_message == ""
+        assert not is_pid_alive(spawned[0]), f"{backend_name} subprocess survived immediate cancellation!"
+        assert not log_file.exists(), f"{backend_name} wrote log_file after cancellation!"
+
+
+def test_ready_to_submit_fails_closed_on_missing_or_corrupted_checkpoint_and_unverified_git(tmp_path):
+    """P1 Orchestrator _resume_ready_to_submit Fault Injection:
+    Must fail closed (requeue to QUEUED, clear checkpoint, never call gm.submit) when:
+    - Case A: verified_result_json is missing/empty
+    - Case B: verified_result_json is corrupted JSON
+    - Case C: required evidence file in envelope.evidence_required is missing on disk
+    - Case D: saved_rev does not match actual Git repository HEAD (GitGuard.verify_head fails)
+    """
+    import json
+    from mtm_core.git import get_head_sha, git_init, run_git
+
+    repo_dir = tmp_path / "repo_fail_closed"
+    git_init(repo_dir)
+    (repo_dir / "src").mkdir(parents=True, exist_ok=True)
+    (repo_dir / "src" / "app.py").write_text("x = 1\n", encoding="utf-8")
+    run_git(repo_dir, ["add", "."])
+    run_git(repo_dir, ["commit", "-m", "initial"])
+    real_sha = get_head_sha(repo_dir)
+
+    gm = MagicMock()
+    gm.get_match_state.return_value = {"status": "RUNNING", "remaining_seconds": 1800}
+    gm.list_backlog.return_value = []
+
+    orch = CompetitionOrchestrator(
+        gm_adapter=gm,
+        repository_path=repo_dir,
+        scratch_dir=tmp_path / "scratch",
+        db_path=str(tmp_path / "fail_closed.db"),
+        push_to_remote=False,
+    )
+
+    # Case A: Missing verified_result_json
+    orch.store.add_task(
+        TaskEnvelope(
+            task_id="READY-MISSING-JSON",
+            task_type="BUG",
+            title="Missing Checkpoint JSON",
+            description="No JSON",
+            repository_path=str(repo_dir),
+            points=400,
+        )
+    )
+    orch.store.update_task_status("READY-MISSING-JSON", TaskState.READY_TO_SUBMIT)
+    res_a = orch.step()
+    assert res_a["task_id"] == "READY-MISSING-JSON"
+    assert res_a["status"] == "CHECKPOINT_INVALID_REQUEUED"
+    assert orch.store.get_task("READY-MISSING-JSON")["status"] == TaskState.QUEUED.value
+    gm.submit.assert_not_called()
+
+    # Case B: Corrupted verified_result_json
+    orch.store.save_verified_checkpoint(
+        "READY-MISSING-JSON",
+        worker_result_json="{corrupted_json!!",
+        workspace_path=str(repo_dir),
+        revision_sha=real_sha,
+    )
+    orch.store.update_task_status("READY-MISSING-JSON", TaskState.READY_TO_SUBMIT)
+    res_b = orch.step()
+    assert res_b["task_id"] == "READY-MISSING-JSON"
+    assert res_b["status"] == "CHECKPOINT_INVALID_REQUEUED"
+    assert orch.store.get_task("READY-MISSING-JSON")["status"] == TaskState.QUEUED.value
+    assert orch.store.get_task("READY-MISSING-JSON")["verified_result_json"] is None
+    gm.submit.assert_not_called()
+
+    # Case C: Required evidence file missing on disk
+    orch.store.add_task(
+        TaskEnvelope(
+            task_id="READY-MISSING-EVIDENCE",
+            task_type="BUG",
+            title="Missing Evidence",
+            description="Evidence required",
+            repository_path=str(repo_dir),
+            points=500,
+            evidence_required=["reports/postmortem.md"],
+        )
+    )
+    valid_res_missing_ev_disk = WorkerResult(
+        task_id="READY-MISSING-EVIDENCE",
+        status=WorkerStatus.READY_FOR_REVIEW,
+        changed_files=["src/app.py"],
+        evidence_paths=["reports/postmortem.md"],  # Declared in JSON, but file does not exist on disk!
+        test_results=[{"command": "pytest", "passed": True}],
+    )
+    orch.store.save_verified_checkpoint(
+        "READY-MISSING-EVIDENCE",
+        worker_result_json=json.dumps(valid_res_missing_ev_disk.to_dict()),
+        workspace_path=str(repo_dir),
+        revision_sha=real_sha,
+    )
+    orch.store.update_task_status("READY-MISSING-EVIDENCE", TaskState.READY_TO_SUBMIT)
+    res_c = orch.step()
+    assert res_c["task_id"] == "READY-MISSING-EVIDENCE"
+    assert res_c["status"] == "CHECKPOINT_INVALID_REQUEUED"
+    assert "missing on disk" in res_c["error"]
+    assert orch.store.get_task("READY-MISSING-EVIDENCE")["status"] == TaskState.QUEUED.value
+    gm.submit.assert_not_called()
+
+    # Case D: Tampered/mismatched saved_rev rejected by GitGuard.verify_head
+    valid_res = WorkerResult(
+        task_id="READY-MISSING-JSON",
+        status=WorkerStatus.READY_FOR_REVIEW,
+        changed_files=["src/app.py"],
+        test_results=[{"command": "pytest", "passed": True}],
+    )
+    orch.store.save_verified_checkpoint(
+        "READY-MISSING-JSON",
+        worker_result_json=json.dumps(valid_res.to_dict()),
+        workspace_path=str(repo_dir),
+        revision_sha="deadbeef00000000000000000000000000000000",
+    )
+    orch.store.update_task_status("READY-MISSING-JSON", TaskState.READY_TO_SUBMIT)
+    res_d = orch.step()
+    assert res_d["task_id"] == "READY-MISSING-JSON"
+    assert res_d["status"] == "CHECKPOINT_INVALID_REQUEUED"
+    assert "GitGuard" in res_d["error"]
+    assert orch.store.get_task("READY-MISSING-JSON")["status"] == TaskState.QUEUED.value
+    gm.submit.assert_not_called()
+
+
+def test_scheduler_strict_cooldown_returns_none_when_all_queued_tasks_on_cooldown(tmp_path):
+    """P2 TournamentScheduler Strict Cooldown Enforcement:
+    When all queued tasks are on a transient retry cooldown, select_next_task() MUST return None
+    instead of bypassing cooldown and burning retry budgets prematurely.
+    """
+    gm = MagicMock()
+    gm.get_match_state.return_value = {"status": "RUNNING", "remaining_seconds": 1800}
+    gm.list_backlog.return_value = [
+        {"task_id": "BUG-COOL-1", "task_type": "BUG", "title": "C1", "description": "D1", "points": 300},
+        {"task_id": "BUG-COOL-2", "task_type": "BUG", "title": "C2", "description": "D2", "points": 200},
+    ]
+
+    orch = CompetitionOrchestrator(
+        gm_adapter=gm,
+        repository_path=tmp_path,
+        scratch_dir=tmp_path / "scratch",
+        db_path=":memory:",
+    )
+    orch.sync_backlog()
+
+    # Put both tasks on a 60s cooldown
+    orch.scheduler.set_cooldown("BUG-COOL-1", 60.0)
+    orch.scheduler.set_cooldown("BUG-COOL-2", 60.0)
+
+    # Scheduler must strictly return None while all tasks are on cooldown
+    assert orch.scheduler.select_next_task() is None
+
+    # Orchestrator step() must return None and NOT call gm.start_working
+    step_res = orch.step()
+    assert step_res is None
+    gm.start_working.assert_not_called()
+
+    # Once BUG-COOL-2 cooldown expires/clears, scheduler selects BUG-COOL-2
+    orch.scheduler.clear_cooldown("BUG-COOL-2")
+    selected = orch.scheduler.select_next_task()
+    assert selected is not None
+    assert selected["task_id"] == "BUG-COOL-2"
+
+
+def test_crash_recovery_pid_reuse_protection_does_not_kill_unrelated_process(tmp_path):
+    """P2 TaskStore Crash Recovery PID Reuse Protection:
+    If the OS recycles a stale active_pid to a new unrelated process whose creation timestamp
+    does not match active_pid_started_at, reconcile_orphaned_tasks() MUST NOT kill the process.
+    """
+    from mtm_core.runtime.process import get_process_create_time
+
+    db_file = tmp_path / "pid_reuse.db"
+    store = TaskStore(str(db_file))
+    store.add_task(
+        TaskEnvelope(
+            task_id="BUG-REUSED-PID",
+            task_type="BUG",
+            title="PID Reuse Test",
+            description="Do not kill innocent process",
+            repository_path=str(tmp_path),
+            points=200,
+        )
+    )
+    store.update_task_status("BUG-REUSED-PID", TaskState.RUNNING)
+
+    innocent_proc = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(60)"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    try:
+        actual_create_time = get_process_create_time(innocent_proc.pid)
+        assert actual_create_time is not None
+
+        # Simulate a stale DB record where the previous worker with this PID started 120 seconds earlier
+        store.set_active_pid(
+            "BUG-REUSED-PID",
+            innocent_proc.pid,
+            pid_started_at=actual_create_time - 120.0,
+        )
+
+        requeued = store.reconcile_orphaned_tasks()
+        assert len(requeued) == 1
+        assert requeued[0]["task_id"] == "BUG-REUSED-PID"
+        assert requeued[0]["to_state"] == TaskState.QUEUED.value
+
+        # Innocent process MUST still be alive!
+        time.sleep(0.1)
+        assert innocent_proc.poll() is None, "reconcile_orphaned_tasks killed a reused innocent PID!"
+        assert is_pid_alive(innocent_proc.pid) is True
+
+        # Event ORPHAN_PID_SKIPPED_REUSED must be recorded
+        events = store.get_events("BUG-REUSED-PID")
+        assert any(e["event_type"] == "ORPHAN_PID_SKIPPED_REUSED" for e in events)
+        assert store.get_task("BUG-REUSED-PID")["active_pid"] is None
+    finally:
+        if innocent_proc.poll() is None:
+            innocent_proc.kill()
+            innocent_proc.wait(timeout=5)

@@ -13,7 +13,12 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from mtm_core.contracts import TaskEnvelope, TaskState
-from mtm_core.runtime.process import _kill_unix_descendants, is_pid_alive
+from mtm_core.runtime.process import (
+    _kill_unix_descendants,
+    get_process_create_time,
+    is_expected_worker_pid,
+    is_pid_alive,
+)
 from mtm_competition.tasks.state_machine import TaskStateMachine
 
 
@@ -76,6 +81,7 @@ class TaskStore:
                 evidence_required_json TEXT,
                 fencing_token TEXT,
                 active_pid INTEGER,
+                active_pid_started_at REAL,
                 verified_result_json TEXT,
                 verified_workspace TEXT,
                 verified_revision TEXT,
@@ -140,6 +146,7 @@ class TaskStore:
                 ("awarded_points", "REAL DEFAULT 0"),
                 ("fencing_token", "TEXT"),
                 ("active_pid", "INTEGER"),
+                ("active_pid_started_at", "REAL"),
                 ("verified_result_json", "TEXT"),
                 ("verified_workspace", "TEXT"),
                 ("verified_revision", "TEXT"),
@@ -220,17 +227,18 @@ class TaskStore:
         """Issue a fresh fencing token for a task attempt and optionally record its active PID."""
         token = f"fence-{task_id}-{int(time.time() * 1000)}-{uuid.uuid4().hex[:8]}"
         now = time.time()
+        pid_started_at = get_process_create_time(int(active_pid)) if active_pid else None
         with self.conn:
             self.conn.execute(
-                "UPDATE tasks SET fencing_token = ?, active_pid = ?, updated_at = ? WHERE task_id = ?",
-                (token, active_pid, now, task_id),
+                "UPDATE tasks SET fencing_token = ?, active_pid = ?, active_pid_started_at = ?, updated_at = ? WHERE task_id = ?",
+                (token, active_pid, pid_started_at, now, task_id),
             )
             self.record_event(
                 task_id,
                 "FENCING_TOKEN_ISSUED",
                 None,
                 None,
-                {"fencing_token": token, "active_pid": active_pid},
+                {"fencing_token": token, "active_pid": active_pid, "active_pid_started_at": pid_started_at},
             )
         return token
 
@@ -239,15 +247,21 @@ class TaskStore:
         task_id: str,
         pid: Optional[int],
         fencing_token: Optional[str] = None,
+        pid_started_at: Optional[float] = None,
     ) -> bool:
-        """Record or clear the active OS subprocess PID for a running task."""
+        """Record or clear the active OS subprocess PID (and its OS creation timestamp) for a running task."""
         if fencing_token is not None and not self.validate_fencing_token(task_id, fencing_token):
             return False
         now = time.time()
+        resolved_start = (
+            pid_started_at
+            if pid_started_at is not None
+            else (get_process_create_time(int(pid)) if pid else None)
+        )
         with self.conn:
             self.conn.execute(
-                "UPDATE tasks SET active_pid = ?, updated_at = ? WHERE task_id = ?",
-                (pid, now, task_id),
+                "UPDATE tasks SET active_pid = ?, active_pid_started_at = ?, updated_at = ? WHERE task_id = ?",
+                (pid, resolved_start, now, task_id),
             )
         return True
 
@@ -266,7 +280,7 @@ class TaskStore:
         now = time.time()
         with self.conn:
             self.conn.execute(
-                "UPDATE tasks SET fencing_token = ?, active_pid = NULL, updated_at = ? WHERE task_id = ?",
+                "UPDATE tasks SET fencing_token = ?, active_pid = NULL, active_pid_started_at = NULL, updated_at = ? WHERE task_id = ?",
                 (new_token, now, task_id),
             )
             self.record_event(
@@ -324,6 +338,19 @@ class TaskStore:
                 WHERE task_id = ?
                 """,
                 (worker_result_json, workspace_path, revision_sha, now, task_id),
+            )
+
+    def clear_verified_checkpoint(self, task_id: str) -> None:
+        """Clear any saved READY_TO_SUBMIT checkpoint fields for `task_id`."""
+        now = time.time()
+        with self.conn:
+            self.conn.execute(
+                """
+                UPDATE tasks
+                SET verified_result_json = NULL, verified_workspace = NULL, verified_revision = NULL, updated_at = ?
+                WHERE task_id = ?
+                """,
+                (now, task_id),
             )
 
     def increment_start_working_requeues(self, task_id: str) -> int:
@@ -395,10 +422,28 @@ class TaskStore:
             tid = t["task_id"]
             old_state = t["status"]
 
-            # 1. Kill any orphaned OS subprocess from previous process instance
+            # 1. Kill any orphaned OS subprocess from previous process instance ONLY if its creation timestamp matches
             stale_pid = t.get("active_pid")
+            recorded_start = t.get("active_pid_started_at")
             if stale_pid and is_pid_alive(int(stale_pid)):
-                _terminate_pid_tree(int(stale_pid))
+                if is_expected_worker_pid(
+                    int(stale_pid),
+                    recorded_start_time=recorded_start,
+                    task_updated_at=t.get("updated_at"),
+                ):
+                    _terminate_pid_tree(int(stale_pid))
+                else:
+                    self.record_event(
+                        tid,
+                        "ORPHAN_PID_SKIPPED_REUSED",
+                        old_state,
+                        old_state,
+                        {
+                            "stale_pid": int(stale_pid),
+                            "recorded_start": recorded_start,
+                            "actual_start": get_process_create_time(int(stale_pid)),
+                        },
+                    )
 
             # 2. Rotate fencing token & clear active_pid so stale worker threads cannot commit
             self.invalidate_fencing_token(tid, reason="crash_recovery")
