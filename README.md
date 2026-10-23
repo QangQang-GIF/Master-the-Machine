@@ -55,7 +55,7 @@ Master-the-Machine/
 │       ├── skill_evolver.py
 │       └── promotion.py
 ├── AI-Arena/                          # Benchmark arena harnesses & test suites
-└── tests/                             # 59 automated unit, integration & E2E scenario tests
+└── tests/                             # Comprehensive unit, integration & E2E scenario test suites
 ```
 
 ## 3. Architecture Modules

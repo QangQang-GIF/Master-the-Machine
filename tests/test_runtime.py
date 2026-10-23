@@ -130,11 +130,12 @@ def test_token_usage_model():
 
 
 def test_process_helpers(tmp_path):
+    import sys
     from mtm_core.runtime.process import is_cli_available, run_command
     assert is_cli_available("python3") or is_cli_available("python")
     assert not is_cli_available("non_existent_binary_xyz_123")
 
-    rc, stdout, stderr, timed_out = run_command(["echo", "hello"], cwd=tmp_path, timeout=5)
+    rc, stdout, stderr, timed_out = run_command([sys.executable, "-c", "print('hello')"], cwd=tmp_path, timeout=5)
     assert rc == 0
     assert "hello" in stdout
     assert not timed_out

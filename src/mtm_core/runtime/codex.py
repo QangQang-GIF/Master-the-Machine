@@ -36,6 +36,9 @@ class RuntimeResult:
         return self.exit_code == 0 and not self.timed_out
 
 
+_DEFAULT = object()
+
+
 class CodexRuntime:
     """Manages spawning, sandboxing, timing, and harvesting of Codex / Antigravity runs."""
 
@@ -43,15 +46,15 @@ class CodexRuntime:
         self,
         prefer_codex: bool = True,
         allow_agy_fallback: bool = True,
-        codex_path: Optional[str] = None,
-        agy_path: Optional[str] = None,
+        codex_path: Any = _DEFAULT,
+        agy_path: Any = _DEFAULT,
         default_backend: str = "auto",
         strict_backend: bool = False,
     ):
         self.prefer_codex = prefer_codex
         self.allow_agy_fallback = allow_agy_fallback
-        self.codex_path = codex_path if codex_path is not None else shutil.which("codex")
-        self.agy_path = agy_path if agy_path is not None else shutil.which("agy")
+        self.codex_path = shutil.which("codex") if codex_path is _DEFAULT else codex_path
+        self.agy_path = shutil.which("agy") if agy_path is _DEFAULT else agy_path
         self.default_backend = default_backend
         self.strict_backend = strict_backend
 

@@ -69,10 +69,43 @@ def git_diff(path: Path | str, base: str = "HEAD", cached: bool = False, stage_a
     return res.stdout
 
 
+def configure_git_identity(
+    path: Path | str,
+    user_name: str = "mtm-agent",
+    user_email: str = "agent@local",
+) -> None:
+    """Explicitly configure git user identity and safe line-ending behavior."""
+    p = Path(path)
+    run_git(p, ["config", "user.name", user_name])
+    run_git(p, ["config", "user.email", user_email])
+    run_git(p, ["config", "core.autocrlf", "false"])
+
+
+def git_clone(
+    source: str | Path,
+    target_dir: Path | str,
+    user_name: str = "mtm-agent",
+    user_email: str = "agent@local",
+) -> None:
+    """Clone a repository and configure explicit identity and settings."""
+    target = Path(target_dir)
+    res = subprocess.run(
+        ["git", "clone", str(source), str(target)],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    if res.returncode != 0:
+        raise RuntimeError(f"git clone failed from {source} to {target}: {res.stderr}")
+    configure_git_identity(target, user_name=user_name, user_email=user_email)
+
+
 def git_commit(path: Path | str, message: str) -> str:
     """Stage all changes and commit, returning the commit SHA."""
+    from .revision import get_head_sha
     run_git(path, ["add", "-A"])
     res = run_git(path, ["commit", "-m", message])
     if res.returncode != 0:
         raise RuntimeError(f"git commit failed: {res.stderr}")
-    return git_diff(path, base="HEAD~1")
+    return get_head_sha(path)

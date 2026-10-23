@@ -74,7 +74,7 @@ def verify_skill_checksums(
         if not target_file.exists():
             raise RuntimeError(f"Skill integrity check failed: missing file {rel_path}")
 
-        file_bytes = target_file.read_bytes()
+        file_bytes = target_file.read_bytes().replace(b"\r\n", b"\n")
         actual_hash = hashlib.sha256(file_bytes).hexdigest()
         if actual_hash.lower() != expected_hash.lower():
             raise RuntimeError(

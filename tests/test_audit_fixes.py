@@ -205,14 +205,30 @@ def test_git_guard_verify_head_fails_when_unpushed(tmp_path):
 def test_orchestrator_blocks_submission_if_push_fails(tmp_path):
     # Set up a bare remote and clone it
     remote_dir = tmp_path / "bare_remote.git"
-    run_git(tmp_path, ["init", "--bare", str(remote_dir)])
+    res1 = run_git(tmp_path, ["init", "--bare", str(remote_dir)])
+    assert res1.returncode == 0, f"git init --bare failed: {res1.stderr}"
 
     local_dir = tmp_path / "local_repo"
-    run_git(tmp_path, ["clone", str(remote_dir), str(local_dir)])
+    res2 = run_git(tmp_path, ["clone", str(remote_dir), str(local_dir)])
+    assert res2.returncode == 0, f"git clone failed: {res2.stderr}"
+
+    # Explicitly configure Git identity for the cloned repo in test fixture
+    run_git(local_dir, ["config", "user.name", "Test Committer"])
+    run_git(local_dir, ["config", "user.email", "test@committer.local"])
+    run_git(local_dir, ["config", "core.autocrlf", "false"])
+
     (local_dir / "code.py").write_text("a = 1\n", encoding="utf-8")
-    run_git(local_dir, ["add", "code.py"])
-    run_git(local_dir, ["commit", "-m", "initial"])
-    run_git(local_dir, ["push", "origin", "main"])
+    res3 = run_git(local_dir, ["add", "code.py"])
+    assert res3.returncode == 0, f"git add failed: {res3.stderr}"
+
+    res4 = run_git(local_dir, ["commit", "-m", "initial"])
+    assert res4.returncode == 0, f"git commit failed: {res4.stderr}"
+
+    res5 = run_git(local_dir, ["branch", "-M", "main"])
+    assert res5.returncode == 0, f"git branch -M main failed: {res5.stderr}"
+
+    res6 = run_git(local_dir, ["push", "-u", "origin", "main"])
+    assert res6.returncode == 0, f"git push failed: {res6.stderr}"
 
     gm = MagicMock()
     gm.get_match_state.return_value = {"status": "IN_PROGRESS", "remaining_seconds": 1800}
@@ -271,9 +287,9 @@ def test_reverify_tests_independently_runs_real_commands(tmp_path):
     ws = tmp_path / "workspace"
     ws.mkdir()
     # 1. Success command
-    assert reverify_tests_independently(ws, [f"{sys.executable} -c 'print(1)'"]) is True
+    assert reverify_tests_independently(ws, [f'{sys.executable} -c "import sys; sys.exit(0)"']) is True
     # 2. Failing command
-    assert reverify_tests_independently(ws, [f"{sys.executable} -c 'sys.exit(2)'"]) is False
+    assert reverify_tests_independently(ws, [f'{sys.executable} -c "import sys; sys.exit(2)"']) is False
 
 
 def test_qa_gate_blocks_fake_worker_test_claims(tmp_path):

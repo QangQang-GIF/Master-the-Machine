@@ -30,4 +30,9 @@ testpaths = ["tests"]
 norecursedirs = ["tests/fixtures", "fixtures", ".venv", "AI-Arena", ".agents"]
 pythonpath = ["src"]
 addopts = "-v --tb=short"
+markers = [
+    "live_cli: tests requiring live real CLI binaries (codex or agy) installed and configured",
+    "staging_game_master: tests requiring live staging Game Master server",
+    "e2e: end-to-end integration scenario tests",
+]
 

@@ -180,12 +180,41 @@ def validate_qa_gate(
                     )
 
 
-def reverify_tests_independently(workspace_dir: Path | str, commands: List[str]) -> bool:
+def reverify_tests_independently(
+    workspace_dir: Path | str,
+    commands: List[str],
+    timeout: int = 120,
+    log_file: Optional[Path | str] = None,
+) -> bool:
     """Independently re-run test commands to verify worker's reported claims."""
     import subprocess
     ws = Path(workspace_dir).resolve()
+    logs = []
     for cmd in commands:
-        proc = subprocess.run(cmd, shell=True, cwd=str(ws), capture_output=True, text=True)
-        if proc.returncode != 0:
+        try:
+            proc = subprocess.run(
+                cmd,
+                shell=True,
+                cwd=str(ws),
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+            )
+            logs.append(f"$ {cmd}\nexit: {proc.returncode}\n{proc.stdout}\n{proc.stderr}")
+            if proc.returncode != 0:
+                if log_file:
+                    Path(log_file).write_text("\n".join(logs), encoding="utf-8")
+                return False
+        except subprocess.TimeoutExpired:
+            logs.append(f"$ {cmd}\nTIMED OUT after {timeout}s")
+            if log_file:
+                Path(log_file).write_text("\n".join(logs), encoding="utf-8")
             return False
+        except Exception as e:
+            logs.append(f"$ {cmd}\nEXCEPTION: {e}")
+            if log_file:
+                Path(log_file).write_text("\n".join(logs), encoding="utf-8")
+            return False
+    if log_file and logs:
+        Path(log_file).write_text("\n".join(logs), encoding="utf-8")
     return True

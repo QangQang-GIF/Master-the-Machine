@@ -67,3 +67,41 @@ def test_config_loader():
     assert "fast" in profiles["profiles"]
     assert "standard" in profiles["profiles"]
     assert "deep_reasoning" in profiles["profiles"]
+
+
+def test_clone_empty_repo_and_head_nonexistent(tmp_path):
+    """Phase 0: Test behavior with empty bare repo, clone, and unresolvable HEAD."""
+    from mtm_core.git import run_git, git_clone, has_head_commit, get_head_sha
+
+    bare_remote = tmp_path / "bare_empty.git"
+    res = run_git(tmp_path, ["init", "--bare", str(bare_remote)])
+    assert res.returncode == 0
+
+    cloned_repo = tmp_path / "cloned_empty"
+    git_clone(bare_remote, cloned_repo, user_name="CI Bot", user_email="ci@local")
+
+    # In empty repo, HEAD does not exist yet
+    assert not has_head_commit(cloned_repo)
+    with pytest.raises(RuntimeError, match="Failed to get HEAD SHA"):
+        get_head_sha(cloned_repo)
+
+
+def test_git_identity_configuration(tmp_path):
+    """Phase 0: Ensure git identity can be configured and commit succeeds independently of global config."""
+    from mtm_core.git import run_git, configure_git_identity, git_commit, get_head_sha
+
+    repo_dir = tmp_path / "isolated_identity_repo"
+    run_git(tmp_path, ["init", str(repo_dir)])
+    
+    # Configure explicit identity
+    configure_git_identity(repo_dir, user_name="Custom Runner", user_email="custom@runner.org")
+    
+    (repo_dir / "file.txt").write_text("content\n", encoding="utf-8")
+    commit_sha = git_commit(repo_dir, "Custom commit message")
+    assert len(commit_sha) == 40
+    assert commit_sha == get_head_sha(repo_dir)
+
+    # Verify committer info in log
+    log_res = run_git(repo_dir, ["log", "-1", "--format=%an <%ae>"])
+    assert log_res.returncode == 0
+    assert "Custom Runner <custom@runner.org>" in log_res.stdout

@@ -25,3 +25,9 @@ def verify_revision(path: Path | str, expected_sha: str) -> bool:
     """Verify that HEAD matches the expected SHA prefix or exact hash."""
     head_sha = get_head_sha(path)
     return head_sha.startswith(expected_sha.strip()) or expected_sha.strip() == "HEAD"
+
+
+def has_head_commit(path: Path | str) -> bool:
+    """Return True if the repository has at least one commit and HEAD is resolvable."""
+    res = run_git(path, ["rev-parse", "--verify", "HEAD"])
+    return res.returncode == 0
