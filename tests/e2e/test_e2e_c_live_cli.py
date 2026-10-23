@@ -187,3 +187,101 @@ def test_e2e_c_agy_worker_timeout(tmp_path, pytestconfig):
     launcher = WorkerLauncher(scratch_dir=tmp_path / "scratch", backend="antigravity")
     result, trace, ws = launcher.launch(envelope)
     assert result.status == WorkerStatus.TIMED_OUT
+
+
+@pytest.mark.live_cli
+def test_e2e_c_codex_worker_preemption_quiescence(tmp_path, pytestconfig):
+    """Codex CLI: Real WorkerSupervisor mid-execution preemption kills CLI process tree with zero post-preempt writes."""
+    import time
+    from mtm_competition.workers.supervisor import WorkerSupervisor
+    from mtm_core.runtime.process import is_pid_alive
+
+    _check_live_cli_gate(pytestconfig, "codex")
+
+    work_repo = tmp_path / "work_repo"
+    shutil.copytree(FIXTURES / "sample_repo", work_repo)
+
+    envelope = TaskEnvelope(
+        task_id="PREEMPT-CODEX-04",
+        task_type="CR",
+        title="Preemption quiescence test",
+        description="Analyze all files thoroughly before making changes.",
+        repository_path=str(work_repo),
+        time_budget_seconds=60,
+        backend="codex",
+    )
+    launcher = WorkerLauncher(scratch_dir=tmp_path / "scratch", backend="codex")
+    supervisor = WorkerSupervisor(max_workers=1)
+
+    spawned_pids = []
+    proc = supervisor.launch_async(
+        launcher.launch,
+        envelope,
+        on_pid_callback=lambda pid: spawned_pids.append(pid),
+    )
+
+    deadline = time.monotonic() + 5.0
+    while time.monotonic() < deadline and not spawned_pids:
+        time.sleep(0.05)
+
+    assert spawned_pids, "Real Codex CLI subprocess did not start in time"
+    cli_pid = spawned_pids[0]
+
+    preempted = supervisor.preempt_worker("PREEMPT-CODEX-04")
+    assert preempted is not None
+    assert preempted.status == "PREEMPTED"
+    assert proc.future.done() is True
+    assert not is_pid_alive(cli_pid), f"Codex CLI PID {cli_pid} survived preemption!"
+
+    ws_dir = tmp_path / "scratch" / "ws_PREEMPT-CODEX-04_att1"
+    assert not (ws_dir / "trace.jsonl").exists(), "Worker thread wrote trace.jsonl after preemption!"
+    supervisor.shutdown_all()
+
+
+@pytest.mark.live_cli
+def test_e2e_c_agy_worker_preemption_quiescence(tmp_path, pytestconfig):
+    """Antigravity CLI (agy): Real WorkerSupervisor mid-execution preemption kills CLI process tree with zero post-preempt writes."""
+    import time
+    from mtm_competition.workers.supervisor import WorkerSupervisor
+    from mtm_core.runtime.process import is_pid_alive
+
+    _check_live_cli_gate(pytestconfig, "antigravity")
+
+    work_repo = tmp_path / "work_repo"
+    shutil.copytree(FIXTURES / "sample_repo", work_repo)
+
+    envelope = TaskEnvelope(
+        task_id="PREEMPT-AGY-04",
+        task_type="CR",
+        title="Preemption quiescence test",
+        description="Analyze all files thoroughly before making changes.",
+        repository_path=str(work_repo),
+        time_budget_seconds=60,
+        backend="antigravity",
+    )
+    launcher = WorkerLauncher(scratch_dir=tmp_path / "scratch", backend="antigravity")
+    supervisor = WorkerSupervisor(max_workers=1)
+
+    spawned_pids = []
+    proc = supervisor.launch_async(
+        launcher.launch,
+        envelope,
+        on_pid_callback=lambda pid: spawned_pids.append(pid),
+    )
+
+    deadline = time.monotonic() + 5.0
+    while time.monotonic() < deadline and not spawned_pids:
+        time.sleep(0.05)
+
+    assert spawned_pids, "Real agy CLI subprocess did not start in time"
+    cli_pid = spawned_pids[0]
+
+    preempted = supervisor.preempt_worker("PREEMPT-AGY-04")
+    assert preempted is not None
+    assert preempted.status == "PREEMPTED"
+    assert proc.future.done() is True
+    assert not is_pid_alive(cli_pid), f"agy CLI PID {cli_pid} survived preemption!"
+
+    ws_dir = tmp_path / "scratch" / "ws_PREEMPT-AGY-04_att1"
+    assert not (ws_dir / "trace.jsonl").exists(), "Worker thread wrote trace.jsonl after preemption!"
+    supervisor.shutdown_all()

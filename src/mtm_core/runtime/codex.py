@@ -133,6 +133,7 @@ class CodexRuntime:
         log_file: Optional[Path | str] = None,
         backend: Optional[str] = None,
         on_process_start: Optional[Callable[[Any], None]] = None,
+        cancel_event: Optional[Any] = None,
     ) -> RuntimeResult:
         """Execute a worker in the given workspace.
 
@@ -142,6 +143,23 @@ class CodexRuntime:
         - Backend selection: 'codex' or 'antigravity' (no silent fallbacks if explicitly requested).
         """
         ws = Path(workspace).resolve()
+        if cancel_event is not None and cancel_event.is_set():
+            return RuntimeResult(
+                exit_code=-1,
+                timed_out=True,
+                trace=ExecutionTrace(),
+                usage={
+                    "input_tokens": 0,
+                    "cached_input_tokens": 0,
+                    "output_tokens": 0,
+                    "reasoning_output_tokens": 0,
+                    "total_tokens": 0,
+                    "billable_tokens": 0,
+                },
+                commands=0,
+                file_changes=0,
+                elapsed=0.0,
+            )
         ws.mkdir(parents=True, exist_ok=True)
 
         target_backend = (backend or self.default_backend).lower()
@@ -197,6 +215,7 @@ class CodexRuntime:
                 text=True,
                 encoding="utf-8",
                 errors="replace",
+                shell=(sys.platform == "win32"),
                 start_new_session=True,
             )
             if on_process_start is not None:
@@ -204,14 +223,19 @@ class CodexRuntime:
                     on_process_start(proc)
                 except Exception:
                     pass
-            try:
-                stdout_text, _ = proc.communicate(timeout=timeout)
-                exit_code = proc.returncode
-            except subprocess.TimeoutExpired:
-                timed_out = True
+            if cancel_event is not None and cancel_event.is_set():
                 _terminate_process_tree(proc)
-                stdout_text, _ = proc.communicate()
+                timed_out = True
                 exit_code = -1
+            else:
+                try:
+                    stdout_text, _ = proc.communicate(timeout=timeout)
+                    exit_code = proc.returncode
+                except subprocess.TimeoutExpired:
+                    timed_out = True
+                    _terminate_process_tree(proc)
+                    stdout_text, _ = proc.communicate()
+                    exit_code = -1
 
             trace = parse_codex_trace(stdout_text)
 
@@ -234,20 +258,27 @@ class CodexRuntime:
                     on_process_start(proc)
                 except Exception:
                     pass
-            try:
-                stdout_text, _ = proc.communicate(timeout=timeout)
-                exit_code = proc.returncode
-            except subprocess.TimeoutExpired:
-                timed_out = True
+            if cancel_event is not None and cancel_event.is_set():
                 _terminate_process_tree(proc)
-                stdout_text, _ = proc.communicate()
+                timed_out = True
                 exit_code = -1
+            else:
+                try:
+                    stdout_text, _ = proc.communicate(timeout=timeout)
+                    exit_code = proc.returncode
+                except subprocess.TimeoutExpired:
+                    timed_out = True
+                    _terminate_process_tree(proc)
+                    stdout_text, _ = proc.communicate()
+                    exit_code = -1
 
             trace = parse_agy_trace(stdout_text)
 
         elapsed = round(time.time() - t0, 2)
 
-        if log_file:
+        if cancel_event is not None and cancel_event.is_set():
+            timed_out = True
+        elif log_file:
             log_path = Path(log_file)
             log_path.parent.mkdir(parents=True, exist_ok=True)
             log_path.write_text(stdout_text, encoding="utf-8")

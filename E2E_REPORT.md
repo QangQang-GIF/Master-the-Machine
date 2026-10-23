@@ -4,21 +4,24 @@
 **Branch:** `main`  
 **Test Runner:** `pytest 9.1.1` on Python 3.12 (win32)  
 **Readiness Status:** **SIMULATION-VERIFIED | LIVE STAGING & CODEX-CLI GATED ON ENVIRONMENT PROVISIONING**  
-**Default CI/Offline Suite:** **108 PASSED, 11 SKIPPED (GATED), 0 FAILED** (119 Collected)
+**Default CI/Offline Suite:** **113 PASSED, 13 SKIPPED (GATED), 0 FAILED** (126 Collected)
 
 ---
 
 ## 1. Executive Summary
 
-This report documents the end-to-end verification and remediation of the MTM 2026 tournament orchestration architecture specified in `Upgrade2.md`. All P0 and P1 integrity vulnerabilities have been remediated, verified via independent regression tests, and certified across four tiers of end-to-end scenarios (E2E-A, E2E-B, E2E-C, and E2E-D).
+This report documents the end-to-end verification and remediation of the MTM 2026 tournament orchestration architecture specified in `Upgrade2.md`. All P0, P1, and P2 integrity and code-review vulnerabilities have been remediated, verified via independent regression tests, and certified across four tiers of end-to-end scenarios (E2E-A, E2E-B, E2E-C, and E2E-D).
 
 ### Key Architectural Assurances
 1. **Remote Git Verification (`IntegrationGuard` & `GitGuard`):** No commit can be submitted unless pushed to the canonical remote and confirmed via `git ls-remote`.
 2. **Mandatory MVS & Independent QA Gate (`QAGate`):** Independent test execution prevents workers from faking test results; all Minimum Viable Solutions (MVS) are verified before submission.
 3. **Strict Once-Only Submission Idempotency (`SubmissionGuard`):** Submissions require UUID idempotency keys; HTTP 4xx errors are permanently rejected; timeouts enter `SUBMIT_IN_FLIGHT` and reconcile without duplicate attempts.
 4. **Grading & Scoring Separation (`TaskStore`):** Provisional points from server `ACCEPTED` are strictly isolated from confirmed points; points are only awarded upon Grader `PASSED`.
-5. **Preemption & Clock Awareness (`WorkerSupervisor` & `TournamentScheduler`):** Emergency Production Incidents (PI) immediately preempt running tasks; match `PAUSED` freezes match clock without burning task budget; process trees terminate cleanly across parent -> child -> grandchild hierarchies (`taskkill /F /T` on Windows; isolated session groups with `os.killpg` and `pgrep -P` descendant fallback on Unix).
-6. **Supervisor & Orchestrator State Machine Integrity:** Explicit distinction between `RUNNING`, `TIMED_OUT`, `PREEMPTED`, `CANCELLED`, `FAILED`, and `COMPLETED`; crash-recovery requeuing of orphaned `RUNNING`/`ASSIGNED` tasks; scheduler capacity leak protection on `start_working` failures; and mid-execution cancellation when match transitions to `FINISHED`.
+5. **Preemption, Thread Quiescence & Clock Awareness (`WorkerSupervisor` & `TournamentScheduler`):** Emergency Production Incidents (PI) immediately preempt running tasks; match `PAUSED` freezes match clock without burning task budget; process trees terminate cleanly across parent -> child -> grandchild hierarchies (`taskkill /F /T` on Windows; isolated session groups with `os.killpg` and `pgrep -P` descendant fallback on Unix); `SupervisedProcess.cancel_event` and `_quiesce_worker` join the worker future and block post-cancellation workspace/trace writes and startup-race `Popen` spawns.
+6. **Supervisor & Orchestrator State Machine, Retry & Fencing Integrity:**
+   - **Transient vs Permanent `start_working` / `get_mvs` Classification:** Transient errors (HTTP 429/5xx/408, network timeouts, `MVSLockedError`) retry with exponential backoff and requeue to `QUEUED` with a cooldown (freeing scheduler capacity so other ready tasks execute without losing scoring opportunities), only transitioning to `REJECTED` on permanent 4xx errors or after exhausting `start_working_max_requeues`.
+   - **Server-First Crash Reconciliation & Fencing Tokens:** `TaskStore.reconcile_orphaned_tasks` terminates lingering zombie worker PIDs (`active_pid`), rotates per-attempt `fencing_token` values (enforced across `RUNNING -> VERIFYING -> READY_TO_SUBMIT -> SUBMIT_IN_FLIGHT`), and reconciles `ASSIGNED`/`RUNNING`/`VERIFYING` tasks against Game Master `get_submission_status` before requeuing.
+   - **Direct `READY_TO_SUBMIT` Recovery:** `TournamentScheduler` preserves `READY_TO_SUBMIT` tasks without downgrading them to `QUEUED`, and `CompetitionOrchestrator._resume_ready_to_submit` resumes them directly at integration/submission without re-running the LLM worker.
 
 ---
 
@@ -28,12 +31,12 @@ This report documents the end-to-end verification and remediation of the MTM 202
 
 | Tier | Category | Collected | Passed (Default) | Skipped (Default) | Failed | Notes |
 |---|---|:---:|:---:|:---:|:---:|---|
-| **Core** | Unit, Contracts, Scheduler, Store, Runtime | 98 | 96 | 2 | 0 | 2 live smoke tests skipped in default run (run via `-m live_cli`) |
+| **Core** | Unit, Contracts, Scheduler, Store, Runtime | 103 | 101 | 2 | 0 | 2 live smoke tests skipped in default run (run via `-m live_cli`) |
 | **E2E-A** | Component Integration & Fault-Injection | 10 | 10 | 0 | 0 | 100% deterministic pass, 0 skips |
 | **E2E-B** | Full 12-Event Tournament Lifecycle | 1 | 1 | 0 | 0 | Full match lifecycle simulation passed, 0 skips |
-| **E2E-C** | Real CLI Execution | 6 | 0 | 6 | 0 | Marker-gated (`-m live_cli`); 3 agy passed live, 3 codex blocked |
+| **E2E-C** | Real CLI Execution | 8 | 0 | 8 | 0 | Marker-gated (`-m live_cli`); 4 agy passed live, 4 codex blocked |
 | **E2E-D** | Game Master Staging Integration | 4 | 1 | 3 | 0 | Production safety check passed; 3 staging-gated |
-| **TOTAL** | **All Categories** | **119** | **108** | **11** | **0** | **100% pass rate in CI/default suite** |
+| **TOTAL** | **All Categories** | **126** | **113** | **13** | **0** | **100% pass rate in CI/default suite** |
 
 ---
 
@@ -86,9 +89,11 @@ Suite: `tests/e2e/test_e2e_c_live_cli.py` & `tests/test_smoke_worker.py` (run wi
 | **Codex CLI** | BUG | Simple bugfix | `codex` binary not on PATH | **BLOCKED (SKIPPED)** |
 | **Codex CLI** | CR | Multi-file feature | `codex` binary not on PATH | **BLOCKED (SKIPPED)** |
 | **Codex CLI** | TIMEOUT | Timeout enforcement | `codex` binary not on PATH | **BLOCKED (SKIPPED)** |
+| **Codex CLI** | PREEMPT | Supervisor preemption & quiescence | `codex` binary not on PATH (verified via executable shim in `test_phase2_reliability.py`) | **BLOCKED (SKIPPED)** |
 | **Anti CLI (`agy`)** | BUG | Functional code fix & test | Autonomous bugfix verified (`>=`) | **PASSED** |
 | **Anti CLI (`agy`)** | CR | Multi-file feature patch | Autonomous patch verified | **PASSED** |
 | **Anti CLI (`agy`)** | TIMEOUT | Timeout enforcement | Terminated in 1.43s via `taskkill` | **PASSED** |
+| **Anti CLI (`agy`)** | PREEMPT | Supervisor preemption & quiescence | Process tree killed & zero post-preempt workspace writes | **PASSED** |
 | **Smoke Worker** | Functional | Code fix & QA gate | Fixed calculator.py, QA gate passed | **PASSED** |
 | **Smoke Timeout** | Timeout | Time budget expiration | Strictly returns `TIMED_OUT` (1.34s) | **PASSED** |
 

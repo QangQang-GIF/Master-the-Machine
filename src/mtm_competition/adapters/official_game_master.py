@@ -67,10 +67,24 @@ class OfficialGameMasterAdapter(GameMasterAdapter):
         team_id: Optional[str] = None,
         timeout: float = 8.0,
         max_retries: int = 3,
+        base_url: Optional[str] = None,
+        auth_token: Optional[str] = None,
     ):
-        base = api_base_url or os.environ.get("MTM_GM_URL", "http://localhost:8000")
+        base = (
+            api_base_url
+            or base_url
+            or os.environ.get("MTM_GM_URL")
+            or os.environ.get("MTM_GM_STAGING_URL")
+            or "http://localhost:8000"
+        )
         self.api_base_url = base.rstrip("/")
-        self.api_key = api_key or os.environ.get("MTM_GM_API_KEY", "")
+        self.api_key = (
+            api_key
+            or auth_token
+            or os.environ.get("MTM_GM_API_KEY")
+            or os.environ.get("MTM_GM_TOKEN")
+            or ""
+        )
         self.team_id = team_id or os.environ.get("MTM_TEAM_ID", "")
         self.timeout = timeout
         self.max_retries = max_retries

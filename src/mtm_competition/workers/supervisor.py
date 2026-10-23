@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import concurrent.futures
+import inspect
+import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -36,6 +38,8 @@ class SupervisedProcess:
     envelope: Optional[TaskEnvelope] = None
     result: Optional[Tuple[WorkerResult, ExecutionTrace, Path]] = None
     subprocess_handle: Optional[Any] = None
+    cancel_event: threading.Event = field(default_factory=threading.Event, repr=False)
+    _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
 
 class WorkerSupervisor:
@@ -64,24 +68,50 @@ class WorkerSupervisor:
         self._active_workers[task_id] = proc
         return proc
 
+    def _register_proc_subprocess(
+        self,
+        proc: SupervisedProcess,
+        handle: Any,
+        on_pid_callback: Optional[Callable[[int], None]] = None,
+    ) -> None:
+        """Bind subprocess handle directly to `proc` under lock; kill immediately if already cancelled."""
+        with proc._lock:
+            proc.subprocess_handle = handle
+            already_cancelled = (
+                proc.cancel_event.is_set()
+                or proc.status in ("PREEMPT_REQUESTED", "PREEMPTED", "TIMED_OUT", "CANCELLED")
+            )
+        if already_cancelled:
+            terminate_process_tree(handle)
+            return
+        if on_pid_callback is not None:
+            pid = getattr(handle, "pid", None)
+            if isinstance(pid, int) and pid > 0:
+                try:
+                    on_pid_callback(pid)
+                except Exception:
+                    pass
+
     def register_subprocess(self, task_id: str, handle: Any) -> None:
         """Register active subprocess handle for mid-execution killing."""
         proc = self._active_workers.get(task_id)
         if proc:
-            proc.subprocess_handle = handle
+            self._register_proc_subprocess(proc, handle)
 
     def get_process(self, task_id: str) -> Optional[SupervisedProcess]:
         return self._active_workers.get(task_id)
+
+    def get_worker(self, task_id: str) -> Optional[SupervisedProcess]:
+        return self.get_process(task_id)
 
     def launch_async(
         self,
         launcher_fn: Callable[..., Tuple[WorkerResult, ExecutionTrace, Path]],
         envelope: TaskEnvelope,
         attempt_number: int = 1,
+        on_pid_callback: Optional[Callable[[int], None]] = None,
     ) -> SupervisedProcess:
         """Asynchronously dispatch worker execution wrapped in a supervised future."""
-        import inspect
-
         task_id = envelope.task_id
         proc = self.register_worker(
             task_id=task_id,
@@ -91,17 +121,24 @@ class WorkerSupervisor:
             envelope=envelope,
         )
 
-        sig = inspect.signature(launcher_fn)
+        target_fn = (
+            launcher_fn.side_effect
+            if callable(getattr(launcher_fn, "side_effect", None))
+            else launcher_fn
+        )
+        sig = inspect.signature(target_fn)
         has_on_proc = "on_process_start" in sig.parameters
+        has_cancel_ev = "cancel_event" in sig.parameters
 
         def _runner():
+            if proc.cancel_event.is_set():
+                return None
+            kwargs: Dict[str, Any] = {"attempt_number": attempt_number}
             if has_on_proc:
-                return launcher_fn(
-                    envelope,
-                    attempt_number=attempt_number,
-                    on_process_start=lambda p: self.register_subprocess(task_id, p),
-                )
-            return launcher_fn(envelope, attempt_number=attempt_number)
+                kwargs["on_process_start"] = lambda p: self._register_proc_subprocess(proc, p, on_pid_callback)
+            if has_cancel_ev:
+                kwargs["cancel_event"] = proc.cancel_event
+            return launcher_fn(envelope, **kwargs)
 
         self._active_workers[task_id] = proc
         future = self._executor.submit(_runner)
@@ -142,7 +179,7 @@ class WorkerSupervisor:
             try:
                 res = proc.future.result(timeout=timeout)
                 # Guard against concurrent preemption/timeout while future was unblocking
-                if proc.status in ("PREEMPTED", "TIMED_OUT", "CANCELLED"):
+                if proc.status in ("PREEMPTED", "TIMED_OUT", "CANCELLED") or proc.cancel_event.is_set():
                     return None
                 proc.result = res
                 proc.status = "COMPLETED"
@@ -154,11 +191,41 @@ class WorkerSupervisor:
                     proc.status = "CANCELLED"
                 return None
             except Exception as e:
-                if proc.status in ("PREEMPTED", "TIMED_OUT", "CANCELLED"):
+                if proc.status in ("PREEMPTED", "TIMED_OUT", "CANCELLED") or proc.cancel_event.is_set():
                     return None
                 proc.status = "FAILED"
                 raise e
         return None
+
+    def _quiesce_worker(
+        self,
+        proc: SupervisedProcess,
+        target_status: str,
+        join_timeout: float = 2.0,
+    ) -> None:
+        """Atomically signal cancellation, kill subprocess tree, and wait for worker thread quiescence."""
+        with proc._lock:
+            proc.cancel_event.set()
+            proc.status = target_status
+            handle = proc.subprocess_handle
+
+        if handle is not None:
+            terminate_process_tree(handle)
+
+        # Second check in case Popen registered concurrently right as cancel_event was set
+        with proc._lock:
+            late_handle = proc.subprocess_handle
+        if late_handle is not None and late_handle is not handle:
+            terminate_process_tree(late_handle)
+
+        if proc.future:
+            if not proc.future.done():
+                proc.future.cancel()
+            if not proc.future.done():
+                try:
+                    concurrent.futures.wait([proc.future], timeout=join_timeout)
+                except Exception:
+                    pass
 
     def timeout_worker(self, task_id: str) -> Optional[SupervisedProcess]:
         """Terminate worker due to timeout. Sets status TIMED_OUT and keeps registration for status inspection."""
@@ -167,11 +234,7 @@ class WorkerSupervisor:
             return None
         if proc.future and proc.future.done() and proc.status == "COMPLETED":
             return proc
-        proc.status = "TIMED_OUT"
-        if proc.subprocess_handle is not None:
-            terminate_process_tree(proc.subprocess_handle)
-        if proc.future and not proc.future.done():
-            proc.future.cancel()
+        self._quiesce_worker(proc, "TIMED_OUT")
         return proc
 
     def preempt_worker(self, task_id: str) -> Optional[SupervisedProcess]:
@@ -184,14 +247,7 @@ class WorkerSupervisor:
         if proc.future and proc.future.done() and proc.status == "COMPLETED":
             return proc
 
-        proc.status = "PREEMPT_REQUESTED"
-        if proc.subprocess_handle is not None:
-            terminate_process_tree(proc.subprocess_handle)
-
-        if proc.future and not proc.future.done():
-            proc.future.cancel()
-
-        proc.status = "PREEMPTED"
+        self._quiesce_worker(proc, "PREEMPTED")
         return self.unregister_worker(task_id)
 
     def cancel_worker(self, task_id: str) -> Optional[SupervisedProcess]:
@@ -203,13 +259,7 @@ class WorkerSupervisor:
         if proc.future and proc.future.done() and proc.status == "COMPLETED":
             return proc
 
-        if proc.subprocess_handle is not None:
-            terminate_process_tree(proc.subprocess_handle)
-
-        if proc.future and not proc.future.done():
-            proc.future.cancel()
-
-        proc.status = "CANCELLED"
+        self._quiesce_worker(proc, "CANCELLED")
         return self.unregister_worker(task_id)
 
     def terminate_all(self, reason: str = "CANCELLED") -> List[SupervisedProcess]:
@@ -226,6 +276,10 @@ class WorkerSupervisor:
             if proc:
                 terminated.append(proc)
         return terminated
+
+    def shutdown_all(self) -> List[SupervisedProcess]:
+        """Alias for terminate_all() used during clean shutdown."""
+        return self.terminate_all("CANCELLED")
 
     def unregister_worker(self, task_id: str) -> Optional[SupervisedProcess]:
         return self._active_workers.pop(task_id, None)

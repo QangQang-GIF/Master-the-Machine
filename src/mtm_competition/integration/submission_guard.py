@@ -28,6 +28,8 @@ class SubmissionResult:
 def _extract_submission_score(resp_data: Dict[str, Any], envelope_points: int, status: str) -> int:
     """Extract awarded score distinguishing 0 from None. Only PASSED awards default points if omitted."""
     raw = resp_data.get("points")
+    if raw is None:
+        raw = resp_data.get("score")
     if raw is not None:
         return int(raw)
     if status == "PASSED":

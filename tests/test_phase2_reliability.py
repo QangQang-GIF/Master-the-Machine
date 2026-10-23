@@ -1,5 +1,7 @@
 """Phase 2: Reliability, Preemption, Clock, and Budget Enforcement Tests."""
 import os
+import subprocess
+import sys
 import time
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -7,6 +9,7 @@ import pytest
 
 from mtm_core.contracts import TaskEnvelope, WorkerResult, WorkerStatus, TaskState
 from mtm_core.runtime import ExecutionTrace
+from mtm_core.runtime.process import is_pid_alive
 from mtm_core.config.loader import get_environment_mode, load_environment_config
 from mtm_competition.workers.supervisor import WorkerSupervisor, SupervisedProcess
 from mtm_competition.scheduling.scheduler import TournamentScheduler
@@ -446,17 +449,26 @@ def test_orchestrator_pi_preemption_and_full_resume_lifecycle(tmp_path):
 
 
 def test_orchestrator_start_working_failure_does_not_leak_scheduler_capacity(tmp_path):
-    """P1 State Machine: If gm.start_working raises an error, scheduler capacity is freed for subsequent tasks."""
+    """P1 State Machine: Transient errors on start_working/get_mvs retry with backoff and requeue to QUEUED
+    (with cooldown so next tasks run without leaking scheduler capacity), while permanent 4xx errors
+    transition immediately to REJECTED without wasting retries.
+    """
     gm = MagicMock()
     gm.get_match_state.return_value = {"status": "RUNNING", "remaining_seconds": 1800}
     gm.list_backlog.return_value = [
         {"task_id": "BUG-FAIL-START", "task_type": "BUG", "title": "T1", "description": "D1", "points": 300},
-        {"task_id": "BUG-NEXT-OK", "task_type": "BUG", "title": "T2", "description": "D2", "points": 100},
+        {"task_id": "BUG-PERM-400", "task_type": "BUG", "title": "T2", "description": "D2", "points": 200},
+        {"task_id": "BUG-NEXT-OK", "task_type": "BUG", "title": "T3", "description": "D3", "points": 100},
     ]
 
+    call_counts = {"BUG-FAIL-START": 0, "BUG-PERM-400": 0, "BUG-NEXT-OK": 0}
+
     def start_working_side_effect(tid):
+        call_counts[tid] = call_counts.get(tid, 0) + 1
         if tid == "BUG-FAIL-START":
             raise RuntimeError("GM 503 Service Unavailable")
+        if tid == "BUG-PERM-400":
+            raise RuntimeError("HTTP 400 Bad Request: Invalid task state")
         return {"status": "STARTED"}
 
     gm.start_working.side_effect = start_working_side_effect
@@ -468,22 +480,109 @@ def test_orchestrator_start_working_failure_does_not_leak_scheduler_capacity(tmp
         scratch_dir=tmp_path / "scratch",
         db_path=":memory:",
         push_to_remote=False,
+        start_working_max_retries=2,
+        start_working_backoff_sec=0.001,
+        start_working_max_requeues=1,
     )
     orch.sync_backlog()
 
-    # Step 1 fails during start_working
+    # Step 1: BUG-FAIL-START encounters transient 503 -> retries in-step (1 initial + 2 retries = 3 calls),
+    # then requeues to QUEUED with a cooldown instead of immediately discarding as REJECTED!
     res1 = orch.step()
     assert res1["task_id"] == "BUG-FAIL-START"
-    assert res1["status"] == "FAILED"
-    assert orch.store.get_task("BUG-FAIL-START")["status"] == TaskState.REJECTED.value
+    assert res1["status"] == "TRANSIENT_RETRY_QUEUED"
+    assert call_counts["BUG-FAIL-START"] == 3
+    assert orch.store.get_task("BUG-FAIL-START")["status"] == TaskState.QUEUED.value
     # Capacity MUST be freed!
     assert orch.scheduler.has_capacity is True
     assert orch.scheduler.active_worker_count == 0
 
-    # Step 2 is able to select BUG-NEXT-OK without deadlocking
+    # Step 2: Because BUG-FAIL-START is on transient cooldown, scheduler selects BUG-PERM-400 next.
+    # BUG-PERM-400 fails with permanent 400 -> NO retries (1 call only), immediately REJECTED!
+    res2 = orch.step()
+    assert res2["task_id"] == "BUG-PERM-400"
+    assert res2["status"] == "FAILED"
+    assert call_counts["BUG-PERM-400"] == 1
+    assert orch.store.get_task("BUG-PERM-400")["status"] == TaskState.REJECTED.value
+    assert orch.scheduler.has_capacity is True
+    assert orch.scheduler.active_worker_count == 0
+
+    # Step 3: Scheduler selects BUG-NEXT-OK without deadlocking
     next_candidate = orch.scheduler.select_next_task()
     assert next_candidate is not None
     assert next_candidate["task_id"] == "BUG-NEXT-OK"
+
+    # Step 4: If BUG-FAIL-START cooldown expires and it fails again beyond start_working_max_requeues=1,
+    # it finally transitions to REJECTED so it cannot loop forever.
+    orch.scheduler.clear_cooldown("BUG-FAIL-START")
+    orch.store.update_task_status("BUG-NEXT-OK", TaskState.PASSED)
+    res4 = orch.step()
+    assert res4["task_id"] == "BUG-FAIL-START"
+    assert res4["status"] == "FAILED"
+    assert orch.store.get_task("BUG-FAIL-START")["status"] == TaskState.REJECTED.value
+
+
+def test_orchestrator_start_working_transient_recovers_in_step(tmp_path):
+    """P1: Transient 503/429 during start_working or get_mvs succeeds when server recovers on retry."""
+    gm = MagicMock()
+    gm.get_match_state.return_value = {"status": "RUNNING", "remaining_seconds": 1800}
+    gm.list_backlog.return_value = [
+        {"task_id": "BUG-FLAKY-503", "task_type": "BUG", "title": "Flaky", "description": "D", "points": 250},
+    ]
+
+    attempts = {"start": 0, "mvs": 0}
+
+    def flaky_start(tid):
+        attempts["start"] += 1
+        if attempts["start"] == 1:
+            raise RuntimeError("HTTP 503 Service Unavailable")
+        return {"status": "STARTED"}
+
+    def flaky_mvs(tid):
+        attempts["mvs"] += 1
+        if attempts["mvs"] == 1:
+            raise RuntimeError("HTTP 429 Too Many Requests")
+        return []
+
+    gm.start_working.side_effect = flaky_start
+    gm.get_mvs.side_effect = flaky_mvs
+    gm.submit.return_value = {"status": "PASSED", "score": 250}
+
+    orch = CompetitionOrchestrator(
+        gm_adapter=gm,
+        repository_path=tmp_path,
+        scratch_dir=tmp_path / "scratch",
+        db_path=":memory:",
+        push_to_remote=False,
+        start_working_max_retries=2,
+        start_working_backoff_sec=0.001,
+    )
+    orch.sync_backlog()
+
+    from mtm_competition.integration.integration_guard import IntegrationResult
+    from mtm_competition.integration.git_guard import VerifiedRevision
+    (tmp_path / "src").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "src" / "app.py").write_text("x = 1\n", encoding="utf-8")
+
+    def fast_worker(envelope, attempt_number=1, on_process_start=None, cancel_event=None):
+        res = WorkerResult(
+            task_id=envelope.task_id,
+            status=WorkerStatus.READY_FOR_REVIEW,
+            changed_files=["src/app.py"],
+            test_results=[{"command": "pytest", "passed": True, "output": "ok"}],
+        )
+        return res, ExecutionTrace(), tmp_path
+
+    with patch.object(orch.launcher, "launch", side_effect=fast_worker), \
+         patch.object(orch.integration_guard, "integrate", return_value=IntegrationResult(success=True, commit_sha="sha-flaky", pushed=False)), \
+         patch.object(orch.git_guard, "verify_head", return_value=VerifiedRevision(commit_sha="sha-flaky", branch="main", is_clean=True)):
+        step_res = orch.step()
+
+    assert step_res["task_id"] == "BUG-FLAKY-503"
+    assert step_res["status"] == "PASSED"
+    assert step_res["points"] == 250
+    assert attempts["start"] == 2
+    assert attempts["mvs"] == 2
 
 
 def test_orchestrator_crash_recovery_requeues_orphaned_running_tasks(tmp_path):
@@ -564,3 +663,369 @@ def test_orchestrator_match_finished_mid_execution_cancels_worker(tmp_path):
     assert orch.scheduler.active_worker_count == 0
     assert orch.supervisor.active_worker_count() == 0
     gm.submit.assert_not_called()
+
+
+def test_crash_recovery_reconciles_with_gm_and_enforces_fencing_tokens(tmp_path):
+    """P1 Recovery & Retry Safety:
+    1. Reconciles orphaned ASSIGNED/RUNNING/VERIFYING tasks with Game Master before requeuing
+       (so tasks already graded on server before local DB commit are marked PASSED, not re-run).
+    2. Terminates stale zombie worker PIDs recorded in SQLite on startup.
+    3. Rotates fencing tokens on recovery and blocks stale attempts from mutating state or submitting.
+    4. Preserves READY_TO_SUBMIT across crash boundaries.
+    """
+    db_file = tmp_path / "crash_fencing.db"
+    store = TaskStore(str(db_file))
+
+    for tid, state, pts in [
+        ("BUG-GRADED-ON-GM", TaskState.VERIFYING, 200),
+        ("BUG-ZOMBIE-PID", TaskState.RUNNING, 150),
+        ("BUG-ASSIGNED-ORPHAN", TaskState.ASSIGNED, 100),
+        ("BUG-READY-SUBMIT", TaskState.READY_TO_SUBMIT, 300),
+    ]:
+        store.add_task(
+            TaskEnvelope(
+                task_id=tid,
+                task_type="BUG",
+                title=tid,
+                description="Boundary crash test",
+                repository_path=str(tmp_path),
+                points=pts,
+            )
+        )
+        store.update_task_status(tid, state)
+
+    # Spawn a real sleeper process to act as an orphaned zombie worker from a crashed orchestrator
+    zombie_proc = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(60)"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    stale_token = store.issue_fencing_token("BUG-ZOMBIE-PID", active_pid=zombie_proc.pid)
+    assert store.validate_fencing_token("BUG-ZOMBIE-PID", stale_token) is True
+
+    gm = MagicMock()
+    gm.get_match_state.return_value = {"status": "RUNNING", "remaining_seconds": 1500}
+    gm.list_backlog.return_value = []
+
+    def gm_status_side_effect(tid):
+        if tid == "BUG-GRADED-ON-GM":
+            return {"status": "PASSED", "score": 200.0}
+        return {"status": "WORKING"}
+
+    gm.get_submission_status.side_effect = gm_status_side_effect
+
+    try:
+        orch = CompetitionOrchestrator(
+            gm_adapter=gm,
+            repository_path=tmp_path,
+            scratch_dir=tmp_path / "scratch",
+            db_path=str(db_file),
+        )
+
+        # 1. Task already graded on GM must be reconciled to PASSED (not downgraded to QUEUED!)
+        graded_row = orch.store.get_task("BUG-GRADED-ON-GM")
+        assert graded_row["status"] == TaskState.PASSED.value
+        assert graded_row["awarded_points"] == 200.0
+
+        # 2. Zombie worker process must be terminated on recovery and task reset to QUEUED
+        zombie_proc.wait(timeout=5.0)
+        assert zombie_proc.poll() is not None
+        zombie_row = orch.store.get_task("BUG-ZOMBIE-PID")
+        assert zombie_row["status"] == TaskState.QUEUED.value
+        assert zombie_row["active_pid"] is None
+
+        # 3. Stale fencing token must now be invalid and rejected at state boundaries
+        assert orch.store.validate_fencing_token("BUG-ZOMBIE-PID", stale_token) is False
+        with pytest.raises(ValueError, match="Fencing token mismatch"):
+            orch.store.transition_state(
+                "BUG-ZOMBIE-PID",
+                TaskState.VERIFYING,
+                fencing_token=stale_token,
+            )
+
+        # 4. ASSIGNED orphan is reset to QUEUED, while READY_TO_SUBMIT remains READY_TO_SUBMIT
+        assert orch.store.get_task("BUG-ASSIGNED-ORPHAN")["status"] == TaskState.QUEUED.value
+        assert orch.store.get_task("BUG-READY-SUBMIT")["status"] == TaskState.READY_TO_SUBMIT.value
+    finally:
+        if zombie_proc.poll() is None:
+            zombie_proc.kill()
+
+
+def test_ready_to_submit_resumes_directly_without_rerunning_worker(tmp_path):
+    """P2 Scheduler & Orchestrator: Tasks in READY_TO_SUBMIT are NOT downgraded to QUEUED,
+    and Orchestrator.step() resumes them directly at integration/submission without re-running the LLM worker.
+    """
+    db_file = tmp_path / "ready_to_submit.db"
+    gm = MagicMock()
+    gm.get_match_state.return_value = {"status": "RUNNING", "remaining_seconds": 1800}
+    gm.list_backlog.return_value = []
+    gm.submit.return_value = {"status": "PASSED", "score": 350}
+
+    orch = CompetitionOrchestrator(
+        gm_adapter=gm,
+        repository_path=tmp_path,
+        scratch_dir=tmp_path / "scratch",
+        db_path=str(db_file),
+        push_to_remote=False,
+    )
+
+    ws_path = tmp_path / "scratch" / "ws_CR-READY-01_att1"
+    ws_path.mkdir(parents=True, exist_ok=True)
+    verified_res = WorkerResult(
+        task_id="CR-READY-01",
+        status=WorkerStatus.READY_FOR_REVIEW,
+        changed_files=["src/app.py"],
+        test_results=[{"command": "pytest", "passed": True, "output": "ok"}],
+    )
+
+    orch.store.add_task(
+        TaskEnvelope(
+            task_id="CR-READY-01",
+            task_type="CR",
+            title="Already QA Verified",
+            description="Should not re-run worker",
+            repository_path=str(tmp_path),
+            points=350,
+        )
+    )
+    import json
+    orch.store.save_verified_checkpoint(
+        "CR-READY-01",
+        worker_result_json=json.dumps(verified_res.to_dict()),
+        workspace_path=str(ws_path),
+        revision_sha="sha-verified-ready-01",
+    )
+    orch.store.update_task_status("CR-READY-01", TaskState.READY_TO_SUBMIT)
+
+    # Scheduler must select CR-READY-01 while preserving READY_TO_SUBMIT state
+    candidate = orch.scheduler.select_next_task()
+    assert candidate is not None
+    assert candidate["task_id"] == "CR-READY-01"
+    assert candidate["status"] == TaskState.READY_TO_SUBMIT.value
+    assert orch.store.get_task("CR-READY-01")["status"] == TaskState.READY_TO_SUBMIT.value
+
+    # Orchestrator step() must submit directly without invoking launcher.launch or gm.start_working
+    with patch.object(orch.launcher, "launch") as mock_launch:
+        step_res = orch.step()
+        mock_launch.assert_not_called()
+        gm.start_working.assert_not_called()
+
+    assert step_res["task_id"] == "CR-READY-01"
+    assert step_res["status"] == "PASSED"
+    assert step_res["points"] == 350
+    assert orch.store.get_task("CR-READY-01")["status"] == TaskState.PASSED.value
+    gm.submit.assert_called_once_with(
+        task_id="CR-READY-01",
+        git_revision="sha-verified-ready-01",
+        evidence=[],
+    )
+
+
+def test_worker_supervisor_real_subprocess_quiescence_on_timeout_and_preempt(tmp_path):
+    """P2 WorkerSupervisor: Real worker with child/grandchild processes and startup race
+    must leave zero surviving processes and zero workspace file writes after timeout or preemption.
+    """
+    supervisor = WorkerSupervisor(max_workers=2)
+
+    # Case 1: Worker with real child + grandchild process tree continuously writing to workspace,
+    # plus a Python post-communicate write attempt that would race if not gated by cancel_event.
+    ws_timeout = tmp_path / "ws_timeout"
+    ws_timeout.mkdir(parents=True, exist_ok=True)
+    pid_file = ws_timeout / "pids.txt"
+    heartbeat_file = ws_timeout / "heartbeat.txt"
+    post_write_file = ws_timeout / "post_cancel_leak.txt"
+
+    child_code = (
+        "import subprocess, sys, time, pathlib\n"
+        f"ws = pathlib.Path(r'{ws_timeout}')\n"
+        "grandchild = subprocess.Popen([sys.executable, '-c', "
+        "\"import time, pathlib; p = pathlib.Path(r'\" + str(ws / 'heartbeat.txt') + \"'); \"\n"
+        "\"\\nwhile True:\\n p.write_text(str(time.time_ns()))\\n time.sleep(0.01)\"])\n"
+        f"pathlib.Path(r'{pid_file}').write_text(f'{{grandchild.pid}}')\n"
+        "time.sleep(60)\n"
+    )
+
+    def real_tree_worker(env: TaskEnvelope, attempt_number: int = 1, on_process_start=None, cancel_event=None):
+        p = subprocess.Popen(
+            [sys.executable, "-c", child_code],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            start_new_session=True,
+        )
+        if on_process_start:
+            on_process_start(p)
+        try:
+            p.communicate(timeout=60)
+        except Exception:
+            pass
+        # Simulate CodexRuntime post-communicate trace/workspace write that must be blocked on cancel/timeout
+        if cancel_event is None or not cancel_event.is_set():
+            post_write_file.write_text("LEAKED_WRITE_AFTER_KILL")
+        return WorkerResult(task_id=env.task_id, status=WorkerStatus.READY_FOR_REVIEW), ExecutionTrace(), ws_timeout
+
+    env_timeout = TaskEnvelope(
+        task_id="TASK-TREE-TIMEOUT",
+        task_type="BUG",
+        title="Timeout Tree",
+        description="Tree",
+        repository_path=str(tmp_path),
+    )
+    proc_info = supervisor.launch_async(real_tree_worker, env_timeout)
+
+    # Wait until grandchild PID file and heartbeat file exist
+    deadline = time.monotonic() + 5.0
+    while time.monotonic() < deadline and not pid_file.exists():
+        time.sleep(0.02)
+    assert pid_file.exists(), "Child process did not spawn grandchild in time"
+    grandchild_pid = int(pid_file.read_text().strip())
+
+    # Trigger timeout_worker
+    assert supervisor.timeout_worker("TASK-TREE-TIMEOUT") is not None
+
+    # Worker thread future MUST be done and no post-cancel write may exist
+    assert proc_info.future.done() is True
+    assert not post_write_file.exists(), "Worker thread wrote to workspace after timeout!"
+    assert not is_pid_alive(grandchild_pid), "Grandchild process survived timeout_worker!"
+
+    # Snapshot heartbeat file after timeout_worker returns and verify it never changes again
+    snap_1 = heartbeat_file.read_text() if heartbeat_file.exists() else ""
+    time.sleep(0.15)
+    snap_2 = heartbeat_file.read_text() if heartbeat_file.exists() else ""
+    assert snap_1 == snap_2, "Grandchild process continued writing to workspace after timeout_worker returned!"
+
+    # Case 2: Preemption racing with Popen startup (preempt_worker called BEFORE Popen / on_process_start)
+    ws_preempt = tmp_path / "ws_preempt"
+    ws_preempt.mkdir(parents=True, exist_ok=True)
+    race_leak_file = ws_preempt / "race_leak.txt"
+
+    def startup_race_worker(env: TaskEnvelope, attempt_number: int = 1, on_process_start=None, cancel_event=None):
+        time.sleep(0.08)  # Preemption happens during this window before Popen
+        if cancel_event is not None and cancel_event.is_set():
+            return WorkerResult(task_id=env.task_id, status=WorkerStatus.FAILED), ExecutionTrace(), ws_preempt
+        p = subprocess.Popen(
+            [sys.executable, "-c", f"import pathlib, time; pathlib.Path(r'{race_leak_file}').write_text('LEAK'); time.sleep(30)"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            start_new_session=True,
+        )
+        if on_process_start:
+            on_process_start(p)
+        p.communicate(timeout=5)
+        return WorkerResult(task_id=env.task_id, status=WorkerStatus.READY_FOR_REVIEW), ExecutionTrace(), ws_preempt
+
+    env_race = TaskEnvelope(
+        task_id="TASK-RACE-PREEMPT",
+        task_type="BUG",
+        title="Startup Race",
+        description="Race",
+        repository_path=str(tmp_path),
+    )
+    race_proc = supervisor.launch_async(startup_race_worker, env_race)
+    time.sleep(0.01)  # Preempt while worker is still in pre-Popen startup sleep
+    assert supervisor.preempt_worker("TASK-RACE-PREEMPT") is not None
+    assert race_proc.future.done() is True
+    time.sleep(0.1)
+    assert not race_leak_file.exists(), "Preempted startup-race worker still spawned Popen and wrote to workspace!"
+    supervisor.shutdown_all()
+
+
+def test_real_codex_cli_binary_pipeline_timeout_and_preemption_quiescence(tmp_path, monkeypatch):
+    """P2 End-to-End WorkerSupervisor + WorkerLauncher + CodexRuntime with a real executable `codex` CLI:
+    Verifies that when CodexRuntime spawns a real `codex` process (which in turn spawns a child process
+    writing to the workspace), mid-execution preemption and timeout kill the entire process tree,
+    quiesce the Python worker thread, and prevent any post-kill workspace writes (including trace.jsonl).
+    """
+    from mtm_competition.workers.launcher import WorkerLauncher
+    from mtm_core.git import git_init, run_git
+
+    # 1. Create a real git repository for WorkspaceManager to clone
+    repo_dir = tmp_path / "customer_repo"
+    git_init(repo_dir)
+    (repo_dir / "app.py").write_text("x = 1\n", encoding="utf-8")
+    run_git(repo_dir, ["add", "app.py"])
+    run_git(repo_dir, ["commit", "-m", "init"])
+
+    # 2. Create a real executable `codex` CLI binary on PATH that spawns a child process writing to cwd
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir(parents=True, exist_ok=True)
+    codex_script = bin_dir / "codex_runner.py"
+    codex_script.write_text(
+        "import os, pathlib, subprocess, sys, time\n"
+        "child = subprocess.Popen([\n"
+        "    sys.executable, '-c',\n"
+        "    \"import pathlib, time\\n\"\n"
+        "    \"p = pathlib.Path('live_child_tick.txt')\\n\"\n"
+        "    \"while True:\\n\"\n"
+        "    \"    p.write_text(str(time.time_ns()), encoding='utf-8')\\n\"\n"
+        "    \"    time.sleep(0.01)\\n\"\n"
+        "])\n"
+        "pathlib.Path('codex_child.pid').write_text(str(child.pid), encoding='utf-8')\n"
+        "sys.stdout.write('{\"type\": \"turn.started\"}\\n')\n"
+        "sys.stdout.flush()\n"
+        "time.sleep(60)\n",
+        encoding="utf-8",
+    )
+
+    if sys.platform == "win32":
+        codex_bin = bin_dir / "codex.cmd"
+        codex_bin.write_text(f'@"{sys.executable}" "{codex_script}" %*\r\n', encoding="utf-8")
+    else:
+        codex_bin = bin_dir / "codex"
+        codex_bin.write_text(f'#!/bin/sh\nexec "{sys.executable}" "{codex_script}" "$@"\n', encoding="utf-8")
+        codex_bin.chmod(0o755)
+
+    monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ.get('PATH', '')}")
+
+    scratch_dir = tmp_path / "scratch"
+    launcher = WorkerLauncher(scratch_dir=scratch_dir, backend="codex")
+    supervisor = WorkerSupervisor(max_workers=1)
+
+    env = TaskEnvelope(
+        task_id="CODEX-REAL-PREEMPT",
+        task_type="CR",
+        title="Full Codex Pipeline Preempt",
+        description="Test real CodexRuntime + WorkerLauncher + WorkerSupervisor preemption",
+        repository_path=str(repo_dir),
+        time_budget_seconds=60,
+        backend="codex",
+    )
+
+    spawned_pids = []
+    try:
+        proc = supervisor.launch_async(
+            launcher.launch,
+            env,
+            attempt_number=1,
+            on_pid_callback=lambda pid: spawned_pids.append(pid),
+        )
+
+        ws_dir = scratch_dir / "CODEX-REAL-PREEMPT_att1"
+        child_pid_file = ws_dir / "codex_child.pid"
+        tick_file = ws_dir / "live_child_tick.txt"
+
+        deadline = time.monotonic() + 8.0
+        while time.monotonic() < deadline and not (child_pid_file.exists() and tick_file.exists()):
+            time.sleep(0.02)
+
+        assert spawned_pids, "CodexRuntime did not register subprocess PID"
+        assert child_pid_file.exists(), "codex CLI did not spawn child process in workspace"
+        grandchild_pid = int(child_pid_file.read_text(encoding="utf-8").strip())
+
+        # Preempt via WorkerSupervisor
+        preempted = supervisor.preempt_worker("CODEX-REAL-PREEMPT")
+        assert preempted is not None
+        assert preempted.status == "PREEMPTED"
+        assert proc.future.done() is True
+
+        # Both codex CLI and its child process must be dead, and trace.jsonl must NOT be written after preempt
+        assert not is_pid_alive(spawned_pids[0]), "codex CLI process survived preemption!"
+        assert not is_pid_alive(grandchild_pid), "codex child process survived preemption!"
+        assert not (ws_dir / "trace.jsonl").exists(), "CodexRuntime wrote trace.jsonl after preemption!"
+
+        snap_before = tick_file.read_text(encoding="utf-8")
+        time.sleep(0.15)
+        snap_after = tick_file.read_text(encoding="utf-8")
+        assert snap_before == snap_after, "Child process modified workspace after preempt_worker returned!"
+    finally:
+        supervisor.shutdown_all()

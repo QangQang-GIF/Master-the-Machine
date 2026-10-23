@@ -2,12 +2,40 @@
 from __future__ import annotations
 
 import json
+import os
+import signal
 import sqlite3
+import subprocess
+import sys
 import time
+import uuid
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from mtm_core.contracts import TaskEnvelope, TaskState
+from mtm_core.runtime.process import _kill_unix_descendants, is_pid_alive
+from mtm_competition.tasks.state_machine import TaskStateMachine
+
+
+def _terminate_pid_tree(pid: int) -> None:
+    """Terminate an orphaned worker PID and its descendants safely across platforms."""
+    if not pid or pid <= 0 or pid == os.getpid():
+        return
+    try:
+        if sys.platform == "win32":
+            subprocess.run(
+                ["taskkill", "/F", "/T", "/PID", str(pid)],
+                capture_output=True,
+                timeout=5,
+            )
+        else:
+            _kill_unix_descendants(pid)
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+    except Exception:
+        pass
 
 
 class TaskStore:
@@ -38,6 +66,7 @@ class TaskStore:
                 title TEXT,
                 description TEXT,
                 points INTEGER DEFAULT 0,
+                awarded_points REAL DEFAULT 0,
                 deadline_epoch REAL,
                 time_budget_seconds INTEGER DEFAULT 420,
                 status TEXT NOT NULL,
@@ -45,6 +74,12 @@ class TaskStore:
                 base_revision TEXT,
                 mvs_json TEXT,
                 evidence_required_json TEXT,
+                fencing_token TEXT,
+                active_pid INTEGER,
+                verified_result_json TEXT,
+                verified_workspace TEXT,
+                verified_revision TEXT,
+                start_working_requeues INTEGER DEFAULT 0,
                 created_at REAL,
                 updated_at REAL
             );
@@ -58,6 +93,7 @@ class TaskStore:
                 elapsed_seconds REAL,
                 billable_tokens INTEGER,
                 result_json TEXT,
+                fencing_token TEXT,
                 created_at REAL,
                 FOREIGN KEY (task_id) REFERENCES tasks(task_id)
             );
@@ -99,8 +135,23 @@ class TaskStore:
                 except sqlite3.OperationalError:
                     pass
 
+            for col, col_type in [
+                ("time_budget_seconds", "INTEGER DEFAULT 420"),
+                ("awarded_points", "REAL DEFAULT 0"),
+                ("fencing_token", "TEXT"),
+                ("active_pid", "INTEGER"),
+                ("verified_result_json", "TEXT"),
+                ("verified_workspace", "TEXT"),
+                ("verified_revision", "TEXT"),
+                ("start_working_requeues", "INTEGER DEFAULT 0"),
+            ]:
+                try:
+                    self.conn.execute(f"ALTER TABLE tasks ADD COLUMN {col} {col_type}")
+                except sqlite3.OperationalError:
+                    pass
+
             try:
-                self.conn.execute("ALTER TABLE tasks ADD COLUMN time_budget_seconds INTEGER DEFAULT 420")
+                self.conn.execute("ALTER TABLE attempts ADD COLUMN fencing_token TEXT")
             except sqlite3.OperationalError:
                 pass
 
@@ -165,6 +216,128 @@ class TaskStore:
             )
             self.record_event(task_id, "STATUS_CHANGE", old_state, state_str, payload or {})
 
+    def issue_fencing_token(self, task_id: str, active_pid: Optional[int] = None) -> str:
+        """Issue a fresh fencing token for a task attempt and optionally record its active PID."""
+        token = f"fence-{task_id}-{int(time.time() * 1000)}-{uuid.uuid4().hex[:8]}"
+        now = time.time()
+        with self.conn:
+            self.conn.execute(
+                "UPDATE tasks SET fencing_token = ?, active_pid = ?, updated_at = ? WHERE task_id = ?",
+                (token, active_pid, now, task_id),
+            )
+            self.record_event(
+                task_id,
+                "FENCING_TOKEN_ISSUED",
+                None,
+                None,
+                {"fencing_token": token, "active_pid": active_pid},
+            )
+        return token
+
+    def set_active_pid(
+        self,
+        task_id: str,
+        pid: Optional[int],
+        fencing_token: Optional[str] = None,
+    ) -> bool:
+        """Record or clear the active OS subprocess PID for a running task."""
+        if fencing_token is not None and not self.validate_fencing_token(task_id, fencing_token):
+            return False
+        now = time.time()
+        with self.conn:
+            self.conn.execute(
+                "UPDATE tasks SET active_pid = ?, updated_at = ? WHERE task_id = ?",
+                (pid, now, task_id),
+            )
+        return True
+
+    def validate_fencing_token(self, task_id: str, fencing_token: Optional[str]) -> bool:
+        """Return True if fencing_token matches the task's current active fencing token."""
+        if not fencing_token:
+            return False
+        task = self.get_task(task_id)
+        if not task:
+            return False
+        return bool(task.get("fencing_token") == fencing_token)
+
+    def invalidate_fencing_token(self, task_id: str, reason: str = "invalidated") -> str:
+        """Rotate fencing token and clear active_pid so stale attempts cannot mutate state."""
+        new_token = f"fence-invalidated-{int(time.time() * 1000)}-{uuid.uuid4().hex[:8]}"
+        now = time.time()
+        with self.conn:
+            self.conn.execute(
+                "UPDATE tasks SET fencing_token = ?, active_pid = NULL, updated_at = ? WHERE task_id = ?",
+                (new_token, now, task_id),
+            )
+            self.record_event(
+                task_id,
+                "FENCING_TOKEN_INVALIDATED",
+                None,
+                None,
+                {"reason": reason, "new_token": new_token},
+            )
+        return new_token
+
+    def transition_state(
+        self,
+        task_id: str,
+        target_state: TaskState | str,
+        expected_current: Optional[Tuple[TaskState, ...]] = None,
+        fencing_token: Optional[str] = None,
+        payload: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """Validated state transition enforcing both state machine rules and fencing token."""
+        task = self.get_task(task_id)
+        if not task:
+            raise ValueError(f"Unknown task_id: {task_id}")
+        if fencing_token is not None and task.get("fencing_token") != fencing_token:
+            raise ValueError(
+                f"Fencing token mismatch for task {task_id}: expected {task.get('fencing_token')}, got {fencing_token}"
+            )
+        cur_state = TaskState(task["status"])
+        tgt_state = target_state if isinstance(target_state, TaskState) else TaskState(target_state)
+        if expected_current and cur_state not in expected_current:
+            raise ValueError(
+                f"State mismatch for task {task_id}: expected one of {[s.value for s in expected_current]}, got {cur_state.value}"
+            )
+        if cur_state != tgt_state:
+            TaskStateMachine.validate_transition(cur_state, tgt_state)
+        self.update_task_status(task_id, tgt_state, payload=payload)
+
+    def save_verified_checkpoint(
+        self,
+        task_id: str,
+        worker_result_json: str,
+        workspace_path: str,
+        revision_sha: Optional[str] = None,
+        fencing_token: Optional[str] = None,
+    ) -> None:
+        """Persist QA-verified worker result, workspace path, and revision SHA before READY_TO_SUBMIT."""
+        if fencing_token is not None and not self.validate_fencing_token(task_id, fencing_token):
+            raise ValueError(f"Fencing token mismatch for task {task_id}")
+        now = time.time()
+        with self.conn:
+            self.conn.execute(
+                """
+                UPDATE tasks
+                SET verified_result_json = ?, verified_workspace = ?, verified_revision = ?, updated_at = ?
+                WHERE task_id = ?
+                """,
+                (worker_result_json, workspace_path, revision_sha, now, task_id),
+            )
+
+    def increment_start_working_requeues(self, task_id: str) -> int:
+        """Increment and return the count of transient start_working/get_mvs requeues for a task."""
+        task = self.get_task(task_id)
+        cur = int((task or {}).get("start_working_requeues") or 0) + 1
+        now = time.time()
+        with self.conn:
+            self.conn.execute(
+                "UPDATE tasks SET start_working_requeues = ?, updated_at = ? WHERE task_id = ?",
+                (cur, now, task_id),
+            )
+        return cur
+
     def record_attempt(
         self,
         task_id: str,
@@ -174,13 +347,14 @@ class TaskStore:
         elapsed_seconds: float = 0.0,
         billable_tokens: int = 0,
         result_json: Optional[Dict[str, Any]] = None,
+        fencing_token: Optional[str] = None,
     ) -> None:
         with self.conn:
             self.conn.execute("""
             INSERT OR REPLACE INTO attempts (
                 attempt_id, task_id, attempt_number, status,
-                elapsed_seconds, billable_tokens, result_json, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                elapsed_seconds, billable_tokens, result_json, fencing_token, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 attempt_id,
                 task_id,
@@ -189,6 +363,7 @@ class TaskStore:
                 elapsed_seconds,
                 billable_tokens,
                 json.dumps(result_json or {}),
+                fencing_token,
                 time.time(),
             ))
 
@@ -199,8 +374,15 @@ class TaskStore:
         row = cursor.fetchone()
         return int(row["cnt"] or 0) if row else 0
 
-    def reconcile_orphaned_tasks(self) -> List[Dict[str, Any]]:
-        """Requeue tasks left in ASSIGNED, RUNNING, or VERIFYING state after an abrupt process crash."""
+    def reconcile_orphaned_tasks(self, status_check_fn: Any = None) -> List[Dict[str, Any]]:
+        """Reconcile tasks left in ASSIGNED, RUNNING, or VERIFYING state after an abrupt process crash.
+
+        1. Terminates any lingering zombie OS worker process recorded in `active_pid`.
+        2. Rotates `fencing_token` to fence off stale attempts.
+        3. Queries Game Master (`status_check_fn`) first in case a submission already succeeded on the server
+           before local SQLite was updated.
+        4. Otherwise requeues unsubmitted tasks back to `QUEUED`.
+        """
         cursor = self.conn.cursor()
         cursor.execute("""
             SELECT * FROM tasks
@@ -211,11 +393,68 @@ class TaskStore:
         now = time.time()
         for t in rows:
             tid = t["task_id"]
+            old_state = t["status"]
+
+            # 1. Kill any orphaned OS subprocess from previous process instance
+            stale_pid = t.get("active_pid")
+            if stale_pid and is_pid_alive(int(stale_pid)):
+                _terminate_pid_tree(int(stale_pid))
+
+            # 2. Rotate fencing token & clear active_pid so stale worker threads cannot commit
+            self.invalidate_fencing_token(tid, reason="crash_recovery")
+
+            # 3. Reconcile against Game Master if status_check_fn is provided
+            gm_reconciled = False
+            if status_check_fn is not None and not self.has_submitted(tid):
+                try:
+                    res = status_check_fn(tid)
+                    if isinstance(res, dict) and isinstance(res.get("status"), str):
+                        st = res["status"].strip().upper()
+                        raw_score = res.get("score") if res.get("score") is not None else res.get("points")
+                        score_val = int(float(raw_score)) if raw_score is not None else 0
+                        if st in ("PASSED", "GRADED", "COMPLETED"):
+                            self.record_submission(
+                                task_id=tid,
+                                status="PASSED",
+                                score=score_val,
+                                response_json=res,
+                                git_revision=res.get("git_revision") or res.get("commit_sha"),
+                                submission_id=res.get("submission_id"),
+                            )
+                            requeued.append({"task_id": tid, "from_state": old_state, "to_state": TaskState.PASSED.value})
+                            gm_reconciled = True
+                        elif st in ("FAILED", "REJECTED"):
+                            self.record_submission(
+                                task_id=tid,
+                                status="FAILED",
+                                score=0,
+                                response_json=res,
+                                git_revision=res.get("git_revision") or res.get("commit_sha"),
+                                submission_id=res.get("submission_id"),
+                            )
+                            requeued.append({"task_id": tid, "from_state": old_state, "to_state": TaskState.FAILED.value})
+                            gm_reconciled = True
+                        elif st in ("ACCEPTED", "SUBMITTED", "GRADING"):
+                            self.record_submission(
+                                task_id=tid,
+                                status="SUBMITTED",
+                                score=score_val,
+                                response_json=res,
+                                git_revision=res.get("git_revision") or res.get("commit_sha"),
+                                submission_id=res.get("submission_id"),
+                            )
+                            requeued.append({"task_id": tid, "from_state": old_state, "to_state": TaskState.SUBMITTED.value})
+                            gm_reconciled = True
+                except Exception:
+                    pass
+
+            if gm_reconciled:
+                continue
+
             if not self.has_submitted(tid):
-                old_state = t["status"]
                 with self.conn:
                     self.conn.execute(
-                        "UPDATE tasks SET status = ?, updated_at = ? WHERE task_id = ?",
+                        "UPDATE tasks SET status = ?, active_pid = NULL, updated_at = ? WHERE task_id = ?",
                         (TaskState.QUEUED.value, now, tid),
                     )
                     self.record_event(
@@ -368,8 +607,8 @@ class TaskStore:
                 final_task_state = TaskState.REJECTED.value
 
             self.conn.execute(
-                "UPDATE tasks SET status = ?, updated_at = ? WHERE task_id = ?",
-                (final_task_state, now, task_id),
+                "UPDATE tasks SET status = ?, awarded_points = ?, active_pid = NULL, updated_at = ? WHERE task_id = ?",
+                (final_task_state, float(confirmed), now, task_id),
             )
             self.record_event(task_id, "SUBMISSION_RECORDED", None, status, {"score": score})
         return True
@@ -411,8 +650,8 @@ class TaskStore:
                 task_state = TaskState.SUBMITTED.value
 
             self.conn.execute(
-                "UPDATE tasks SET status = ?, updated_at = ? WHERE task_id = ?",
-                (task_state, now, task_id),
+                "UPDATE tasks SET status = ?, awarded_points = ?, active_pid = NULL, updated_at = ? WHERE task_id = ?",
+                (task_state, float(confirmed), now, task_id),
             )
             self.record_event(task_id, "GRADING_STATUS_UPDATED", sub["status"], status, {"score": final_score})
 

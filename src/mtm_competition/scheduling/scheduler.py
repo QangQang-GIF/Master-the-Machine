@@ -25,6 +25,7 @@ class TournamentScheduler:
         self.match_duration = match_duration_seconds
         self.match_start_time = time.time()
         self.running_tasks: Dict[str, Dict[str, Any]] = {}
+        self.cooldown_until: Dict[str, float] = {}
 
         # Server clock synchronization
         self.clock_offset: float = 0.0
@@ -32,6 +33,24 @@ class TournamentScheduler:
         self.last_sync_time: float = time.time()
         self.match_status: str = "RUNNING"
         self.is_paused: bool = False
+
+    def set_cooldown(self, task_id: str, duration_seconds: float = 15.0) -> None:
+        """Temporarily deprioritize a task after a transient failure so other ready tasks can run."""
+        self.cooldown_until[task_id] = time.monotonic() + max(0.0, duration_seconds)
+
+    def clear_cooldown(self, task_id: str) -> None:
+        """Clear any transient cooldown on a task."""
+        self.cooldown_until.pop(task_id, None)
+
+    def is_on_cooldown(self, task_id: str) -> bool:
+        """Return True if task is currently within a transient retry cooldown window."""
+        until = self.cooldown_until.get(task_id)
+        if until is None:
+            return False
+        if time.monotonic() >= until:
+            self.cooldown_until.pop(task_id, None)
+            return False
+        return True
 
     def sync_with_game_master(self, match_state: Dict[str, Any]) -> None:
         """Calibrate server epoch, clock offset, remaining time, and pause state."""
@@ -84,12 +103,26 @@ class TournamentScheduler:
         if not self.has_capacity:
             return None
 
-        # Promote newly DISCOVERED (or recovered READY_TO_SUBMIT) tasks to QUEUED
-        for state_val in (TaskState.DISCOVERED.value, TaskState.READY_TO_SUBMIT.value):
-            candidates = self.store.list_tasks(status=state_val)
-            for d in candidates:
-                if not self.store.has_submitted(d["task_id"]):
-                    self.store.update_task_status(d["task_id"], TaskState.QUEUED)
+        # Promote newly DISCOVERED tasks to QUEUED (never downgrade READY_TO_SUBMIT back to QUEUED)
+        discovered = self.store.list_tasks(status=TaskState.DISCOVERED.value)
+        for d in discovered:
+            if not self.store.has_submitted(d["task_id"]):
+                self.store.update_task_status(d["task_id"], TaskState.QUEUED)
+
+        rem_sec = self.match_remaining_seconds
+        cur_time = self.current_server_time
+
+        # Prioritize READY_TO_SUBMIT tasks first without downgrading their state
+        ready_tasks = [
+            t
+            for t in self.store.list_tasks(status=TaskState.READY_TO_SUBMIT.value)
+            if not self.store.has_submitted(t["task_id"]) and not self.is_on_cooldown(t["task_id"])
+        ]
+        if ready_tasks:
+            pq_ready = PriorityQueue()
+            for t in ready_tasks:
+                pq_ready.push(t, match_remaining_seconds=rem_sec, current_time=cur_time)
+            return pq_ready.pop()
 
         queued_tasks = self.store.list_tasks(status=TaskState.QUEUED.value)
 
@@ -98,18 +131,27 @@ class TournamentScheduler:
         if not queued_tasks:
             return None
 
+        # Prefer tasks not currently on a transient retry cooldown
+        eligible_tasks = [t for t in queued_tasks if not self.is_on_cooldown(t["task_id"])]
+        pool = eligible_tasks if eligible_tasks else queued_tasks
+
         # Build priority queue
         pq = PriorityQueue()
-        rem_sec = self.match_remaining_seconds
-        cur_time = self.current_server_time
-        for t in queued_tasks:
+        for t in pool:
             pq.push(t, match_remaining_seconds=rem_sec, current_time=cur_time)
 
         next_task = pq.pop()
         return next_task
 
     def assign_task(self, task_id: str, worker_id: str = "worker-01") -> None:
-        """Mark task as assigned and running."""
+        """Mark task as assigned and running (or reserve capacity for READY_TO_SUBMIT recovery)."""
+        existing = self.store.get_task(task_id)
+        if existing and existing.get("status") == TaskState.READY_TO_SUBMIT.value:
+            existing["start_time"] = time.time()
+            existing["worker_id"] = worker_id
+            self.running_tasks[task_id] = existing
+            return
+
         TaskStateMachine.validate_transition(TaskState.QUEUED, TaskState.ASSIGNED)
         self.store.update_task_status(task_id, TaskState.ASSIGNED, {"worker_id": worker_id})
         TaskStateMachine.validate_transition(TaskState.ASSIGNED, TaskState.RUNNING)

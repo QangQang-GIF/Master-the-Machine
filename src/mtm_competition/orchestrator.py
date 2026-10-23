@@ -14,11 +14,53 @@ from mtm_competition.workers.launcher import WorkerLauncher
 from mtm_competition.workers.supervisor import WorkerSupervisor
 from mtm_competition.verification.qa_gate import validate_qa_gate, QAGateError
 from mtm_competition.integration.integration_guard import IntegrationGuard
-from mtm_competition.integration.git_guard import GitGuard
+from mtm_competition.integration.git_guard import GitGuard, VerifiedRevision
 from mtm_competition.integration.submission_guard import SubmissionGuard, SubmissionResult
 from mtm_competition.adapters.base import GameMasterAdapter
 
 logger = logging.getLogger("mtm.orchestrator")
+
+
+def _is_transient_gm_error(exc: Exception) -> bool:
+    """Classify whether a Game Master exception is transient (retryable/requeueable) vs permanent."""
+    if isinstance(exc, (KeyError, ValueError, TypeError)):
+        return False
+    if isinstance(exc, (TimeoutError, ConnectionError)):
+        return True
+
+    cls_name = exc.__class__.__name__
+    if cls_name in ("MVSLockedError", "GameMasterRateLimitError", "GameMasterConnectionError"):
+        return True
+    if cls_name in ("GameMasterAuthError", "GameMasterValidationError", "GameMasterClientError"):
+        return False
+
+    status_code = getattr(exc, "status_code", None)
+    if isinstance(status_code, int):
+        if status_code in (408, 425, 429) or status_code >= 500:
+            return True
+        if 400 <= status_code < 500:
+            return False
+
+    msg = str(exc).lower()
+    permanent_markers = (
+        "http 400", "http 401", "http 403", "http 404", "http 409", "http 410", "http 422",
+        " 400 ", " 401 ", " 403 ", " 404 ", " 409 ", " 422 ",
+        "bad request", "unauthorized", "forbidden", "not found", "conflict",
+        "invalid task", "already submitted", "unknown task",
+    )
+    if any(m in msg for m in permanent_markers):
+        return False
+
+    transient_markers = (
+        "500", "502", "503", "504", "429", "408",
+        "service unavailable", "bad gateway", "gateway timeout", "too many requests",
+        "rate limit", "temporarily unavailable", "timeout", "timed out",
+        "connection", "network", "locked", "mvs",
+    )
+    if any(m in msg for m in transient_markers):
+        return True
+
+    return False
 
 
 class CompetitionOrchestrator:
@@ -38,11 +80,19 @@ class CompetitionOrchestrator:
         reverify_worker_tests: bool = False,
         require_remote: bool = False,
         token_budget: int = 1_000_000,
+        start_working_max_retries: int = 2,
+        start_working_backoff_sec: float = 0.25,
+        start_working_max_requeues: int = 2,
+        start_working_cooldown_sec: float = 15.0,
     ):
         self.gm = gm_adapter
         self.repo_path = Path(repository_path).resolve()
         self.scratch_dir = Path(scratch_dir).resolve()
         self.scratch_dir.mkdir(parents=True, exist_ok=True)
+        self.start_working_max_retries = max(0, int(start_working_max_retries))
+        self.start_working_backoff_sec = max(0.0, float(start_working_backoff_sec))
+        self.start_working_max_requeues = max(0, int(start_working_max_requeues))
+        self.start_working_cooldown_sec = max(0.0, float(start_working_cooldown_sec))
 
         if db_path is None:
             self.db_path = str(self.scratch_dir / "tournament.db")
@@ -111,17 +161,144 @@ class CompetitionOrchestrator:
             verify_skill_checksums(project_root)
 
         # Reconcile any orphaned tasks, in-flight submissions, and grading lifecycle remaining from crash/restart
+        status_fn = getattr(self.gm, "get_submission_status", None)
         try:
-            self.store.reconcile_orphaned_tasks()
+            self.store.reconcile_orphaned_tasks(status_check_fn=status_fn)
         except Exception as e:
             logger.warning("Could not reconcile orphaned tasks on startup: %s", e)
 
-        if hasattr(self.gm, "get_submission_status"):
+        if status_fn is not None:
             try:
-                self.store.reconcile_in_flight_submissions(self.gm.get_submission_status)
-                self.store.reconcile_grading_lifecycle(self.gm.get_submission_status)
+                self.store.reconcile_in_flight_submissions(status_fn)
+                self.store.reconcile_grading_lifecycle(status_fn)
             except Exception as e:
                 logger.warning("Could not reconcile in-flight submissions on startup: %s", e)
+
+    def _call_gm_with_retry(self, fn: Any) -> Any:
+        """Execute a Game Master RPC with bounded exponential backoff on transient failures."""
+        max_attempts = 1 + self.start_working_max_retries
+        last_exc: Optional[Exception] = None
+        for attempt_idx in range(max_attempts):
+            try:
+                return fn()
+            except Exception as exc:
+                last_exc = exc
+                if not _is_transient_gm_error(exc) or attempt_idx >= max_attempts - 1:
+                    raise
+                if self.start_working_backoff_sec > 0:
+                    time.sleep(self.start_working_backoff_sec * (2 ** attempt_idx))
+        if last_exc is not None:
+            raise last_exc
+        return None
+
+    def _resume_ready_to_submit(self, task_data: Dict[str, Any]) -> Dict[str, Any]:
+        """Resume a task already in READY_TO_SUBMIT directly at integration/submission without re-running worker."""
+        task_id = task_data["task_id"]
+        fencing_token = self.store.issue_fencing_token(task_id)
+        t_stage_start = time.time()
+
+        evidence_req = []
+        if task_data.get("evidence_required_json"):
+            try:
+                evidence_req = json.loads(task_data["evidence_required_json"])
+            except Exception:
+                pass
+
+        envelope = TaskEnvelope(
+            task_id=task_id,
+            task_type=task_data["task_type"],
+            title=task_data["title"],
+            description=task_data["description"],
+            repository_path=str(self.repo_path),
+            points=task_data["points"],
+            deadline_epoch=task_data["deadline_epoch"],
+            time_budget_seconds=int(task_data.get("time_budget_seconds") or 420),
+            evidence_required=evidence_req,
+            backend=self.worker_backend,
+        )
+
+        raw_res_json = task_data.get("verified_result_json")
+        if raw_res_json:
+            try:
+                worker_res = WorkerResult.from_dict(json.loads(raw_res_json))
+            except Exception:
+                worker_res = WorkerResult(task_id=task_id, status="READY_FOR_REVIEW")
+        else:
+            worker_res = WorkerResult(task_id=task_id, status="READY_FOR_REVIEW")
+
+        saved_rev = task_data.get("verified_revision")
+        saved_ws = task_data.get("verified_workspace")
+        pushed_flag = True
+
+        if saved_rev:
+            verified_rev = VerifiedRevision(commit_sha=saved_rev, branch="main", is_clean=True)
+        else:
+            ws_dir = Path(saved_ws) if saved_ws else self.repo_path
+            integ_res = self.integration_guard.integrate(worker_res, ws_dir)
+            if not integ_res.success:
+                self.scheduler.complete_task(task_id, TaskState.REJECTED)
+                return {
+                    "task_id": task_id,
+                    "status": "INTEGRATION_FAILED",
+                    "error": integ_res.error_message,
+                }
+            pushed_flag = integ_res.pushed
+            verified_rev = VerifiedRevision(commit_sha=integ_res.commit_sha or "HEAD", branch="main", is_clean=True)
+
+        if not self.store.validate_fencing_token(task_id, fencing_token):
+            self.scheduler.requeue_task(task_id)
+            return {"task_id": task_id, "status": "FENCED_OFF"}
+
+        sub_res = self.submission_guard.execute_guarded_submission(
+            envelope=envelope,
+            worker_result=worker_res,
+            revision=verified_rev,
+            game_master_submit_fn=self.gm.submit,
+            game_master_status_fn=getattr(self.gm, "get_submission_status", None),
+            current_time=self.scheduler.current_server_time,
+        )
+
+        final_status = sub_res.status
+        final_points = sub_res.points_awarded
+        if sub_res.success and final_status not in ("PASSED", "FAILED") and hasattr(self.gm, "get_submission_status"):
+            try:
+                grading = self.gm.get_submission_status(task_id)
+                if isinstance(grading, dict) and isinstance(grading.get("status"), str):
+                    g_status = grading.get("status")
+                    if g_status in ("PASSED", "FAILED"):
+                        final_status = g_status
+                        raw_pts = grading.get("points") if grading.get("points") is not None else grading.get("score")
+                        if g_status == "PASSED":
+                            final_points = int(raw_pts) if raw_pts is not None else (final_points or envelope.points)
+                        else:
+                            final_points = int(raw_pts) if raw_pts is not None else 0
+                        self.store.update_submission_status(task_id, g_status, final_points, grading)
+            except Exception:
+                pass
+
+        if final_status == "PASSED":
+            final_state = TaskState.PASSED
+        elif final_status == "FAILED":
+            final_state = TaskState.FAILED
+        elif sub_res.success:
+            final_state = TaskState.SUBMITTED
+        else:
+            final_state = TaskState.REJECTED
+
+        self.scheduler.complete_task(task_id, final_state)
+        self.store.record_event(
+            task_id,
+            "READY_TO_SUBMIT_RESUMED",
+            TaskState.READY_TO_SUBMIT.value,
+            final_state.value,
+            {"total_duration": round(time.time() - t_stage_start, 2), "billable_tokens": 0},
+        )
+        return {
+            "task_id": task_id,
+            "status": final_status,
+            "points": final_points,
+            "pushed": pushed_flag,
+        }
 
     def sync_backlog(self) -> int:
         """Poll backlog from Game Master, sync server clock, and register new items into TaskStore."""
@@ -205,13 +382,38 @@ class CompetitionOrchestrator:
         task_id = task_data["task_id"]
         self.scheduler.assign_task(task_id)
 
-        t_stage_start = time.time()
+        # Direct READY_TO_SUBMIT recovery path (do not re-run worker or start_working)
+        if task_data.get("status") == TaskState.READY_TO_SUBMIT.value:
+            return self._resume_ready_to_submit(task_data)
 
-        # 1. Signal Game Master and unlock MVS (guarded so running_tasks never leaks on failure)
+        t_stage_start = time.time()
+        fencing_token = self.store.issue_fencing_token(task_id)
+
+        # 1. Signal Game Master and unlock MVS with transient vs permanent error classification & retry
         try:
-            self.gm.start_working(task_id)
-            mvs = self.gm.get_mvs(task_id)
+            self._call_gm_with_retry(lambda: self.gm.start_working(task_id))
+            mvs = self._call_gm_with_retry(lambda: self.gm.get_mvs(task_id))
         except Exception as e:
+            self.store.invalidate_fencing_token(task_id, reason="start_working_failed")
+            if _is_transient_gm_error(e):
+                requeue_count = self.store.increment_start_working_requeues(task_id)
+                if requeue_count <= self.start_working_max_requeues:
+                    self.scheduler.requeue_task(task_id)
+                    self.scheduler.set_cooldown(task_id, self.start_working_cooldown_sec)
+                    self.store.record_event(
+                        task_id,
+                        "START_WORKING_TRANSIENT_REQUEUED",
+                        TaskState.RUNNING.value,
+                        TaskState.QUEUED.value,
+                        {"error": str(e), "requeue_count": requeue_count},
+                    )
+                    return {
+                        "task_id": task_id,
+                        "status": "TRANSIENT_RETRY_QUEUED",
+                        "error": str(e),
+                        "requeue_count": requeue_count,
+                    }
+
             self.scheduler.complete_task(task_id, TaskState.REJECTED)
             self.store.record_event(
                 task_id, "START_WORKING_FAILED", TaskState.RUNNING.value, TaskState.REJECTED.value, {"error": str(e)}
@@ -242,6 +444,7 @@ class CompetitionOrchestrator:
 
         # 2. Token Budget Watchdog: block launch if hard budget reached, or downshift effort
         if self.cumulative_billable_tokens >= self.token_budget:
+            self.store.invalidate_fencing_token(task_id, reason="budget_exceeded")
             self.scheduler.complete_task(task_id, TaskState.REJECTED)
             return {
                 "task_id": task_id,
@@ -253,10 +456,15 @@ class CompetitionOrchestrator:
             envelope.reasoning_effort = "low"
             envelope.model = "gpt-6.1-sol" if self.worker_backend == "codex" else "gemini-3.8-flash-low"
 
-        # 3. Supervised worker launch with mid-execution preemption and match pause awareness
+        # 3. Supervised worker launch with mid-execution preemption, PID tracking, and match pause awareness
         t_worker_start = time.time()
         attempt_num = self.store.get_attempt_count(task_id) + 1
-        supervised_proc = self.supervisor.launch_async(self.launcher.launch, envelope, attempt_number=attempt_num)
+        supervised_proc = self.supervisor.launch_async(
+            self.launcher.launch,
+            envelope,
+            attempt_number=attempt_num,
+            on_pid_callback=lambda pid: self.store.set_active_pid(task_id, pid, fencing_token=fencing_token),
+        )
 
         while not self.supervisor.is_finished(task_id):
             # Sync match state and clock
@@ -268,6 +476,7 @@ class CompetitionOrchestrator:
 
             if self.scheduler.match_status == "FINISHED":
                 self.supervisor.cancel_worker(task_id)
+                self.store.invalidate_fencing_token(task_id, reason="match_finished")
                 self.scheduler.complete_task(task_id, TaskState.ABORTED)
                 return {"task_id": task_id, "status": "FINISHED"}
 
@@ -280,15 +489,18 @@ class CompetitionOrchestrator:
             # Poll backlog to detect if high-priority PI arrived that preempts us
             self.sync_backlog()
             if supervised_proc.status == "PREEMPTED":
+                self.store.invalidate_fencing_token(task_id, reason="preempted")
                 return {"task_id": task_id, "status": "PREEMPTED"}
 
             if self.supervisor.is_timed_out(task_id):
                 self.supervisor.timeout_worker(task_id)
+                self.store.invalidate_fencing_token(task_id, reason="timed_out")
                 break
 
             time.sleep(0.05)
 
         if supervised_proc.status == "PREEMPTED":
+            self.store.invalidate_fencing_token(task_id, reason="preempted")
             return {"task_id": task_id, "status": "PREEMPTED"}
 
         # Retrieve result with status-aware handling
@@ -296,14 +508,18 @@ class CompetitionOrchestrator:
         try:
             res = self.supervisor.get_result(task_id, timeout=5.0)
         except Exception as e:
+            self.store.invalidate_fencing_token(task_id, reason="worker_exception")
             self.scheduler.complete_task(task_id, TaskState.REJECTED)
             self.supervisor.unregister_worker(task_id)
             return {"task_id": task_id, "status": "FAILED", "error": str(e)}
+
+        self.store.set_active_pid(task_id, None, fencing_token=fencing_token)
 
         if res is None:
             # Distinguish based on supervisor's tracked status
             terminal_status = supervised_proc.status
             self.supervisor.unregister_worker(task_id)
+            self.store.invalidate_fencing_token(task_id, reason=f"terminal_{terminal_status}")
             att_num = getattr(supervised_proc, "attempt_number", attempt_num)
             unique_att_id = f"{task_id}_att{att_num}_{int(time.time() * 1000)}"
             if terminal_status == "TIMED_OUT":
@@ -315,6 +531,7 @@ class CompetitionOrchestrator:
                     elapsed_seconds=round(time.time() - t_worker_start, 2),
                     billable_tokens=0,
                     result_json={"task_id": task_id, "status": "TIMED_OUT"},
+                    fencing_token=fencing_token,
                 )
                 self.scheduler.complete_task(task_id, TaskState.TIMED_OUT)
                 self.store.record_event(
@@ -344,7 +561,7 @@ class CompetitionOrchestrator:
 
         self.cumulative_billable_tokens += trace.billable_tokens
 
-        # Record attempt with unique attempt ID
+        # Record attempt with unique attempt ID and fencing token
         att_num = getattr(supervised_proc, "attempt_number", attempt_num)
         unique_att_id = f"{task_id}_att{att_num}_{int(time.time() * 1000)}"
         self.store.record_attempt(
@@ -355,10 +572,12 @@ class CompetitionOrchestrator:
             elapsed_seconds=worker_res.elapsed_seconds,
             billable_tokens=trace.billable_tokens,
             result_json=worker_res.to_dict(),
+            fencing_token=fencing_token,
         )
 
         # If worker itself reported TIMED_OUT, transition directly to TIMED_OUT without QA Gate rejection
         if worker_res.status == "TIMED_OUT":
+            self.store.invalidate_fencing_token(task_id, reason="worker_timed_out")
             self.scheduler.complete_task(task_id, TaskState.TIMED_OUT)
             self.store.record_event(
                 task_id,
@@ -368,6 +587,18 @@ class CompetitionOrchestrator:
                 {"elapsed_seconds": worker_res.elapsed_seconds},
             )
             return {"task_id": task_id, "status": "TIMED_OUT", "error": "Worker execution timed out"}
+
+        # Validate fencing token and transition RUNNING -> VERIFYING before QA Gate
+        try:
+            self.store.transition_state(
+                task_id,
+                TaskState.VERIFYING,
+                expected_current=(TaskState.RUNNING,),
+                fencing_token=fencing_token,
+            )
+        except ValueError as e:
+            self.scheduler.requeue_task(task_id)
+            return {"task_id": task_id, "status": "FENCED_OFF", "error": str(e)}
 
         # 4. Deterministic QA Gate validation
         t_qa_start = time.time()
@@ -379,9 +610,10 @@ class CompetitionOrchestrator:
                 reverify_tests=self.reverify_worker_tests,
             )
         except QAGateError as e:
+            self.store.invalidate_fencing_token(task_id, reason="qa_gate_failed")
             self.scheduler.complete_task(task_id, TaskState.REJECTED)
             self.store.record_event(
-                task_id, "QA_GATE_FAILED", TaskState.RUNNING.value, TaskState.REJECTED.value, {"error": str(e)}
+                task_id, "QA_GATE_FAILED", TaskState.VERIFYING.value, TaskState.REJECTED.value, {"error": str(e)}
             )
             return {"task_id": task_id, "status": "REJECTED", "error": str(e)}
         qa_duration = round(time.time() - t_qa_start, 2)
@@ -400,6 +632,7 @@ class CompetitionOrchestrator:
                 verification_cmd=v_cmd,
             )
             if not integ_res.success:
+                self.store.invalidate_fencing_token(task_id, reason="integration_failed")
                 self.scheduler.complete_task(task_id, TaskState.REJECTED)
                 return {
                     "task_id": task_id,
@@ -411,6 +644,7 @@ class CompetitionOrchestrator:
             remote_configured = self.git_guard.has_remote(self.integration_guard.remote_name)
             must_verify_pushed = self.integration_guard.push_to_remote and remote_configured
             if must_verify_pushed and not integ_res.pushed:
+                self.store.invalidate_fencing_token(task_id, reason="push_failed")
                 self.scheduler.complete_task(task_id, TaskState.REJECTED)
                 return {
                     "task_id": task_id,
@@ -425,6 +659,7 @@ class CompetitionOrchestrator:
                     remote=self.integration_guard.remote_name,
                 )
             except Exception as e:
+                self.store.invalidate_fencing_token(task_id, reason="verify_head_failed")
                 self.scheduler.complete_task(task_id, TaskState.REJECTED)
                 return {
                     "task_id": task_id,
@@ -433,9 +668,29 @@ class CompetitionOrchestrator:
                 }
             integ_duration = round(time.time() - t_integ_start, 2)
 
+            # Persist verified checkpoint and transition VERIFYING -> READY_TO_SUBMIT under fencing token
+            try:
+                self.store.save_verified_checkpoint(
+                    task_id,
+                    worker_result_json=json.dumps(worker_res.to_dict()),
+                    workspace_path=str(ws_path),
+                    revision_sha=verified_rev.commit_sha,
+                    fencing_token=fencing_token,
+                )
+                self.store.transition_state(
+                    task_id,
+                    TaskState.READY_TO_SUBMIT,
+                    expected_current=(TaskState.VERIFYING,),
+                    fencing_token=fencing_token,
+                )
+            except ValueError as e:
+                self.scheduler.requeue_task(task_id)
+                return {"task_id": task_id, "status": "FENCED_OFF", "error": str(e)}
+
             # Re-check deadline immediately before submission (P1.2)
             current_server_now = self.scheduler.current_server_time
             if envelope.deadline_epoch and current_server_now > envelope.deadline_epoch:
+                self.store.invalidate_fencing_token(task_id, reason="deadline_expired")
                 self.scheduler.complete_task(task_id, TaskState.REJECTED)
                 return {
                     "task_id": task_id,
@@ -458,17 +713,19 @@ class CompetitionOrchestrator:
             # Check grading status if server returned ACCEPTED
             final_status = sub_res.status
             final_points = sub_res.points_awarded
-            if sub_res.success and hasattr(self.gm, "get_submission_status"):
+            if sub_res.success and final_status not in ("PASSED", "FAILED") and hasattr(self.gm, "get_submission_status"):
                 try:
                     grading = self.gm.get_submission_status(task_id)
-                    g_status = grading.get("status")
-                    if g_status in ("PASSED", "FAILED"):
-                        final_status = g_status
-                        if g_status == "PASSED":
-                            final_points = int(grading["points"]) if grading.get("points") is not None else (final_points or envelope.points)
-                        else:  # FAILED
-                            final_points = int(grading["points"]) if grading.get("points") is not None else 0
-                        self.store.update_submission_status(task_id, g_status, final_points, grading)
+                    if isinstance(grading, dict) and isinstance(grading.get("status"), str):
+                        g_status = grading.get("status")
+                        if g_status in ("PASSED", "FAILED"):
+                            final_status = g_status
+                            raw_pts = grading.get("points") if grading.get("points") is not None else grading.get("score")
+                            if g_status == "PASSED":
+                                final_points = int(raw_pts) if raw_pts is not None else (final_points or envelope.points)
+                            else:  # FAILED
+                                final_points = int(raw_pts) if raw_pts is not None else 0
+                            self.store.update_submission_status(task_id, g_status, final_points, grading)
                 except Exception:
                     pass
 

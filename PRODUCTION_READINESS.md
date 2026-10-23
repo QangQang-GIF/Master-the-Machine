@@ -11,13 +11,14 @@
 | Requirement | Target Criteria | Actual Status | Verification Method |
 |---|---|:---:|---|
 | **Python Compatibility** | Python 3.12 & 3.13 | **PASS** | CI Matrix on Ubuntu & local Windows 3.12/3.13 verification |
-| **P0/P1 Remediations** | 100% of P0/P1 regression tests passing | **PASS** | 96 core tests + 12 component/tournament E2E tests pass (108 passed, 0 failed) |
+| **P0/P1/P2 Remediations** | 100% of P0/P1/P2 regression tests passing | **PASS** | 101 core tests + 12 component/tournament E2E tests pass (113 passed, 0 failed) |
 | **Independent QA & MVS** | Independent test re-verification in production | **PASS** | `QAGate` re-runs tests with real subprocesses and validates MVS |
 | **Remote Git Verification** | Commit SHA verified on remote before submit | **PASS** | `IntegrationGuard` and `GitGuard.verify_head(verify_pushed=True)` |
 | **Submission Idempotency** | Zero duplicate submissions on network timeouts | **PASS** | `SubmissionGuard` uses UUID idempotency keys and reconciles in-flight |
 | **Two-Phase Grading** | Confirmed points awarded only upon Grader PASSED | **PASS** | `TaskStore` cleanly separates provisional vs confirmed points |
-| **Clean Process Tree** | Preemption/cancel does not leave orphan processes | **PASS** | `terminate_process_tree` (`taskkill /F /T` on Windows, isolated session groups with parent protection on Unix) |
-| **Real Antigravity CLI** | Live CLI smoke tests executed without mock | **PASS** | `agy` (v1.4.6) passed functional bugfix and timeout termination |
+| **Clean Process Tree & Quiescence** | Preemption/timeout leaves 0 orphan PIDs or post-kill writes | **PASS** | `terminate_process_tree` + `SupervisedProcess.cancel_event` + thread join |
+| **Fencing & Crash Recovery** | Reconciles with GM first; kills zombie PIDs; fences stale attempts | **PASS** | `TaskStore.reconcile_orphaned_tasks` + `fencing_token` + `READY_TO_SUBMIT` resume |
+| **Real Antigravity CLI** | Live CLI smoke & preemption tests executed without mock | **PASS** | `agy` (v1.4.6) passed functional bugfix, timeout, and preemption quiescence |
 | **Codex CLI Live Execution** | Codex CLI smoke tests executed without mock | **PENDING** | Marked `BLOCKED`; pending `codex` binary installation on contest runner |
 | **Contest Simulation** | Full 12-event tournament lifecycle simulation | **PASS** | `tests/e2e/test_e2e_b_tournament_sim.py` passed |
 | **Game Master Staging** | Live connection & grading against staging GM | **PENDING** | Safety guard passed; live tests pending staging URL & token from organizers |

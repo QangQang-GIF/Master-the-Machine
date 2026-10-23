@@ -1,10 +1,11 @@
 """WorkerLauncher: Launches and supervises an isolated worker execution."""
 from __future__ import annotations
 
+import inspect
 import json
 import time
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Callable, Dict, Optional, Tuple
 
 from mtm_core.contracts import TaskEnvelope, WorkerResult, WorkerStatus
 from mtm_core.runtime import CodexRuntime, RuntimeResult, ExecutionTrace
@@ -44,6 +45,7 @@ class WorkerLauncher:
         attempt_number: int = 1,
         backend: Optional[str] = None,
         on_process_start: Optional[Callable[[Any], None]] = None,
+        cancel_event: Optional[Any] = None,
     ) -> Tuple[WorkerResult, ExecutionTrace, Path]:
         """Execute task in an isolated workspace.
 
@@ -59,13 +61,41 @@ class WorkerLauncher:
         timeout = int(env_dict.get("time_budget_seconds") or routing.timeout_seconds)
         skills = routing.selected_skills
 
-        # Prepare isolated workspace
         repo_path = Path(env_dict["repository_path"]).resolve()
+        if cancel_event is not None and cancel_event.is_set():
+            return (
+                WorkerResult(
+                    task_id=env_dict["task_id"],
+                    status=WorkerStatus.TIMED_OUT,
+                    skill_ids=skills,
+                    unresolved_risks=["Worker cancelled before workspace preparation"],
+                    model=model,
+                    effort=effort,
+                ),
+                ExecutionTrace(),
+                repo_path,
+            )
+
+        # Prepare isolated workspace
         ws_path = self.workspace_mgr.prepare_workspace(
             repo_path=repo_path,
             task_id=env_dict["task_id"],
             attempt=attempt_number,
         )
+
+        if cancel_event is not None and cancel_event.is_set():
+            return (
+                WorkerResult(
+                    task_id=env_dict["task_id"],
+                    status=WorkerStatus.TIMED_OUT,
+                    skill_ids=skills,
+                    unresolved_risks=["Worker cancelled before kickoff"],
+                    model=model,
+                    effort=effort,
+                ),
+                ExecutionTrace(),
+                ws_path,
+            )
 
         # Build prompt & write TASK.md
         prompt_content = PromptBuilder.build_prompt(env_dict, selected_skills=skills)
@@ -77,22 +107,32 @@ class WorkerLauncher:
         )
 
         trace_log = ws_path / "trace.jsonl"
-        runtime_res = self.runtime.run(
-            workspace=ws_path,
-            prompt=kickoff,
-            model=model,
-            effort=effort,
-            timeout=timeout,
-            log_file=trace_log,
-            backend=routing.backend,
-            on_process_start=on_process_start,
-        )
+        run_kwargs: Dict[str, Any] = {
+            "workspace": ws_path,
+            "prompt": kickoff,
+            "model": model,
+            "effort": effort,
+            "timeout": timeout,
+            "log_file": trace_log,
+            "backend": routing.backend,
+            "on_process_start": on_process_start,
+        }
+        try:
+            sig = inspect.signature(self.runtime.run)
+            if "cancel_event" in sig.parameters or any(
+                p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()
+            ):
+                run_kwargs["cancel_event"] = cancel_event
+        except Exception:
+            pass
+
+        runtime_res = self.runtime.run(**run_kwargs)
 
         trace = runtime_res.trace
         elapsed = runtime_res.elapsed
 
-        # Strict timeout handling
-        if runtime_res.timed_out:
+        # Strict timeout / cancellation handling
+        if runtime_res.timed_out or (cancel_event is not None and cancel_event.is_set()):
             result = WorkerResult(
                 task_id=env_dict["task_id"],
                 status=WorkerStatus.TIMED_OUT,
