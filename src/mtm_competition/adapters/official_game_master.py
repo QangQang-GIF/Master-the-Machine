@@ -34,10 +34,30 @@ class GameMasterAPIError(GameMasterError):
         self.payload = payload or {}
 
 
+class GameMasterAuthError(GameMasterAPIError):
+    """401/403: Authentication or authorization failed."""
+    pass
+
+
+class GameMasterConflictError(GameMasterAPIError):
+    """409: Conflict or duplicate submission."""
+    pass
+
+
+class GameMasterRateLimitError(GameMasterAPIError):
+    """429: Rate limited by Game Master."""
+    pass
+
+
+class MVSLockedError(GameMasterAPIError):
+    """403/423: MVS is locked or not yet unlocked by start_working."""
+    pass
+
+
 class OfficialGameMasterAdapter(GameMasterAdapter):
     """Production HTTP REST connector for the official BTC tournament platform.
 
-    Handles authentication, timeouts, exponential backoff retries, and strict schema validation.
+    Handles authentication, timeouts, exponential backoff retries, rate limiting, and strict schema contracts.
     """
 
     def __init__(
@@ -102,13 +122,22 @@ class OfficialGameMasterAdapter(GameMasterAdapter):
                 except Exception:
                     pass
 
-                # 4xx errors (client error / duplicate / bad request) should not retry
-                if 400 <= e.code < 500:
-                    raise GameMasterAPIError(
-                        status_code=e.code,
-                        message=parsed_error.get("detail") or parsed_error.get("error") or str(e),
-                        payload=parsed_error,
-                    )
+                msg = parsed_error.get("detail") or parsed_error.get("error") or str(e)
+
+                # HTTP error classification (Phase 3)
+                if e.code in (401, 403):
+                    raise GameMasterAuthError(e.code, msg, parsed_error)
+                elif e.code == 409:
+                    raise GameMasterConflictError(e.code, msg, parsed_error)
+                elif e.code == 429:
+                    retry_after = e.headers.get("Retry-After") if hasattr(e, "headers") else None
+                    sleep_time = float(retry_after) if retry_after and retry_after.isdigit() else (0.5 * (2 ** (attempt - 1)))
+                    if attempt < max_attempts:
+                        time.sleep(sleep_time)
+                        continue
+                    raise GameMasterRateLimitError(e.code, msg, parsed_error)
+                elif 400 <= e.code < 500:
+                    raise GameMasterAPIError(e.code, msg, parsed_error)
 
                 last_error = GameMasterAPIError(
                     status_code=e.code,
@@ -123,6 +152,9 @@ class OfficialGameMasterAdapter(GameMasterAdapter):
                 last_error = GameMasterError(f"Unexpected request failure: {e}")
 
             if attempt < max_attempts:
+                # Do not retry unsafe POST operations unless explicitly configured
+                if method.upper() == "POST" and max_attempts == 1:
+                    break
                 backoff = 0.5 * (2 ** (attempt - 1))
                 time.sleep(backoff)
 
@@ -131,9 +163,12 @@ class OfficialGameMasterAdapter(GameMasterAdapter):
     def get_match_state(self) -> Dict[str, Any]:
         """Fetch current match state (duration, remaining time, status, clock)."""
         res = self._request("GET", "/match/state")
-        # Ensure standard keys
+        # Do not fabricate server_epoch; distinguish synced vs uncalibrated clock
         if "server_epoch" not in res:
-            res["server_epoch"] = time.time()
+            res["server_epoch"] = None
+            res["server_calibrated"] = False
+        else:
+            res["server_calibrated"] = True
         return res
 
     def list_backlog(self) -> List[Dict[str, Any]]:
@@ -154,16 +189,26 @@ class OfficialGameMasterAdapter(GameMasterAdapter):
         return self._request("POST", f"/tasks/{encoded_id}/start")
 
     def get_mvs(self, task_id: str) -> Optional[List[Dict[str, Any]]]:
-        """Retrieve Minimum Viable Solution test specifications."""
+        """Retrieve Minimum Viable Solution test specifications.
+
+        Differentiates:
+        - 200 OK: Returns List of MVS items.
+        - 404 Not Found: Server has no MVS for this task -> returns None.
+        - 403 / 423 Locked: MVS not unlocked -> raises MVSLockedError.
+        """
         encoded_id = urllib.parse.quote(task_id)
         try:
             res = self._request("GET", f"/tasks/{encoded_id}/mvs")
             if isinstance(res, list):
                 return res
             return res.get("mvs") if isinstance(res, dict) else None
+        except GameMasterAuthError as e:
+            raise MVSLockedError(e.status_code, f"MVS is locked or not unlocked: {e.message}", e.payload)
         except GameMasterAPIError as e:
             if e.status_code == 404:
                 return None
+            if e.status_code in (403, 423):
+                raise MVSLockedError(e.status_code, f"MVS is locked: {e.message}", e.payload)
             raise
 
     def submit(
@@ -174,8 +219,8 @@ class OfficialGameMasterAdapter(GameMasterAdapter):
         idempotency_key: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Submit completed solution revision for scoring.
-        
-        Phase 1 P0.3: Vô hiệu hóa retry tự động cho POST /submit, trừ khi có idempotency key.
+
+        P0.3 / Phase 3: Single-shot submission without automatic retry unless idempotency key provided.
         """
         encoded_id = urllib.parse.quote(task_id)
         payload = {
