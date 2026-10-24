@@ -246,7 +246,7 @@ def test_terminate_process_tree_cross_platform_and_unix_safety():
         mock_killpg.assert_not_called()
         mock_proc.kill.assert_called()
 
-    # 3. Test Unix group termination: mock pgid != parent_pgid
+    # 3. Test Unix group termination: mock pgid != parent_pgid and pgid == proc.pid
     mock_proc_child_group = MagicMock()
     mock_proc_child_group.pid = 99999
     mock_proc_child_group.poll.return_value = None
@@ -258,6 +258,27 @@ def test_terminate_process_tree_cross_platform_and_unix_safety():
         terminate_process_tree(mock_proc_child_group)
         # killpg MUST be called on child's pgid when distinct from parent!
         mock_killpg.assert_called_once_with(99999, 9)
+
+    # 4. Test MagicMock without integer pid or pgid=0/1 never calls os.getpgid / os.killpg
+    mock_untyped_proc = MagicMock()  # mock_untyped_proc.pid is a MagicMock (__index__ == 1), not an int
+    with patch("sys.platform", "linux"), \
+         patch("os.getpgid", return_value=0, create=True) as mock_getpgid, \
+         patch("os.killpg", create=True) as mock_killpg:
+        terminate_process_tree(mock_untyped_proc)
+        mock_getpgid.assert_not_called()
+        mock_killpg.assert_not_called()
+        mock_untyped_proc.kill.assert_called()
+
+    # 5. Test pgid == 0 or pgid != proc.pid never calls os.killpg(0, ...)
+    mock_zero_pgid_proc = MagicMock()
+    mock_zero_pgid_proc.pid = 88888
+    with patch("sys.platform", "linux"), \
+         patch("os.getpgid", return_value=0, create=True), \
+         patch("os.getpgrp", return_value=12345, create=True), \
+         patch("os.killpg", create=True) as mock_killpg:
+        terminate_process_tree(mock_zero_pgid_proc)
+        mock_killpg.assert_not_called()
+        mock_zero_pgid_proc.kill.assert_called()
 
 
 def test_terminate_process_tree_kills_grandchild_processes(tmp_path):

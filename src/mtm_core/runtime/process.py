@@ -140,6 +140,11 @@ def is_pid_alive(pid: int) -> bool:
 
 def _kill_unix_descendants(pid: int) -> None:
     """Recursively find and SIGKILL descendant processes of `pid` on Unix without using killpg."""
+    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 1 or pid == os.getpid():
+        return
+    ppid = getattr(os, "getppid", lambda: None)()
+    if ppid and pid == ppid:
+        return
     try:
         res = subprocess.run(
             ["pgrep", "-P", str(pid)],
@@ -152,11 +157,12 @@ def _kill_unix_descendants(pid: int) -> None:
                 line = line.strip()
                 if line.isdigit():
                     child_pid = int(line)
-                    _kill_unix_descendants(child_pid)
-                    try:
-                        os.kill(child_pid, signal.SIGKILL)
-                    except ProcessLookupError:
-                        pass
+                    if child_pid > 1 and child_pid != os.getpid() and child_pid != ppid:
+                        _kill_unix_descendants(child_pid)
+                        try:
+                            os.kill(child_pid, signal.SIGKILL)
+                        except ProcessLookupError:
+                            pass
     except Exception:
         pass
 
@@ -201,25 +207,45 @@ def terminate_process_tree(proc: subprocess.Popen) -> None:
     if proc is None:
         return
 
+    raw_pid = getattr(proc, "pid", None)
+    valid_int_pid = (
+        isinstance(raw_pid, int)
+        and not isinstance(raw_pid, bool)
+        and raw_pid > 1
+        and raw_pid != os.getpid()
+        and raw_pid != getattr(os, "getppid", lambda: None)()
+    )
+
     try:
-        if sys.platform == "win32":
-            subprocess.run(
-                ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
-                capture_output=True,
-                timeout=5,
-            )
-        else:
-            try:
-                pgid = os.getpgid(proc.pid)
-                parent_pgid = os.getpgrp()
-                if pgid != parent_pgid:
-                    os.killpg(pgid, signal.SIGKILL)
-                else:
-                    # Child shares caller's process group - recursively kill descendants, then child
-                    _kill_unix_descendants(proc.pid)
-                    proc.kill()
-            except ProcessLookupError:
-                pass
+        if valid_int_pid:
+            if sys.platform == "win32":
+                subprocess.run(
+                    ["taskkill", "/F", "/T", "/PID", str(raw_pid)],
+                    capture_output=True,
+                    timeout=5,
+                )
+            else:
+                try:
+                    pgid = os.getpgid(raw_pid)
+                    parent_pgid = os.getpgrp()
+                    # CRITICAL UNIX SAFETY:
+                    # Only call os.killpg when pgid > 1, pgid == raw_pid (child is its own session/group leader),
+                    # and pgid != parent_pgid. Never call killpg(0, ...) or killpg(1, ...), which on Linux
+                    # can signal the caller's own process group (including CI runner agents).
+                    if (
+                        isinstance(pgid, int)
+                        and not isinstance(pgid, bool)
+                        and pgid > 1
+                        and pgid == raw_pid
+                        and pgid != parent_pgid
+                    ):
+                        os.killpg(pgid, signal.SIGKILL)
+                    else:
+                        # Child shares caller's process group - recursively kill descendants, then child
+                        _kill_unix_descendants(raw_pid)
+                        proc.kill()
+                except ProcessLookupError:
+                    pass
     except Exception:
         pass
 

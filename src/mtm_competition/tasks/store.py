@@ -24,7 +24,13 @@ from mtm_competition.tasks.state_machine import TaskStateMachine
 
 def _terminate_pid_tree(pid: int) -> None:
     """Terminate an orphaned worker PID and its descendants safely across platforms."""
-    if not pid or pid <= 0 or pid == os.getpid():
+    if (
+        not isinstance(pid, int)
+        or isinstance(pid, bool)
+        or pid <= 1
+        or pid == os.getpid()
+        or pid == getattr(os, "getppid", lambda: None)()
+    ):
         return
     try:
         if sys.platform == "win32":

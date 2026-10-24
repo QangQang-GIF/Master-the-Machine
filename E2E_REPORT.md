@@ -1,10 +1,10 @@
-﻿# MTM 2026 Skill System — End-to-End Verification Report (E2E)
+# MTM 2026 Skill System — End-to-End Verification Report (E2E)
 
 **Generated:** 2026-10-23  
 **Branch:** `main`  
 **Test Runner:** `pytest 9.1.1` on Python 3.12 (win32)  
 **Readiness Status:** **SIMULATION-VERIFIED | LIVE STAGING & CODEX-CLI GATED ON ENVIRONMENT PROVISIONING**  
-**Default CI/Offline Suite:** **120 PASSED, 13 SKIPPED (GATED), 0 FAILED** (133 Collected)
+**Default CI/Offline Suite:** **121 PASSED, 13 SKIPPED (GATED), 0 FAILED** (134 Collected)
 
 ---
 
@@ -33,12 +33,12 @@ This report documents the end-to-end verification and remediation of the MTM 202
 
 | Tier | Category | Collected | Passed (Default) | Skipped (Default) | Failed | Notes |
 |---|---|:---:|:---:|:---:|:---:|---|
-| **Core** | Unit, Contracts, Scheduler, Store, Runtime | 110 | 108 | 2 | 0 | 2 live smoke tests skipped in default run (run via `-m live_cli`) |
+| **Core** | Unit, Contracts, Scheduler, Store, Runtime | 111 | 109 | 2 | 0 | 2 live smoke tests skipped in default run (run via `-m live_cli`) |
 | **E2E-A** | Component Integration & Fault-Injection | 10 | 10 | 0 | 0 | 100% deterministic pass, 0 skips |
 | **E2E-B** | Full 12-Event Tournament Lifecycle | 1 | 1 | 0 | 0 | Full match lifecycle simulation passed, 0 skips |
 | **E2E-C** | Real CLI Execution | 8 | 0 | 8 | 0 | Marker-gated (`-m live_cli`); 4 agy passed live, 4 codex blocked |
 | **E2E-D** | Game Master Staging Integration | 4 | 1 | 3 | 0 | Production safety check passed; 3 staging-gated |
-| **TOTAL** | **All Categories** | **133** | **120** | **13** | **0** | **100% pass rate in CI/default suite** |
+| **TOTAL** | **All Categories** | **134** | **121** | **13** | **0** | **100% pass rate in CI/default suite** |
 
 ---
 
@@ -146,5 +146,5 @@ Finding & fix from the first benchmark pass: SQLite in rollback-journal mode gav
 | Live Game Master staging | **NOT VERIFIED** (3 tests gated on credentials) | Run `pytest -m staging_game_master` with `MTM_GM_STAGING_URL` / `MTM_GM_TOKEN` |
 | Python 3.13 | Not installed locally; covered by the CI matrix only | Confirm green CI on 3.13 |
 | Linux/POSIX process-group paths | Mock-tested + CI (ubuntu); not executed locally on Linux. Benchmark CI step is `continue-on-error` until baselined | Confirm green CI |
-| `active_pid` of a quarantined (hung) worker | Cleared by fencing invalidation, so crash recovery would not kill a still-alive hung worker after a restart | Low risk (cancel signalled and process tree killed); follow-up candidate |
-| Hung worker thread occupies a `ThreadPoolExecutor` slot | Quarantine prevents reuse of the task, but the pool slot stays busy until the thread exits | Keep `max_workers` above the concurrency limit (default 2 vs 1) |
+| `active_pid` of a quarantined (hung) worker | **RESOLVED.** `invalidate_fencing_token(clear_pid=False)` preserves `active_pid` & `active_pid_started_at` until `reap_pending_cleanup()` confirms thread exit | Verified by `test_hung_workers_do_not_starve_supervisor_threads_and_preserve_pid_until_quiesced` |
+| Hung worker thread pool starvation | **RESOLVED.** `WorkerSupervisor` spawns supervised per-attempt daemon `threading.Thread`s instead of a fixed-size `ThreadPoolExecutor` | Verified by `test_hung_workers_do_not_starve_supervisor_threads_and_preserve_pid_until_quiesced` |
