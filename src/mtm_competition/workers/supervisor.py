@@ -47,6 +47,7 @@ class WorkerSupervisor:
     """Supervises active worker processes and handles async dispatch, timeouts, and preemption."""
 
     def __init__(self, max_workers: int = 2, quiesce_timeout: float = 5.0):
+        self.max_workers = max_workers
         self._active_workers: Dict[str, SupervisedProcess] = {}
         # Workers that were cancelled/preempted/timed-out but whose thread has NOT yet finished.
         # They are kept here (never silently dropped) until `reap_pending_cleanup()` confirms quiescence.
@@ -151,8 +152,26 @@ class WorkerSupervisor:
             return launcher_fn(envelope, **kwargs)
 
         self._active_workers[task_id] = proc
-        future = self._executor.submit(_runner)
+        future: concurrent.futures.Future = concurrent.futures.Future()
+
+        def _thread_entry() -> None:
+            if not future.set_running_or_notify_cancel():
+                return
+            try:
+                out = _runner()
+                if not future.done():
+                    future.set_result(out)
+            except BaseException as exc:
+                if not future.done():
+                    future.set_exception(exc)
+
         proc.future = future
+        worker_thread = threading.Thread(
+            target=_thread_entry,
+            name=f"mtm-worker-{task_id}-att{attempt_number}",
+            daemon=True,
+        )
+        worker_thread.start()
         return proc
 
     def is_finished(self, task_id: str) -> bool:

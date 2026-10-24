@@ -432,6 +432,7 @@ class CompetitionOrchestrator:
         """Re-check cancelled-but-stuck workers; release quarantine (and requeue) only once they truly stopped."""
         released = self.supervisor.reap_pending_cleanup()
         for tid in released:
+            self.store.set_active_pid(tid, None)
             if self.scheduler.is_quarantined(tid):
                 requeued = self.scheduler.release_quarantine(tid)
                 self.store.record_event(
@@ -660,18 +661,27 @@ class CompetitionOrchestrator:
             # Poll backlog to detect if high-priority PI arrived that preempts us
             self.sync_backlog()
             if supervised_proc.status == "PREEMPTED":
-                self.store.invalidate_fencing_token(task_id, reason="preempted")
+                still_unquiesced = self.supervisor.has_pending_cleanup(task_id) or not supervised_proc.quiesced
+                self.store.invalidate_fencing_token(
+                    task_id, reason="preempted", clear_pid=not still_unquiesced
+                )
                 return {"task_id": task_id, "status": "PREEMPTED"}
 
             if self.supervisor.is_timed_out(task_id):
                 self.supervisor.timeout_worker(task_id)
-                self.store.invalidate_fencing_token(task_id, reason="timed_out")
+                still_unquiesced = self.supervisor.has_pending_cleanup(task_id) or not supervised_proc.quiesced
+                self.store.invalidate_fencing_token(
+                    task_id, reason="timed_out", clear_pid=not still_unquiesced
+                )
                 break
 
             time.sleep(0.05)
 
         if supervised_proc.status == "PREEMPTED":
-            self.store.invalidate_fencing_token(task_id, reason="preempted")
+            still_unquiesced = self.supervisor.has_pending_cleanup(task_id) or not supervised_proc.quiesced
+            self.store.invalidate_fencing_token(
+                task_id, reason="preempted", clear_pid=not still_unquiesced
+            )
             return {"task_id": task_id, "status": "PREEMPTED"}
 
         # Retrieve result with status-aware handling
@@ -684,20 +694,26 @@ class CompetitionOrchestrator:
             self.supervisor.unregister_worker(task_id)
             return {"task_id": task_id, "status": "FAILED", "error": str(e)}
 
-        self.store.set_active_pid(task_id, None, fencing_token=fencing_token)
+        if not self.supervisor.has_pending_cleanup(task_id) and getattr(supervised_proc, "quiesced", True):
+            self.store.set_active_pid(task_id, None, fencing_token=fencing_token)
 
         if res is None:
             # Distinguish based on supervisor's tracked status
             terminal_status = supervised_proc.status
             self.supervisor.unregister_worker(task_id)
-            if self.supervisor.has_pending_cleanup(task_id):
+            has_pending = self.supervisor.has_pending_cleanup(task_id)
+            if has_pending:
                 # Cancelled worker thread is still alive: quarantine (capacity held, no reuse of task/workspace)
                 self._quarantine_unquiesced(
                     task_id,
                     f"terminal_{terminal_status}",
                     requeue_on_release=(terminal_status == "PREEMPTED"),
                 )
-            self.store.invalidate_fencing_token(task_id, reason=f"terminal_{terminal_status}")
+            self.store.invalidate_fencing_token(
+                task_id,
+                reason=f"terminal_{terminal_status}",
+                clear_pid=not has_pending,
+            )
             att_num = getattr(supervised_proc, "attempt_number", attempt_num)
             unique_att_id = f"{task_id}_att{att_num}_{int(time.time() * 1000)}"
             if terminal_status == "TIMED_OUT":

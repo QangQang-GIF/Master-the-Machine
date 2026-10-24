@@ -79,12 +79,12 @@ jobs:
         python -m pip install --upgrade pip
         pip install -e ".[dev]" pytest
 
-    - name: Run E2E Component & Tournament Simulation (Strict: Zero Skips)
+    - name: "Run E2E Component & Tournament Simulation (Strict: Zero Skips)"
       run: |
         pytest tests/e2e/test_e2e_a_components.py tests/e2e/test_e2e_b_tournament_sim.py -v --junitxml=e2e_sim_results.xml
         python -c "import xml.etree.ElementTree as ET, sys; root = ET.parse('e2e_sim_results.xml').getroot(); suite = root.find('testsuite') or root; skipped = int(suite.attrib.get('skipped', 0)); tests = int(suite.attrib.get('tests', 0)); failed = int(suite.attrib.get('failures', 0)); errors = int(suite.attrib.get('errors', 0)); sys.exit(1 if (skipped > 0 or tests == 0 or failed > 0 or errors > 0) else 0)"
 
-    - name: Run E2E Production Target Safety Check
+    - name: "Run E2E Production Target Safety Check"
       run: |
         pytest tests/e2e/test_e2e_d_staging_gm.py -k "test_e2e_d_staging_safe_target_verification" -v
 
@@ -127,7 +127,7 @@ jobs:
           echo "::notice ::Staging Game Master credentials not configured. Gate deferred to pre-tournament release checklist."
         fi
 
-    - name: Run Live Staging Integration (Strict: Zero Skips Allowed)
+    - name: "Run Live Staging Integration (Strict: Zero Skips Allowed)"
       if: steps.check-creds.outputs.has_creds == 'true'
       env:
         MTM_GM_STAGING_URL: ${{ secrets.MTM_GM_STAGING_URL }}

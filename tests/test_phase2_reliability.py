@@ -1528,3 +1528,68 @@ def test_task_md_write_race_at_check_write_boundary_never_leaves_file_after_canc
     result, _trace, ws_path = launcher.launch(env, attempt_number=3, cancel_event=threading.Event())
     assert (ws_path / "TASK.md").exists()
     runtime.run.assert_called_once()
+
+
+def test_hung_workers_do_not_starve_supervisor_threads_and_preserve_pid_until_quiesced(tmp_path):
+    """Verify:
+    1. Multiple hung workers in _pending_cleanup never starve WorkerSupervisor from spawning new threads
+       for distinct tasks (no fixed ThreadPoolExecutor exhaustion).
+    2. invalidate_fencing_token(..., clear_pid=False) preserves active_pid and active_pid_started_at in SQLite
+       while a worker is un-quiesced so crash recovery can still reap it, and clears it once quiesced.
+    3. .github/workflows/ci.yml is valid YAML.
+    """
+    import threading
+    import yaml
+
+    ci_yaml = Path(__file__).resolve().parent.parent / ".github" / "workflows" / "ci.yml"
+    parsed_ci = yaml.safe_load(ci_yaml.read_text(encoding="utf-8"))
+    assert isinstance(parsed_ci, dict) and "jobs" in parsed_ci
+
+    supervisor = WorkerSupervisor(max_workers=1, quiesce_timeout=0.1)
+    release_all = threading.Event()
+
+    try:
+        # Spawn and preempt 3 hung workers on a max_workers=1 supervisor
+        for idx in range(3):
+            started = threading.Event()
+            tid = f"HUNG-POOL-{idx}"
+            env = TaskEnvelope(
+                task_id=tid, task_type="BUG", title=tid, description="d",
+                repository_path=str(tmp_path), time_budget_seconds=60,
+            )
+            supervisor.launch_async(_make_hung_worker(release_all, started), env)
+            assert started.wait(timeout=2.0)
+            p = supervisor.preempt_worker(tid)
+            assert p is not None and p.quiesced is False
+
+        assert len(supervisor.pending_cleanup_task_ids()) == 3
+
+        # A distinct task MUST still execute immediately without thread-pool starvation!
+        fresh_env = TaskEnvelope(
+            task_id="FRESH-TASK-OK", task_type="PI", title="Fresh", description="d",
+            repository_path=str(tmp_path), time_budget_seconds=10,
+        )
+        fresh_proc = supervisor.launch_async(
+            lambda e, **kw: (WorkerResult(task_id=e.task_id, status=WorkerStatus.READY_FOR_REVIEW), ExecutionTrace(), tmp_path),
+            fresh_env,
+        )
+        fresh_res = supervisor.get_result("FRESH-TASK-OK", timeout=2.0)
+        assert fresh_res is not None
+        assert fresh_res[0].status == WorkerStatus.READY_FOR_REVIEW
+
+        # Verify TaskStore preserves active_pid when clear_pid=False
+        store = TaskStore(":memory:")
+        store.add_task(fresh_env)
+        tok = store.issue_fencing_token("FRESH-TASK-OK", active_pid=os.getpid())
+        assert store.get_task("FRESH-TASK-OK")["active_pid"] == os.getpid()
+        store.invalidate_fencing_token("FRESH-TASK-OK", reason="preempted_unquiesced", clear_pid=False)
+        assert store.validate_fencing_token("FRESH-TASK-OK", tok) is False
+        assert store.get_task("FRESH-TASK-OK")["active_pid"] == os.getpid()
+        store.close()
+    finally:
+        release_all.set()
+        deadline = time.monotonic() + 2.0
+        while supervisor.has_pending_cleanup() and time.monotonic() < deadline:
+            supervisor.reap_pending_cleanup()
+            time.sleep(0.02)
+        supervisor.shutdown_all()

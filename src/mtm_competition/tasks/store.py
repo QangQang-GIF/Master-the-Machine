@@ -296,21 +296,37 @@ class TaskStore:
             return False
         return bool(task.get("fencing_token") == fencing_token)
 
-    def invalidate_fencing_token(self, task_id: str, reason: str = "invalidated") -> str:
-        """Rotate fencing token and clear active_pid so stale attempts cannot mutate state."""
+    def invalidate_fencing_token(
+        self,
+        task_id: str,
+        reason: str = "invalidated",
+        clear_pid: bool = True,
+    ) -> str:
+        """Rotate fencing token so stale attempts cannot mutate state.
+
+        When `clear_pid=False` (e.g. a cancelled worker thread has not yet quiesced), `active_pid` and
+        `active_pid_started_at` are retained in SQLite so crash recovery can still reap the process if
+        the orchestrator restarts before the hung worker stops.
+        """
         new_token = f"fence-invalidated-{int(time.time() * 1000)}-{uuid.uuid4().hex[:8]}"
         now = time.time()
         with self.conn:
-            self.conn.execute(
-                "UPDATE tasks SET fencing_token = ?, active_pid = NULL, active_pid_started_at = NULL, updated_at = ? WHERE task_id = ?",
-                (new_token, now, task_id),
-            )
+            if clear_pid:
+                self.conn.execute(
+                    "UPDATE tasks SET fencing_token = ?, active_pid = NULL, active_pid_started_at = NULL, updated_at = ? WHERE task_id = ?",
+                    (new_token, now, task_id),
+                )
+            else:
+                self.conn.execute(
+                    "UPDATE tasks SET fencing_token = ?, updated_at = ? WHERE task_id = ?",
+                    (new_token, now, task_id),
+                )
             self.record_event(
                 task_id,
                 "FENCING_TOKEN_INVALIDATED",
                 None,
                 None,
-                {"reason": reason, "new_token": new_token},
+                {"reason": reason, "new_token": new_token, "clear_pid": clear_pid},
             )
         return new_token
 
