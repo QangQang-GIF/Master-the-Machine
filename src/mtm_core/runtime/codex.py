@@ -10,6 +10,7 @@ import os
 import shutil
 import subprocess
 import sys
+import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -208,81 +209,125 @@ class CodexRuntime:
                 network_access=network_access,
                 codex_config=codex_config,
             )
-            proc = subprocess.Popen(
-                cmd,
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                cwd=str(ws),
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                shell=(sys.platform == "win32"),
-                start_new_session=True,
-            )
-            if on_process_start is not None:
-                try:
-                    on_process_start(proc)
-                except Exception:
-                    pass
             if cancel_event is not None and cancel_event.is_set():
-                _terminate_process_tree(proc)
-                try:
-                    out, _ = proc.communicate(timeout=2)
-                    stdout_text = out or ""
-                except Exception:
-                    stdout_text = ""
                 timed_out = True
                 exit_code = -1
+                stdout_text = ""
             else:
-                try:
-                    stdout_text, _ = proc.communicate(timeout=timeout)
-                    exit_code = proc.returncode
-                except subprocess.TimeoutExpired:
-                    timed_out = True
+                proc = subprocess.Popen(
+                    cmd,
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    cwd=str(ws),
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    shell=(sys.platform == "win32"),
+                    start_new_session=True,
+                )
+                if on_process_start is not None:
+                    try:
+                        on_process_start(proc)
+                    except Exception:
+                        pass
+                if cancel_event is not None and cancel_event.is_set():
                     _terminate_process_tree(proc)
-                    stdout_text, _ = proc.communicate()
+                    try:
+                        out, _ = proc.communicate(timeout=2)
+                        stdout_text = out or ""
+                    except Exception:
+                        stdout_text = ""
+                    timed_out = True
                     exit_code = -1
+                else:
+                    stop_watcher = threading.Event()
+                    if cancel_event is not None:
+                        def _watch_codex_cancel() -> None:
+                            while not stop_watcher.is_set():
+                                if cancel_event.is_set():
+                                    _terminate_process_tree(proc)
+                                    return
+                                stop_watcher.wait(0.02)
+
+                        threading.Thread(target=_watch_codex_cancel, daemon=True).start()
+                    try:
+                        out, _ = proc.communicate(timeout=timeout)
+                        stdout_text = out or ""
+                        exit_code = proc.returncode
+                    except subprocess.TimeoutExpired:
+                        timed_out = True
+                        _terminate_process_tree(proc)
+                        try:
+                            out, _ = proc.communicate(timeout=2)
+                            stdout_text = out or ""
+                        except Exception:
+                            stdout_text = ""
+                        exit_code = -1
+                    finally:
+                        stop_watcher.set()
 
             trace = parse_codex_trace(stdout_text)
 
         else:
             cmd = self.build_agy_cmd(prompt=prompt, effort=effort, model=model)
-            proc = subprocess.Popen(
-                cmd,
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                cwd=str(ws),
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                shell=(sys.platform == "win32"),
-                start_new_session=True,
-            )
-            if on_process_start is not None:
-                try:
-                    on_process_start(proc)
-                except Exception:
-                    pass
             if cancel_event is not None and cancel_event.is_set():
-                _terminate_process_tree(proc)
-                try:
-                    out, _ = proc.communicate(timeout=2)
-                    stdout_text = out or ""
-                except Exception:
-                    stdout_text = ""
                 timed_out = True
                 exit_code = -1
+                stdout_text = ""
             else:
-                try:
-                    stdout_text, _ = proc.communicate(timeout=timeout)
-                    exit_code = proc.returncode
-                except subprocess.TimeoutExpired:
-                    timed_out = True
+                proc = subprocess.Popen(
+                    cmd,
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    cwd=str(ws),
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    shell=(sys.platform == "win32"),
+                    start_new_session=True,
+                )
+                if on_process_start is not None:
+                    try:
+                        on_process_start(proc)
+                    except Exception:
+                        pass
+                if cancel_event is not None and cancel_event.is_set():
                     _terminate_process_tree(proc)
-                    stdout_text, _ = proc.communicate()
+                    try:
+                        out, _ = proc.communicate(timeout=2)
+                        stdout_text = out or ""
+                    except Exception:
+                        stdout_text = ""
+                    timed_out = True
                     exit_code = -1
+                else:
+                    stop_watcher = threading.Event()
+                    if cancel_event is not None:
+                        def _watch_agy_cancel() -> None:
+                            while not stop_watcher.is_set():
+                                if cancel_event.is_set():
+                                    _terminate_process_tree(proc)
+                                    return
+                                stop_watcher.wait(0.02)
+
+                        threading.Thread(target=_watch_agy_cancel, daemon=True).start()
+                    try:
+                        out, _ = proc.communicate(timeout=timeout)
+                        stdout_text = out or ""
+                        exit_code = proc.returncode
+                    except subprocess.TimeoutExpired:
+                        timed_out = True
+                        _terminate_process_tree(proc)
+                        try:
+                            out, _ = proc.communicate(timeout=2)
+                            stdout_text = out or ""
+                        except Exception:
+                            stdout_text = ""
+                        exit_code = -1
+                    finally:
+                        stop_watcher.set()
 
             trace = parse_agy_trace(stdout_text)
 
@@ -290,6 +335,7 @@ class CodexRuntime:
 
         if cancel_event is not None and cancel_event.is_set():
             timed_out = True
+            exit_code = -1
         elif log_file:
             log_path = Path(log_file)
             log_path.parent.mkdir(parents=True, exist_ok=True)

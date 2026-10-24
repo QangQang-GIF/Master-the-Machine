@@ -39,6 +39,7 @@ class SupervisedProcess:
     result: Optional[Tuple[WorkerResult, ExecutionTrace, Path]] = None
     subprocess_handle: Optional[Any] = None
     cancel_event: threading.Event = field(default_factory=threading.Event, repr=False)
+    quiesced: bool = False
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
 
@@ -201,9 +202,13 @@ class WorkerSupervisor:
         self,
         proc: SupervisedProcess,
         target_status: str,
-        join_timeout: float = 2.0,
-    ) -> None:
-        """Atomically signal cancellation, kill subprocess tree, and wait for worker thread quiescence."""
+        join_timeout: float = 5.0,
+    ) -> bool:
+        """Atomically signal cancellation, kill subprocess tree, and wait for worker thread quiescence.
+
+        Continuously monitors and terminates any late-registered subprocess handles until the
+        worker future finishes (or `join_timeout` elapses), and records `proc.quiesced`.
+        """
         with proc._lock:
             proc.cancel_event.set()
             proc.status = target_status
@@ -212,20 +217,28 @@ class WorkerSupervisor:
         if handle is not None:
             terminate_process_tree(handle)
 
-        # Second check in case Popen registered concurrently right as cancel_event was set
-        with proc._lock:
-            late_handle = proc.subprocess_handle
-        if late_handle is not None and late_handle is not handle:
-            terminate_process_tree(late_handle)
+        if proc.future is None:
+            proc.quiesced = True
+            return True
 
-        if proc.future:
-            if not proc.future.done():
-                proc.future.cancel()
-            if not proc.future.done():
-                try:
-                    concurrent.futures.wait([proc.future], timeout=join_timeout)
-                except Exception:
-                    pass
+        if not proc.future.done():
+            proc.future.cancel()
+
+        deadline = time.monotonic() + max(0.1, float(join_timeout))
+        while not proc.future.done() and time.monotonic() < deadline:
+            with proc._lock:
+                cur_handle = proc.subprocess_handle
+            if cur_handle is not None:
+                poll_fn = getattr(cur_handle, "poll", None)
+                if not callable(poll_fn) or poll_fn() is None:
+                    terminate_process_tree(cur_handle)
+            try:
+                concurrent.futures.wait([proc.future], timeout=0.05)
+            except Exception:
+                pass
+
+        proc.quiesced = bool(proc.future.done())
+        return proc.quiesced
 
     def timeout_worker(self, task_id: str) -> Optional[SupervisedProcess]:
         """Terminate worker due to timeout. Sets status TIMED_OUT and keeps registration for status inspection."""

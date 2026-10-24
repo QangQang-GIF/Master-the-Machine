@@ -1027,6 +1027,7 @@ def test_real_codex_cli_binary_pipeline_timeout_and_preemption_quiescence(tmp_pa
         preempted = supervisor.preempt_worker("CODEX-REAL-PREEMPT")
         assert preempted is not None
         assert preempted.status == "PREEMPTED"
+        assert preempted.quiesced is True
         assert proc.future.done() is True
 
         # Both codex CLI and its child process must be dead, and trace.jsonl must NOT be written after preempt
@@ -1105,6 +1106,30 @@ def test_codex_runtime_cancellation_before_and_after_popen_has_no_unbound_local(
         assert res_post.last_message == ""
         assert not is_pid_alive(spawned[0]), f"{backend_name} subprocess survived immediate cancellation!"
         assert not log_file.exists(), f"{backend_name} wrote log_file after cancellation!"
+
+        # Case 3: cancel_event set asynchronously 80ms AFTER proc.communicate() has started blocking
+        mid_cancel = threading.Event()
+        mid_spawned = []
+
+        def _delayed_cancel_after_start(proc):
+            mid_spawned.append(proc.pid)
+            threading.Timer(0.08, mid_cancel.set).start()
+
+        t_mid = time.monotonic()
+        res_mid = rt.run(
+            workspace=ws,
+            prompt="noop",
+            backend=backend_name,
+            timeout=30,
+            log_file=log_file,
+            on_process_start=_delayed_cancel_after_start,
+            cancel_event=mid_cancel,
+        )
+        assert (time.monotonic() - t_mid) < 3.0, f"{backend_name} blocked in communicate() despite mid-flight cancel_event!"
+        assert res_mid.timed_out is True
+        assert res_mid.exit_code == -1
+        assert not is_pid_alive(mid_spawned[0]), f"{backend_name} subprocess survived mid-communicate cancellation!"
+        assert not log_file.exists()
 
 
 def test_ready_to_submit_fails_closed_on_missing_or_corrupted_checkpoint_and_unverified_git(tmp_path):

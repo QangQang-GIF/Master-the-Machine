@@ -99,6 +99,19 @@ class WorkerLauncher:
 
         # Build prompt & write TASK.md
         prompt_content = PromptBuilder.build_prompt(env_dict, selected_skills=skills)
+        if cancel_event is not None and cancel_event.is_set():
+            return (
+                WorkerResult(
+                    task_id=env_dict["task_id"],
+                    status=WorkerStatus.TIMED_OUT,
+                    skill_ids=skills,
+                    unresolved_risks=["Worker cancelled before writing TASK.md"],
+                    model=model,
+                    effort=effort,
+                ),
+                ExecutionTrace(),
+                ws_path,
+            )
         (ws_path / "TASK.md").write_text(prompt_content, encoding="utf-8")
 
         kickoff = (
