@@ -1,4 +1,4 @@
-"""E2E-C — Real CLI Execution Suite.
+﻿"""E2E-C — Real CLI Execution Suite.
 
 Verifies real autonomous worker runs using the live CLI binaries (Codex CLI and Antigravity CLI)
 against customer repository fixtures.
@@ -34,6 +34,48 @@ def _check_live_cli_gate(pytestconfig, backend_name: str):
     if not shutil.which(binary):
         pytest.skip(f"BLOCKED: {binary} CLI binary not found on PATH. Not marked as PASS.")
 
+
+def _snapshot_tree(root: Path) -> dict:
+    """Map relative path -> (size, mtime_ns) for every file under root (excluding .git internals)."""
+    snap = {}
+    for f in root.rglob("*"):
+        if ".git" in f.parts:
+            continue
+        try:
+            if f.is_file():
+                st = f.stat()
+                snap[str(f.relative_to(root))] = (st.st_size, st.st_mtime_ns)
+        except OSError:
+            continue
+    return snap
+
+
+def _assert_preemption_is_quiescent(supervisor, proc, task_id, cli_pid, launcher, backend_label):
+    """Shared strict post-preemption assertions for real CLI binaries.
+
+    - worker thread fully quiesced (not merely signalled)
+    - CLI process dead
+    - REAL workspace dir (WorkspaceManager naming: <task_id>_att<N>) exists, has no trace.jsonl,
+      and its file tree is frozen (no residual child process keeps writing)
+    """
+    import time
+    from mtm_core.runtime.process import is_pid_alive
+
+    preempted = supervisor.preempt_worker(task_id)
+    assert preempted is not None
+    assert preempted.status == "PREEMPTED"
+    assert preempted.quiesced is True, f"{backend_label} worker thread did not quiesce after preemption"
+    assert proc.future.done() is True
+    assert not is_pid_alive(cli_pid), f"{backend_label} CLI PID {cli_pid} survived preemption!"
+
+    ws_dir = launcher.workspace_mgr.scratch_dir / f"{task_id}_att1"
+    assert ws_dir.exists(), f"Expected real workspace {ws_dir} (assertion would otherwise be vacuous)"
+    assert not (ws_dir / "trace.jsonl").exists(), "Worker thread wrote trace.jsonl after preemption!"
+    snap_before = _snapshot_tree(ws_dir)
+    time.sleep(0.75)
+    snap_after = _snapshot_tree(ws_dir)
+    assert snap_before == snap_after, f"{backend_label}: workspace modified after preemption (residual child process?)"
+    assert not supervisor.has_pending_cleanup(task_id)
 
 @pytest.mark.live_cli
 def test_e2e_c_codex_simple_bug(tmp_path, pytestconfig):
@@ -227,15 +269,10 @@ def test_e2e_c_codex_worker_preemption_quiescence(tmp_path, pytestconfig):
     assert spawned_pids, "Real Codex CLI subprocess did not start in time"
     cli_pid = spawned_pids[0]
 
-    preempted = supervisor.preempt_worker("PREEMPT-CODEX-04")
-    assert preempted is not None
-    assert preempted.status == "PREEMPTED"
-    assert proc.future.done() is True
-    assert not is_pid_alive(cli_pid), f"Codex CLI PID {cli_pid} survived preemption!"
-
-    ws_dir = tmp_path / "scratch" / "ws_PREEMPT-CODEX-04_att1"
-    assert not (ws_dir / "trace.jsonl").exists(), "Worker thread wrote trace.jsonl after preemption!"
-    supervisor.shutdown_all()
+    try:
+        _assert_preemption_is_quiescent(supervisor, proc, "PREEMPT-CODEX-04", cli_pid, launcher, "codex")
+    finally:
+        supervisor.shutdown_all()
 
 
 @pytest.mark.live_cli
@@ -276,12 +313,7 @@ def test_e2e_c_agy_worker_preemption_quiescence(tmp_path, pytestconfig):
     assert spawned_pids, "Real agy CLI subprocess did not start in time"
     cli_pid = spawned_pids[0]
 
-    preempted = supervisor.preempt_worker("PREEMPT-AGY-04")
-    assert preempted is not None
-    assert preempted.status == "PREEMPTED"
-    assert proc.future.done() is True
-    assert not is_pid_alive(cli_pid), f"agy CLI PID {cli_pid} survived preemption!"
-
-    ws_dir = tmp_path / "scratch" / "ws_PREEMPT-AGY-04_att1"
-    assert not (ws_dir / "trace.jsonl").exists(), "Worker thread wrote trace.jsonl after preemption!"
-    supervisor.shutdown_all()
+    try:
+        _assert_preemption_is_quiescent(supervisor, proc, "PREEMPT-AGY-04", cli_pid, launcher, "agy")
+    finally:
+        supervisor.shutdown_all()

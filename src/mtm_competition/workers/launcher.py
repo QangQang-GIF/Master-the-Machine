@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import inspect
 import json
+import os
 import time
 from pathlib import Path
 from typing import Any, Callable, Dict, Optional, Tuple
@@ -14,6 +15,40 @@ from mtm_competition.routing.prompt_builder import PromptBuilder
 from mtm_competition.routing.skill_router import SkillRouter
 from mtm_competition.routing.model_router import ModelRouter
 from mtm_competition.workers.workspace import WorkspaceManager
+
+
+def _write_task_file_guarded(target: Path, content: str, cancel_event: Optional[Any]) -> bool:
+    """Write `target` atomically unless cancelled; return False (leaving no TASK.md) if cancelled.
+
+    Cancellation is checked before the write, again right before the atomic publish (`os.replace`),
+    and once more after publishing; if cancellation landed in any of those windows the file is removed.
+    Combined with WorkerSupervisor quiescence (cancel -> join worker thread) and scheduler quarantine,
+    no attempt can observe or reuse a workspace that an un-quiesced worker may still touch.
+    """
+    def _cancelled() -> bool:
+        return cancel_event is not None and cancel_event.is_set()
+
+    if _cancelled():
+        return False
+    tmp = target.with_name(target.name + ".tmp")
+    try:
+        tmp.write_text(content, encoding="utf-8")
+        if _cancelled():
+            return False
+        os.replace(tmp, target)
+        if _cancelled():
+            try:
+                target.unlink()
+            except FileNotFoundError:
+                pass
+            return False
+        return True
+    finally:
+        if tmp.exists():
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
 
 
 class WorkerLauncher:
@@ -97,22 +132,21 @@ class WorkerLauncher:
                 ws_path,
             )
 
-        # Build prompt & write TASK.md
+        # Build prompt & write TASK.md (atomic write; re-checked against cancellation at the check/write boundary)
         prompt_content = PromptBuilder.build_prompt(env_dict, selected_skills=skills)
-        if cancel_event is not None and cancel_event.is_set():
+        if not _write_task_file_guarded(ws_path / "TASK.md", prompt_content, cancel_event):
             return (
                 WorkerResult(
                     task_id=env_dict["task_id"],
                     status=WorkerStatus.TIMED_OUT,
                     skill_ids=skills,
-                    unresolved_risks=["Worker cancelled before writing TASK.md"],
+                    unresolved_risks=["Worker cancelled while writing TASK.md"],
                     model=model,
                     effort=effort,
                 ),
                 ExecutionTrace(),
                 ws_path,
             )
-        (ws_path / "TASK.md").write_text(prompt_content, encoding="utf-8")
 
         kickoff = (
             f"Read TASK.md and complete the backlog item {env_dict['task_id']} now. "

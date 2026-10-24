@@ -1,10 +1,10 @@
-# MTM 2026 Skill System — End-to-End Verification Report (E2E)
+﻿# MTM 2026 Skill System — End-to-End Verification Report (E2E)
 
 **Generated:** 2026-10-23  
 **Branch:** `main`  
 **Test Runner:** `pytest 9.1.1` on Python 3.12 (win32)  
 **Readiness Status:** **SIMULATION-VERIFIED | LIVE STAGING & CODEX-CLI GATED ON ENVIRONMENT PROVISIONING**  
-**Default CI/Offline Suite:** **117 PASSED, 13 SKIPPED (GATED), 0 FAILED** (130 Collected)
+**Default CI/Offline Suite:** **120 PASSED, 13 SKIPPED (GATED), 0 FAILED** (133 Collected)
 
 ---
 
@@ -22,6 +22,8 @@ This report documents the end-to-end verification and remediation of the MTM 202
    - **Transient vs Permanent `start_working` / `get_mvs` Classification & Strict Cooldown Enforcement:** Transient errors (HTTP 429/5xx/408, network timeouts, `MVSLockedError`) retry with exponential backoff and requeue to `QUEUED` with a strict cooldown (`select_next_task()` returns `None` if all queued tasks are on cooldown, preventing retry budget burn during outages), only transitioning to `REJECTED` on permanent 4xx errors or after exhausting `start_working_max_requeues`.
    - **Server-First Crash Reconciliation, PID Reuse Protection & Fencing Tokens:** `TaskStore.reconcile_orphaned_tasks` verifies OS process creation timestamps (`active_pid_started_at` via `is_expected_worker_pid`) before terminating orphaned worker PIDs (preventing false-positive kills if the OS recycles a stale PID), rotates per-attempt `fencing_token` values (enforced across `RUNNING -> VERIFYING -> READY_TO_SUBMIT -> SUBMIT_IN_FLIGHT`), and reconciles `ASSIGNED`/`RUNNING`/`VERIFYING` tasks against Game Master `get_submission_status` before requeuing.
    - **Fail-Closed `READY_TO_SUBMIT` Recovery with Git Re-verification:** `TournamentScheduler` preserves `READY_TO_SUBMIT` tasks without downgrading them to `QUEUED`, and `CompetitionOrchestrator._resume_ready_to_submit` validates `verified_result_json`, required evidence on disk, and Git commit integrity via `GitGuard.verify_head` (failing closed by clearing corrupted checkpoints and requeuing to `QUEUED` rather than fabricating unverified submissions).
+   - **Un-quiesced Worker Quarantine:** `WorkerSupervisor._quiesce_worker` returns whether the worker thread truly stopped (`quiesced`). A cancelled worker that is still alive is never forgotten: it moves to a pending-cleanup table, `launch_async` refuses a new attempt for that task, `TournamentScheduler` quarantines the task (holds its capacity slot and excludes it from selection), and the orchestrator requeues it only after `reap_pending_cleanup()` confirms the old thread exited (`WORKER_NOT_QUIESCED_QUARANTINED` / `WORKER_QUIESCED_RELEASED` events).
+   - **Guarded `TASK.md` Write:** `_write_task_file_guarded` checks cancellation before the write, before the atomic `os.replace` publish, and after it (removing the file if cancel landed in any window); tested by injecting cancellation exactly at each boundary.
 
 ---
 
@@ -31,12 +33,12 @@ This report documents the end-to-end verification and remediation of the MTM 202
 
 | Tier | Category | Collected | Passed (Default) | Skipped (Default) | Failed | Notes |
 |---|---|:---:|:---:|:---:|:---:|---|
-| **Core** | Unit, Contracts, Scheduler, Store, Runtime | 107 | 105 | 2 | 0 | 2 live smoke tests skipped in default run (run via `-m live_cli`) |
+| **Core** | Unit, Contracts, Scheduler, Store, Runtime | 110 | 108 | 2 | 0 | 2 live smoke tests skipped in default run (run via `-m live_cli`) |
 | **E2E-A** | Component Integration & Fault-Injection | 10 | 10 | 0 | 0 | 100% deterministic pass, 0 skips |
 | **E2E-B** | Full 12-Event Tournament Lifecycle | 1 | 1 | 0 | 0 | Full match lifecycle simulation passed, 0 skips |
 | **E2E-C** | Real CLI Execution | 8 | 0 | 8 | 0 | Marker-gated (`-m live_cli`); 4 agy passed live, 4 codex blocked |
 | **E2E-D** | Game Master Staging Integration | 4 | 1 | 3 | 0 | Production safety check passed; 3 staging-gated |
-| **TOTAL** | **All Categories** | **130** | **117** | **13** | **0** | **100% pass rate in CI/default suite** |
+| **TOTAL** | **All Categories** | **133** | **120** | **13** | **0** | **100% pass rate in CI/default suite** |
 
 ---
 
@@ -110,3 +112,39 @@ Suite: `tests/e2e/test_e2e_d_staging_gm.py` (run with `-m staging_game_master`)
   Guarantees test runners never connect to production tournament hosts (`prod.mtm2026.org`, `contest.mtm2026.org`).
 - **Live Staging Endpoint Contract:** **BLOCKED (SKIPPED)**  
   Cleanly gated until staging credentials (`MTM_GM_STAGING_URL`, `MTM_GM_TOKEN`) are provisioned by the tournament organizers.
+
+
+
+---
+
+## 3. Reliability Benchmarks (`scripts/bench_reliability.py`)
+
+Measured on Windows / Python 3.12 (5 runs per metric). Budgets are p95 gates; the script exits non-zero if any budget is exceeded.
+
+| Metric | Median | p95 | Budget |
+|---|---:|---:|---:|
+| Process-tree kill (parent + grandchild) | 115 ms | 122 ms | 3000 ms |
+| Supervisor preempt (cooperative worker) | 5 ms | 5 ms | 1500 ms |
+| Supervisor preempt (real subprocess tree) | 113 ms | 116 ms | 4000 ms |
+| Hung worker: bounded quiesce wait (`quiesce_timeout=0.5s`) | 497 ms | 539 ms | 1500 ms |
+| `CodexRuntime` mid-`communicate()` cancel | 115 ms | 139 ms | 3000 ms |
+| `select_next_task` with 1000 queued tasks | 41 ms | 41 ms | 1500 ms |
+| `TaskStore.add_task` (per task) | 0.53 ms | 0.54 ms | 5 ms |
+| `reconcile_orphaned_tasks` (100 orphans) | 98 ms | 103 ms | 1000 ms |
+| Guarded atomic `TASK.md` write | 0.8 ms | 0.85 ms | 50 ms |
+
+Finding & fix from the first benchmark pass: SQLite in rollback-journal mode gave `add_task` ≈ 13.7 ms and `reconcile` p95 ≈ 2.7 s (high variance from per-commit fsync). `TaskStore` now uses `journal_mode=WAL` with `synchronous=FULL` (every commit stays durable, so the once-only submission ledger is not weakened), giving ~26x faster `add_task` and ~26x lower `reconcile` p95. `TaskStore.close()` was also added: the benchmark showed the DB file handle was never released on Windows.
+
+---
+
+## 4. Known Gaps (honest status)
+
+| Gap | Status | Required action |
+|---|---|---|
+| Real `codex` binary (no shim) | **NOT VERIFIED.** `codex` is not installed on this machine; the live Codex tests and smoke tests are skipped as BLOCKED, not PASS | On the contest runner: `MTM_LIVE_CLI=1 pytest tests/e2e/test_e2e_c_live_cli.py tests/test_smoke_worker.py -m live_cli -rs` and confirm 0 skips |
+| Real `agy` binary | Verified: live timeout + preemption pass with strengthened assertions (worker quiesced, CLI dead, real workspace tree frozen) | none |
+| Live Game Master staging | **NOT VERIFIED** (3 tests gated on credentials) | Run `pytest -m staging_game_master` with `MTM_GM_STAGING_URL` / `MTM_GM_TOKEN` |
+| Python 3.13 | Not installed locally; covered by the CI matrix only | Confirm green CI on 3.13 |
+| Linux/POSIX process-group paths | Mock-tested + CI (ubuntu); not executed locally on Linux. Benchmark CI step is `continue-on-error` until baselined | Confirm green CI |
+| `active_pid` of a quarantined (hung) worker | Cleared by fencing invalidation, so crash recovery would not kill a still-alive hung worker after a restart | Low risk (cancel signalled and process tree killed); follow-up candidate |
+| Hung worker thread occupies a `ThreadPoolExecutor` slot | Quarantine prevents reuse of the task, but the pool slot stays busy until the thread exits | Keep `max_workers` above the concurrency limit (default 2 vs 1) |

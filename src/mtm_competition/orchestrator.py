@@ -428,8 +428,39 @@ class CompetitionOrchestrator:
             "pushed": pushed_flag,
         }
 
+    def _release_quiesced_workers(self) -> List[str]:
+        """Re-check cancelled-but-stuck workers; release quarantine (and requeue) only once they truly stopped."""
+        released = self.supervisor.reap_pending_cleanup()
+        for tid in released:
+            if self.scheduler.is_quarantined(tid):
+                requeued = self.scheduler.release_quarantine(tid)
+                self.store.record_event(
+                    tid,
+                    "WORKER_QUIESCED_RELEASED",
+                    TaskState.RUNNING.value if requeued else None,
+                    TaskState.QUEUED.value if requeued else None,
+                    {"requeued": requeued},
+                )
+        return released
+
+    def _quarantine_unquiesced(self, task_id: str, reason: str, requeue_on_release: bool) -> None:
+        """Hold a task (and its capacity slot) while its cancelled worker thread is still alive."""
+        self.scheduler.quarantine_task(task_id)
+        if not requeue_on_release:
+            self.scheduler.running_tasks.pop(task_id, None)
+        logger.error("Worker for %s did not quiesce (%s); task quarantined until it stops", task_id, reason)
+        self.store.record_event(
+            task_id,
+            "WORKER_NOT_QUIESCED_QUARANTINED",
+            None,
+            None,
+            {"reason": reason, "requeue_on_release": requeue_on_release},
+        )
+
     def sync_backlog(self) -> int:
         """Poll backlog from Game Master, sync server clock, and register new items into TaskStore."""
+        self._release_quiesced_workers()
+
         # 1. Sync server clock and match status
         try:
             match_state = self.gm.get_match_state()
@@ -462,15 +493,23 @@ class CompetitionOrchestrator:
                 if preempt_task_id:
                     logger.warning("Preemption triggered by %s on %s", task_id, preempt_task_id)
                     preempted_proc = self.supervisor.preempt_worker(preempt_task_id)
-                    if not preempted_proc or preempted_proc.status != "COMPLETED":
-                        self.scheduler.requeue_task(preempt_task_id)
-                        self.store.record_event(
-                            preempt_task_id,
-                            "TASK_PREEMPTED",
-                            TaskState.RUNNING.value,
-                            TaskState.QUEUED.value,
-                            {"preempted_by": task_id},
+                    if preempted_proc is not None and preempted_proc.status == "COMPLETED":
+                        continue
+                    if preempted_proc is not None and not preempted_proc.quiesced:
+                        # Worker thread is still alive: do NOT requeue. Keep the capacity slot and block
+                        # re-selection until the old worker has genuinely stopped.
+                        self._quarantine_unquiesced(
+                            preempt_task_id, f"preempted_by={task_id}", requeue_on_release=True
                         )
+                        continue
+                    self.scheduler.requeue_task(preempt_task_id)
+                    self.store.record_event(
+                        preempt_task_id,
+                        "TASK_PREEMPTED",
+                        TaskState.RUNNING.value,
+                        TaskState.QUEUED.value,
+                        {"preempted_by": task_id},
+                    )
 
         return count
 
@@ -485,6 +524,7 @@ class CompetitionOrchestrator:
         6. Confirm two-phase grading status.
         """
         # Periodic grading reconciliation loop
+        self._release_quiesced_workers()
         if hasattr(self.gm, "get_submission_status"):
             try:
                 self.store.reconcile_grading_lifecycle(self.gm.get_submission_status)
@@ -508,6 +548,9 @@ class CompetitionOrchestrator:
             return None
 
         task_id = task_data["task_id"]
+        if self.supervisor.has_pending_cleanup(task_id) or self.scheduler.is_quarantined(task_id):
+            # Previous worker for this task is still alive: never start a new attempt on top of it.
+            return {"task_id": task_id, "status": "BLOCKED_PENDING_CLEANUP"}
         self.scheduler.assign_task(task_id)
 
         # Direct READY_TO_SUBMIT recovery path (do not re-run worker or start_working)
@@ -647,6 +690,13 @@ class CompetitionOrchestrator:
             # Distinguish based on supervisor's tracked status
             terminal_status = supervised_proc.status
             self.supervisor.unregister_worker(task_id)
+            if self.supervisor.has_pending_cleanup(task_id):
+                # Cancelled worker thread is still alive: quarantine (capacity held, no reuse of task/workspace)
+                self._quarantine_unquiesced(
+                    task_id,
+                    f"terminal_{terminal_status}",
+                    requeue_on_release=(terminal_status == "PREEMPTED"),
+                )
             self.store.invalidate_fencing_token(task_id, reason=f"terminal_{terminal_status}")
             att_num = getattr(supervised_proc, "attempt_number", attempt_num)
             unique_att_id = f"{task_id}_att{att_num}_{int(time.time() * 1000)}"
@@ -672,7 +722,7 @@ class CompetitionOrchestrator:
                 return {"task_id": task_id, "status": "TIMED_OUT", "error": "Worker exceeded time budget"}
             elif terminal_status == "PREEMPTED":
                 # Ensure running_tasks is cleaned up if preemption occurred outside sync_backlog
-                if task_id in self.scheduler.running_tasks:
+                if task_id in self.scheduler.running_tasks and not self.scheduler.is_quarantined(task_id):
                     self.scheduler.requeue_task(task_id)
                 return {"task_id": task_id, "status": "PREEMPTED"}
             elif terminal_status == "CANCELLED":

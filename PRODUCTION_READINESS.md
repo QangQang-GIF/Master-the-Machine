@@ -11,7 +11,7 @@
 | Requirement | Target Criteria | Actual Status | Verification Method |
 |---|---|:---:|---|
 | **Python Compatibility** | Python 3.12 & 3.13 | **PASS** | CI Matrix on Ubuntu & local Windows 3.12/3.13 verification |
-| **P0/P1/P2 Remediations** | 100% of P0/P1/P2 regression tests passing | **PASS** | 105 core tests + 12 component/tournament E2E tests pass (117 passed, 0 failed) |
+| **P0/P1/P2 Remediations** | 100% of P0/P1/P2 regression tests passing | **PASS** | 108 core tests + 12 component/tournament E2E tests pass (120 passed, 0 failed) |
 | **Independent QA & MVS** | Independent test re-verification in production | **PASS** | `QAGate` re-runs tests with real subprocesses and validates MVS |
 | **Remote Git Verification** | Commit SHA verified on remote before submit | **PASS** | `IntegrationGuard` and `GitGuard.verify_head(verify_pushed=True)` |
 | **Submission Idempotency** | Zero duplicate submissions on network timeouts | **PASS** | `SubmissionGuard` uses UUID idempotency keys and reconciles in-flight |
@@ -103,6 +103,9 @@ python -m pytest tests --ignore=tests/e2e -v
 
 # 4. Run E2E tournament simulation suite (21 tests)
 python -m pytest tests/e2e/ -v
+
+# 5. Reliability benchmark gate (exit code != 0 if any latency budget is exceeded)
+python scripts/bench_reliability.py --repeat 5
 ```
 
 All commands must exit with returncode `0`.

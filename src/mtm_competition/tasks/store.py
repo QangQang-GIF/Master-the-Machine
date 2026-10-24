@@ -50,9 +50,31 @@ class TaskStore:
         self.db_path = str(db_path)
         if self.db_path != ":memory:":
             Path(self.db_path).parent.mkdir(parents=True, exist_ok=True)
-        self.conn = sqlite3.connect(self.db_path, check_same_thread=False)
+        self.conn = sqlite3.connect(self.db_path, check_same_thread=False, timeout=30.0)
         self.conn.row_factory = sqlite3.Row
+        if self.db_path != ":memory:":
+            try:
+                # WAL: far fewer fsyncs per commit and no reader/writer blocking.
+                # synchronous=FULL keeps every commit durable (the once-only submission ledger must not lose rows).
+                self.conn.execute("PRAGMA journal_mode=WAL")
+                self.conn.execute("PRAGMA synchronous=FULL")
+                self.conn.execute("PRAGMA busy_timeout=30000")
+            except sqlite3.DatabaseError:
+                pass
         self._init_tables()
+
+    def close(self) -> None:
+        """Close the underlying SQLite connection (releases the DB file handle; required on Windows)."""
+        try:
+            self.conn.close()
+        except Exception:
+            pass
+
+    def __enter__(self) -> "TaskStore":
+        return self
+
+    def __exit__(self, *exc: Any) -> None:
+        self.close()
 
     def _init_tables(self) -> None:
         with self.conn:

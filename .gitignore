@@ -40,3 +40,8 @@ AI-Arena/arena/data/results/
 AI-Arena/arena/data/catalog.jsonl
 
 .superpowers/
+
+# runtime/benchmark artifacts
+bench_results.json
+*.db-wal
+*.db-shm

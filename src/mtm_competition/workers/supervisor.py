@@ -46,8 +46,13 @@ class SupervisedProcess:
 class WorkerSupervisor:
     """Supervises active worker processes and handles async dispatch, timeouts, and preemption."""
 
-    def __init__(self, max_workers: int = 2):
+    def __init__(self, max_workers: int = 2, quiesce_timeout: float = 5.0):
         self._active_workers: Dict[str, SupervisedProcess] = {}
+        # Workers that were cancelled/preempted/timed-out but whose thread has NOT yet finished.
+        # They are kept here (never silently dropped) until `reap_pending_cleanup()` confirms quiescence.
+        self._pending_cleanup: Dict[str, List[SupervisedProcess]] = {}
+        self._pending_lock = threading.Lock()
+        self.quiesce_timeout = quiesce_timeout
         self._executor = concurrent.futures.ThreadPoolExecutor(max_workers=max_workers)
 
     def register_worker(
@@ -114,6 +119,10 @@ class WorkerSupervisor:
     ) -> SupervisedProcess:
         """Asynchronously dispatch worker execution wrapped in a supervised future."""
         task_id = envelope.task_id
+        if self.has_pending_cleanup(task_id):
+            raise RuntimeError(
+                f"Cannot launch new attempt for {task_id}: previous worker has not quiesced (pending cleanup)"
+            )
         proc = self.register_worker(
             task_id=task_id,
             attempt_number=attempt_number,
@@ -202,13 +211,16 @@ class WorkerSupervisor:
         self,
         proc: SupervisedProcess,
         target_status: str,
-        join_timeout: float = 5.0,
+        join_timeout: Optional[float] = None,
     ) -> bool:
         """Atomically signal cancellation, kill subprocess tree, and wait for worker thread quiescence.
 
         Continuously monitors and terminates any late-registered subprocess handles until the
         worker future finishes (or `join_timeout` elapses), and records `proc.quiesced`.
+        `join_timeout` defaults to `self.quiesce_timeout` when passed as None.
         """
+        if join_timeout is None:
+            join_timeout = self.quiesce_timeout
         with proc._lock:
             proc.cancel_event.set()
             proc.status = target_status
@@ -224,7 +236,7 @@ class WorkerSupervisor:
         if not proc.future.done():
             proc.future.cancel()
 
-        deadline = time.monotonic() + max(0.1, float(join_timeout))
+        deadline = time.monotonic() + max(0.05, float(join_timeout))
         while not proc.future.done() and time.monotonic() < deadline:
             with proc._lock:
                 cur_handle = proc.subprocess_handle
@@ -295,7 +307,64 @@ class WorkerSupervisor:
         return self.terminate_all("CANCELLED")
 
     def unregister_worker(self, task_id: str) -> Optional[SupervisedProcess]:
-        return self._active_workers.pop(task_id, None)
+        """Remove worker from the active table.
+
+        If the worker was cancelled but its thread is still alive (quiesced=False), it is moved to the
+        pending-cleanup table instead of being forgotten, so the scheduler can refuse to reuse its task/workspace.
+        """
+        proc = self._active_workers.pop(task_id, None)
+        if (
+            proc is not None
+            and proc.cancel_event.is_set()
+            and proc.future is not None
+            and not proc.future.done()
+        ):
+            proc.quiesced = False
+            with self._pending_lock:
+                self._pending_cleanup.setdefault(task_id, []).append(proc)
+        return proc
+
+    def has_pending_cleanup(self, task_id: Optional[str] = None) -> bool:
+        """True if any (or the given task's) cancelled worker thread has not yet fully stopped."""
+        with self._pending_lock:
+            if task_id is None:
+                return any(self._pending_cleanup.values())
+            return bool(self._pending_cleanup.get(task_id))
+
+    def pending_cleanup_task_ids(self) -> List[str]:
+        with self._pending_lock:
+            return [tid for tid, procs in self._pending_cleanup.items() if procs]
+
+    def reap_pending_cleanup(self) -> List[str]:
+        """Re-attempt termination of stuck workers; return task_ids whose workers are now fully quiesced."""
+        released: List[str] = []
+        with self._pending_lock:
+            items = list(self._pending_cleanup.items())
+        for tid, procs in items:
+            still_alive: List[SupervisedProcess] = []
+            for p in procs:
+                if p.future is None or p.future.done():
+                    handle = p.subprocess_handle
+                    if handle is not None:
+                        poll_fn = getattr(handle, "poll", None)
+                        if not callable(poll_fn) or poll_fn() is None:
+                            terminate_process_tree(handle)
+                    p.quiesced = True
+                    continue
+                with p._lock:
+                    handle = p.subprocess_handle
+                if handle is not None:
+                    poll_fn = getattr(handle, "poll", None)
+                    if not callable(poll_fn) or poll_fn() is None:
+                        terminate_process_tree(handle)
+                still_alive.append(p)
+            with self._pending_lock:
+                if still_alive:
+                    self._pending_cleanup[tid] = still_alive
+                else:
+                    self._pending_cleanup.pop(tid, None)
+                    released.append(tid)
+        return released
 
     def is_timed_out(self, task_id: str) -> bool:
         proc = self._active_workers.get(task_id)

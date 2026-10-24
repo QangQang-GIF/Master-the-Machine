@@ -26,6 +26,9 @@ class TournamentScheduler:
         self.match_start_time = time.time()
         self.running_tasks: Dict[str, Dict[str, Any]] = {}
         self.cooldown_until: Dict[str, float] = {}
+        # Tasks whose previous worker was cancelled but has not yet fully stopped (thread still alive).
+        # They keep consuming capacity and must not be re-selected until their worker quiesces.
+        self.quarantined: set[str] = set()
 
         # Server clock synchronization
         self.clock_offset: float = 0.0
@@ -33,6 +36,21 @@ class TournamentScheduler:
         self.last_sync_time: float = time.time()
         self.match_status: str = "RUNNING"
         self.is_paused: bool = False
+
+    def quarantine_task(self, task_id: str) -> None:
+        """Block re-selection of a task (and hold its capacity slot) until its old worker has quiesced."""
+        self.quarantined.add(task_id)
+
+    def release_quarantine(self, task_id: str) -> bool:
+        """Release quarantine; if the task still holds a running slot, return it to QUEUED. Returns True if requeued."""
+        self.quarantined.discard(task_id)
+        if task_id in self.running_tasks:
+            self.requeue_task(task_id)
+            return True
+        return False
+
+    def is_quarantined(self, task_id: str) -> bool:
+        return task_id in self.quarantined
 
     def set_cooldown(self, task_id: str, duration_seconds: float = 15.0) -> None:
         """Temporarily deprioritize a task after a transient failure so other ready tasks can run."""
@@ -88,7 +106,7 @@ class TournamentScheduler:
 
     @property
     def active_worker_count(self) -> int:
-        return len(self.running_tasks)
+        return len(set(self.running_tasks) | self.quarantined)
 
     @property
     def has_capacity(self) -> bool:
@@ -116,7 +134,9 @@ class TournamentScheduler:
         ready_tasks = [
             t
             for t in self.store.list_tasks(status=TaskState.READY_TO_SUBMIT.value)
-            if not self.store.has_submitted(t["task_id"]) and not self.is_on_cooldown(t["task_id"])
+            if not self.store.has_submitted(t["task_id"])
+            and not self.is_on_cooldown(t["task_id"])
+            and not self.is_quarantined(t["task_id"])
         ]
         if ready_tasks:
             pq_ready = PriorityQueue()
@@ -127,7 +147,11 @@ class TournamentScheduler:
         queued_tasks = self.store.list_tasks(status=TaskState.QUEUED.value)
 
         # Strictly ignore any task that has already been submitted
-        queued_tasks = [t for t in queued_tasks if not self.store.has_submitted(t["task_id"])]
+        queued_tasks = [
+            t
+            for t in queued_tasks
+            if not self.store.has_submitted(t["task_id"]) and not self.is_quarantined(t["task_id"])
+        ]
         if not queued_tasks:
             return None
 

@@ -1345,3 +1345,186 @@ def test_crash_recovery_pid_reuse_protection_does_not_kill_unrelated_process(tmp
         if innocent_proc.poll() is None:
             innocent_proc.kill()
             innocent_proc.wait(timeout=5)
+
+
+# ---------------------------------------------------------------------------
+# Review round: un-quiesced workers must never be unregistered/requeued/reused
+# ---------------------------------------------------------------------------
+
+def _make_hung_worker(release_event, started_event, ignore_cancel=True):
+    """Worker that ignores cancellation (simulates a hung/unresponsive worker thread)."""
+    def hung_worker(env, attempt_number=1, on_process_start=None, cancel_event=None):
+        started_event.set()
+        release_event.wait(timeout=30)
+        return WorkerResult(task_id=env.task_id, status=WorkerStatus.READY_FOR_REVIEW), ExecutionTrace(), Path(".")
+    return hung_worker
+
+
+def test_preempt_worker_not_quiesced_is_tracked_as_pending_cleanup_and_blocks_relaunch(tmp_path):
+    """P1: preempt_worker() on a hung worker must report quiesced=False, keep it in pending-cleanup
+    (not silently forgotten), refuse a new attempt for the same task, and release only after it truly stops."""
+    import threading
+
+    supervisor = WorkerSupervisor(max_workers=2, quiesce_timeout=0.2)
+    release, started = threading.Event(), threading.Event()
+    env = TaskEnvelope(
+        task_id="CR-HUNG-01", task_type="CR", title="Hung", description="Ignores cancel",
+        repository_path=str(tmp_path), time_budget_seconds=60,
+    )
+    try:
+        supervisor.launch_async(_make_hung_worker(release, started), env)
+        assert started.wait(timeout=3)
+
+        t0 = time.monotonic()
+        proc = supervisor.preempt_worker("CR-HUNG-01")
+        assert time.monotonic() - t0 < 2.0, "quiesce must be bounded by quiesce_timeout"
+        assert proc is not None and proc.status == "PREEMPTED"
+        assert proc.quiesced is False
+        assert supervisor.active_worker_count() == 0
+        assert supervisor.has_pending_cleanup("CR-HUNG-01") is True
+        assert supervisor.pending_cleanup_task_ids() == ["CR-HUNG-01"]
+
+        # A new attempt for the same task must be refused while the old thread is alive
+        with pytest.raises(RuntimeError, match="not quiesced"):
+            supervisor.launch_async(_make_hung_worker(release, started), env)
+
+        # Still hung -> reaping releases nothing
+        assert supervisor.reap_pending_cleanup() == []
+        assert supervisor.has_pending_cleanup("CR-HUNG-01") is True
+
+        # Worker finally stops -> reaping releases it
+        release.set()
+        deadline = time.monotonic() + 3
+        released = []
+        while time.monotonic() < deadline and not released:
+            released = supervisor.reap_pending_cleanup()
+            time.sleep(0.02)
+        assert released == ["CR-HUNG-01"]
+        assert supervisor.has_pending_cleanup() is False
+        assert proc.quiesced is True
+    finally:
+        release.set()
+        supervisor.shutdown_all()
+
+
+def test_orchestrator_does_not_requeue_or_reschedule_preempted_task_until_worker_quiesces(tmp_path):
+    """P1: PI preempts a hung CR. CR must stay quarantined (RUNNING, capacity held, never re-selected,
+    no new attempt/workspace) and only be requeued once the old worker thread has really stopped."""
+    import threading
+
+    backlog = [{
+        "task_id": "CR-HUNG-02", "task_type": "CR", "title": "CR", "description": "d",
+        "points": 200, "time_budget_seconds": 600,
+    }]
+    gm = MagicMock()
+    gm.get_match_state.return_value = {"status": "RUNNING", "remaining_seconds": 1800}
+    gm.list_backlog.side_effect = lambda: list(backlog)
+
+    orch = CompetitionOrchestrator(
+        gm_adapter=gm, repository_path=tmp_path, scratch_dir=tmp_path / "scratch",
+        db_path=":memory:", push_to_remote=False,
+    )
+    orch.supervisor.quiesce_timeout = 0.2
+    orch.sync_backlog()
+
+    release, started = threading.Event(), threading.Event()
+    env = TaskEnvelope(
+        task_id="CR-HUNG-02", task_type="CR", title="CR", description="d",
+        repository_path=str(tmp_path), time_budget_seconds=600, points=200,
+    )
+    try:
+        orch.scheduler.select_next_task()
+        orch.scheduler.assign_task("CR-HUNG-02")
+        orch.supervisor.launch_async(_make_hung_worker(release, started), env)
+        assert started.wait(timeout=3)
+
+        backlog.append({
+            "task_id": "PI-URGENT-HUNG", "task_type": "PI", "title": "PI", "description": "urgent",
+            "points": 500, "time_budget_seconds": 60,
+        })
+        orch.sync_backlog()
+
+        # Not requeued: still RUNNING, quarantined, capacity held, nothing selectable (concurrency=1)
+        assert orch.store.get_task("CR-HUNG-02")["status"] == TaskState.RUNNING.value
+        assert orch.scheduler.is_quarantined("CR-HUNG-02")
+        assert orch.scheduler.has_capacity is False
+        assert orch.scheduler.select_next_task() is None
+        events = [e["event_type"] for e in orch.store.get_events("CR-HUNG-02")]
+        assert "WORKER_NOT_QUIESCED_QUARANTINED" in events
+        assert "TASK_PREEMPTED" not in events
+
+        # step() must not start anything while the old worker is alive
+        with patch.object(orch.launcher, "launch") as mock_launch:
+            assert orch.step() is None
+            mock_launch.assert_not_called()
+        gm.start_working.assert_not_called()
+
+        # Old worker stops -> next sync releases quarantine and requeues
+        release.set()
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline and orch.scheduler.is_quarantined("CR-HUNG-02"):
+            orch.sync_backlog()
+            time.sleep(0.02)
+        assert not orch.scheduler.is_quarantined("CR-HUNG-02")
+        assert orch.store.get_task("CR-HUNG-02")["status"] == TaskState.QUEUED.value
+        assert orch.scheduler.has_capacity is True
+        assert orch.supervisor.has_pending_cleanup() is False
+        assert "WORKER_QUIESCED_RELEASED" in [e["event_type"] for e in orch.store.get_events("CR-HUNG-02")]
+        selected = orch.scheduler.select_next_task()
+        assert selected is not None  # PI (higher EV) or CR - both now schedulable again
+    finally:
+        release.set()
+        orch.supervisor.shutdown_all()
+
+
+def test_task_md_write_race_at_check_write_boundary_never_leaves_file_after_cancel(tmp_path, monkeypatch):
+    """P2: cancellation landing exactly between the cancel check and the write/publish of TASK.md
+    must leave no TASK.md behind and must never reach runtime.run()."""
+    import threading
+    import mtm_competition.workers.launcher as launcher_mod
+    from mtm_competition.workers.launcher import WorkerLauncher
+    from mtm_core.git import git_init, run_git
+
+    repo_dir = tmp_path / "repo"
+    git_init(repo_dir)
+    (repo_dir / "app.py").write_text("x = 1\n", encoding="utf-8")
+    run_git(repo_dir, ["add", "app.py"])
+    run_git(repo_dir, ["commit", "-m", "init"])
+
+    runtime = MagicMock()
+    launcher = WorkerLauncher(scratch_dir=tmp_path / "scratch", runtime=runtime, backend="codex")
+    env = TaskEnvelope(
+        task_id="BUG-RACE-TASKMD", task_type="BUG", title="t", description="d",
+        repository_path=str(repo_dir), time_budget_seconds=30,
+    )
+
+    # Inject cancellation at each boundary: (a) right before os.replace publishes TASK.md,
+    # (b) right after os.replace has published it.
+    real_replace = os.replace
+    for inject_at in ("before_replace", "after_replace"):
+        cancel = threading.Event()
+
+        def racing_replace(src, dst, _mode=inject_at, _cancel=cancel):
+            if _mode == "before_replace":
+                _cancel.set()
+            real_replace(src, dst)
+            if _mode == "after_replace":
+                _cancel.set()
+
+        monkeypatch.setattr(launcher_mod.os, "replace", racing_replace)
+        result, _trace, ws_path = launcher.launch(env, attempt_number=1 if inject_at == "before_replace" else 2, cancel_event=cancel)
+
+        assert result.status == WorkerStatus.TIMED_OUT, inject_at
+        assert not (ws_path / "TASK.md").exists(), f"TASK.md leaked after cancellation ({inject_at})"
+        assert not (ws_path / "TASK.md.tmp").exists(), f"temp file leaked ({inject_at})"
+        runtime.run.assert_not_called()
+        monkeypatch.setattr(launcher_mod.os, "replace", real_replace)
+
+    # Sanity: without cancellation TASK.md IS written and runtime is invoked
+    runtime.run.return_value = MagicMock(
+        trace=ExecutionTrace(), elapsed=0.1, timed_out=False, exit_code=0,
+        usage={"total_tokens": 0, "billable_tokens": 0},
+    )
+    result, _trace, ws_path = launcher.launch(env, attempt_number=3, cancel_event=threading.Event())
+    assert (ws_path / "TASK.md").exists()
+    runtime.run.assert_called_once()
