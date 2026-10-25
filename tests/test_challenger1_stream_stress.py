@@ -242,6 +242,130 @@ def test_asymmetric_burst_contention_100kb_stdout_vs_10mb_stderr():
             proc.wait(timeout=2.0)
 
 
+def test_asymmetric_burst_contention_9mb_stdout_vs_3mb_stderr():
+    """Verify asymmetric bursts (9MB stdout vs 3MB stderr) respect aggregate 10.1MB RAM ceiling and keep markers."""
+    chunk_size = 65536
+    code = (
+        f"import sys\n"
+        f"chunk_size = {chunk_size}\n"
+        f"out_head = b'HEAD_OUT_9MB' + b'O' * (chunk_size - 12)\n"
+        f"out_mid = b'O' * chunk_size\n"
+        f"out_tail = b'O' * (chunk_size - 12) + b'TAIL_OUT_9MB'\n"
+        f"err_head = b'HEAD_ERR_3MB' + b'E' * (chunk_size - 12)\n"
+        f"err_mid = b'E' * chunk_size\n"
+        f"err_tail = b'E' * (chunk_size - 12) + b'TAIL_ERR_3MB'\n"
+        f"sys.stdout.buffer.write(out_head)\n"
+        f"sys.stderr.buffer.write(err_head)\n"
+        f"for _ in range(46):\n"
+        f"    sys.stdout.buffer.write(out_mid)\n"
+        f"    sys.stderr.buffer.write(err_mid)\n"
+        f"sys.stdout.buffer.write(out_mid)\n"
+        f"sys.stderr.buffer.write(err_tail)\n"
+        f"for _ in range(95):\n"
+        f"    sys.stdout.buffer.write(out_mid)\n"
+        f"sys.stdout.buffer.write(out_tail)\n"
+        f"sys.stdout.buffer.flush()\n"
+        f"sys.stderr.buffer.flush()\n"
+    )
+
+    proc = subprocess.Popen(
+        [sys.executable, "-c", code],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+
+    try:
+        t0 = time.monotonic()
+        stdout_text, stderr_text = CodexRuntime._communicate_with_pause(
+            proc, timeout=15.0, pause_event=None
+        )
+        elapsed = time.monotonic() - t0
+        proc.wait(timeout=5.0)
+
+        assert proc.returncode == 0
+        assert elapsed < 10.0, f"Draining 9MB vs 3MB took {elapsed:.2f}s, expected < 10.0s"
+
+        # AGGREGATE RAM BOUND: combined stdout + stderr in memory <= 10.1MB
+        combined_ram = len(stdout_text) + len(stderr_text)
+        max_aggregate_ram = 10 * 1024 * 1024 + 1000  # 10MB + notice strings <= 10.1MB
+        assert combined_ram <= max_aggregate_ram, (
+            f"Aggregate RAM bound exceeded: len(stdout)={len(stdout_text)}, len(stderr)={len(stderr_text)}, "
+            f"combined={combined_ram} bytes > {max_aggregate_ram} bytes ceiling!"
+        )
+
+        # Head and tail markers preserved on both streams
+        assert stdout_text.startswith("HEAD_OUT_9MB")
+        assert stdout_text.endswith("TAIL_OUT_9MB")
+        assert stderr_text.startswith("HEAD_ERR_3MB")
+        assert stderr_text.endswith("TAIL_ERR_3MB")
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait(timeout=2.0)
+
+
+def test_asymmetric_burst_contention_10mb_stdout_vs_4_5mb_stderr():
+    """Verify asymmetric bursts (10MB stdout vs 4.5MB stderr) respect aggregate 10.1MB RAM ceiling and keep markers."""
+    chunk_size = 65536
+    code = (
+        f"import sys\n"
+        f"chunk_size = {chunk_size}\n"
+        f"out_head = b'HEAD_OUT_10MB' + b'O' * (chunk_size - 13)\n"
+        f"out_mid = b'O' * chunk_size\n"
+        f"out_tail = b'O' * (chunk_size - 13) + b'TAIL_OUT_10MB'\n"
+        f"err_head = b'HEAD_ERR_4_5MB' + b'E' * (chunk_size - 14)\n"
+        f"err_mid = b'E' * chunk_size\n"
+        f"err_tail = b'E' * (chunk_size - 14) + b'TAIL_ERR_4_5MB'\n"
+        f"sys.stdout.buffer.write(out_head)\n"
+        f"sys.stderr.buffer.write(err_head)\n"
+        f"for _ in range(70):\n"
+        f"    sys.stdout.buffer.write(out_mid)\n"
+        f"    sys.stderr.buffer.write(err_mid)\n"
+        f"sys.stdout.buffer.write(out_mid)\n"
+        f"sys.stderr.buffer.write(err_tail)\n"
+        f"for _ in range(87):\n"
+        f"    sys.stdout.buffer.write(out_mid)\n"
+        f"sys.stdout.buffer.write(out_tail)\n"
+        f"sys.stdout.buffer.flush()\n"
+        f"sys.stderr.buffer.flush()\n"
+    )
+
+    proc = subprocess.Popen(
+        [sys.executable, "-c", code],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+
+    try:
+        t0 = time.monotonic()
+        stdout_text, stderr_text = CodexRuntime._communicate_with_pause(
+            proc, timeout=15.0, pause_event=None
+        )
+        elapsed = time.monotonic() - t0
+        proc.wait(timeout=5.0)
+
+        assert proc.returncode == 0
+        assert elapsed < 10.0, f"Draining 10MB vs 4.5MB took {elapsed:.2f}s, expected < 10.0s"
+
+        # AGGREGATE RAM BOUND: combined stdout + stderr in memory <= 10.1MB
+        combined_ram = len(stdout_text) + len(stderr_text)
+        max_aggregate_ram = 10 * 1024 * 1024 + 1000  # 10MB + notice strings <= 10.1MB
+        assert combined_ram <= max_aggregate_ram, (
+            f"Aggregate RAM bound exceeded: len(stdout)={len(stdout_text)}, len(stderr)={len(stderr_text)}, "
+            f"combined={combined_ram} bytes > {max_aggregate_ram} bytes ceiling!"
+        )
+
+        # Head and tail markers preserved on both streams
+        assert stdout_text.startswith("HEAD_OUT_10MB")
+        assert stdout_text.endswith("TAIL_OUT_10MB")
+        assert stderr_text.startswith("HEAD_ERR_4_5MB")
+        assert stderr_text.endswith("TAIL_ERR_4_5MB")
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait(timeout=2.0)
+
+
 # ==============================================================================
 # 3. ABRUPT PROCESS TERMINATION & BROKEN PIPE HANDLING
 # ==============================================================================

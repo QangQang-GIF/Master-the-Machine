@@ -124,6 +124,7 @@ class BoundedStreamBuffer:
         self.lock = threading.Lock()
         self.peer_buffer: Optional["BoundedStreamBuffer"] = None
         self.fair_share: int = max_bytes // 2
+        self.total_limit: int = max_bytes
 
         if isinstance(log_file, DiskLogWriter):
             self.disk_writer: Optional[DiskLogWriter] = log_file
@@ -141,16 +142,29 @@ class BoundedStreamBuffer:
     def _check_peer_budget(self) -> None:
         if self.peer_buffer is not None:
             peer_bytes = self.peer_buffer.total_bytes
-            if peer_bytes > self.fair_share and self.max_bytes > self.fair_share:
-                self._shrink_to(self.fair_share)
+            burst_margin = 100 * 1024
+            if peer_bytes <= burst_margin and self.total_bytes <= self.total_limit:
+                allowed = self.total_limit
+            else:
+                allowed = max(self.fair_share, self.total_limit - peer_bytes)
 
-    def _shrink_to(self, new_max: int) -> None:
-        if self.max_bytes <= new_max:
-            return
-        self.max_bytes = new_max
-        self.head_budget = new_max // 2
-        self.tail_budget = new_max - self.head_budget
+            if self.max_bytes > allowed:
+                self._shrink_to(allowed)
 
+            peer = self.peer_buffer
+            if self.total_bytes <= burst_margin and peer.total_bytes <= peer.total_limit:
+                peer_allowed = peer.total_limit
+            else:
+                peer_allowed = max(peer.fair_share, peer.total_limit - self.total_bytes)
+
+            if peer.max_bytes > peer_allowed:
+                if peer.lock.acquire(blocking=False):
+                    try:
+                        peer._shrink_to(peer_allowed)
+                    finally:
+                        peer.lock.release()
+
+    def _clamp_head(self) -> None:
         if self.head_bytes > self.head_budget:
             new_head: List[bytes] = []
             accum = 0
@@ -167,6 +181,7 @@ class BoundedStreamBuffer:
             self.head_chunks = new_head
             self.head_bytes = accum
 
+    def _clamp_tail(self) -> None:
         while self.tail_bytes > self.tail_budget and self.tail_chunks:
             excess = self.tail_bytes - self.tail_budget
             front = self.tail_chunks[0]
@@ -177,6 +192,17 @@ class BoundedStreamBuffer:
                 self.tail_chunks[0] = front[excess:]
                 self.tail_bytes -= excess
                 break
+
+    def _shrink_to(self, new_max: int) -> None:
+        if self.max_bytes <= new_max:
+            return
+        self.max_bytes = new_max
+        self.head_budget = new_max // 2
+        self.tail_budget = new_max - self.head_budget
+
+        if self.total_bytes > new_max:
+            self._clamp_head()
+            self._clamp_tail()
 
     def append(self, chunk: Any) -> None:
         if not chunk:
@@ -193,6 +219,9 @@ class BoundedStreamBuffer:
         with self.lock:
             self.total_bytes += chunk_len
             self._check_peer_budget()
+
+            if self.total_bytes > self.max_bytes:
+                self._clamp_head()
 
             # 1. Fill head buffer up to head_budget
             if self.head_bytes < self.head_budget:
@@ -217,16 +246,7 @@ class BoundedStreamBuffer:
             else:
                 self.tail_chunks.append(raw)
                 self.tail_bytes += chunk_len
-                while self.tail_bytes > self.tail_budget and self.tail_chunks:
-                    excess = self.tail_bytes - self.tail_budget
-                    front = self.tail_chunks[0]
-                    if len(front) <= excess:
-                        self.tail_chunks.popleft()
-                        self.tail_bytes -= len(front)
-                    else:
-                        self.tail_chunks[0] = front[excess:]
-                        self.tail_bytes -= excess
-                        break
+                self._clamp_tail()
 
     def get_text(self) -> str:
         with self.lock:
@@ -465,8 +485,10 @@ class CodexRuntime:
             stderr_buf = BoundedStreamBuffer(max_bytes=total_limit, log_file=disk_writer)
             stdout_buf.peer_buffer = stderr_buf
             stdout_buf.fair_share = fair_share
+            stdout_buf.total_limit = total_limit
             stderr_buf.peer_buffer = stdout_buf
             stderr_buf.fair_share = total_limit - fair_share
+            stderr_buf.total_limit = total_limit
         elif has_stdout:
             stdout_buf = BoundedStreamBuffer(max_bytes=total_limit, log_file=disk_writer)
             stderr_buf = BoundedStreamBuffer(max_bytes=0, log_file=disk_writer)
