@@ -149,7 +149,7 @@ def test_r4_bounded_stream_buffer_retains_head_and_rolling_tail_when_over_limit(
     result = buf.get_text()
     assert result.startswith("H" * 50)
     assert result.endswith("T" * 50)
-    assert "200 bytes truncated in memory to preserve 10MB RAM bound" in result
+    assert "output truncated: 200 bytes truncated in memory (no disk log configured)" in result
 
 
 def test_r4_bounded_stream_buffer_multibyte_utf8_boundary_integrity():
@@ -218,7 +218,8 @@ def test_r4_stream_stress_100mb_bounded_ram():
         # Verify diagnostic head and tail preservation
         assert stdout_text.startswith("HEAD_MARKER")
         assert stdout_text.endswith("TAIL_MARKER")
-        assert "truncated in memory to preserve 10MB RAM bound" in stdout_text
+        assert "output truncated:" in stdout_text
+        assert "bytes truncated in memory (no disk log configured)" in stdout_text
     finally:
         if proc.poll() is None:
             proc.kill()
@@ -393,7 +394,7 @@ def test_r4_truncation_notice_when_log_file_is_none():
     buf.append(b"T" * 50)
 
     result = buf.get_text()
-    assert "200 bytes truncated in memory to preserve 10MB RAM bound" in result
+    assert "output truncated: 200 bytes truncated in memory (no disk log configured)" in result
     assert "(no disk log configured)" in result
     assert "Full stream written to log_file" not in result
 
@@ -410,7 +411,7 @@ def test_r4_truncation_notice_when_log_file_is_provided(tmp_path):
     buf.close()
 
     result = buf.get_text()
-    assert "200 bytes truncated in memory to preserve 10MB RAM bound" in result
+    assert "output truncated: 200 bytes truncated in memory. Full stream written to log_file." in result
     assert "Full stream written to log_file." in result
     assert "(no disk log configured)" not in result
 
@@ -477,9 +478,207 @@ def test_r3_subprocess_60mb_stream_capped_at_50mb_disk_quota(tmp_path):
         disk_size = log_file.stat().st_size
         expected_quota = 50 * 1024 * 1024
         assert disk_size == expected_quota, f"Expected {expected_quota} bytes on disk, found {disk_size}!"
+
+        # Verify DISK_LOG_TRUNCATED notice with exact byte accounting (Requirement R4 Test 1)
+        expected_saved = expected_quota
+        expected_omitted_disk = total_bytes - expected_quota
+        expected_omitted_ram = total_bytes - 10 * 1024 * 1024
+        assert (
+            f"DISK_LOG_TRUNCATED: {expected_saved} bytes saved, {expected_omitted_disk} bytes omitted from disk"
+            in stdout_text
+        )
+        assert f"output truncated: {expected_omitted_ram} bytes truncated in memory" in stdout_text
+        assert "Disk log reached 50MB quota" in stdout_text
     finally:
         if proc.poll() is None:
             proc.kill()
             proc.wait(timeout=2.0)
+
+
+# ==============================================================================
+# Gen4 Requirements R1 & R3 Unit Tests
+# ==============================================================================
+
+def test_r1_disk_log_writer_properties_and_omission_tracking(tmp_path):
+    """R1: Verify DiskLogWriter tracks bytes_omitted and exposes properties is_truncated, bytes_written, bytes_omitted."""
+    from mtm_core.runtime.codex import DiskLogWriter
+
+    log_path = tmp_path / "writer_props.log"
+    writer = DiskLogWriter(log_path, max_bytes=1000)
+
+    assert writer.bytes_written == 0
+    assert writer.bytes_omitted == 0
+    assert not writer.is_truncated
+
+    # Write 600 bytes (within quota)
+    w1 = writer.write(b"A" * 600)
+    assert w1 == 600
+    assert writer.bytes_written == 600
+    assert writer.bytes_omitted == 0
+    assert not writer.is_truncated
+
+    # Write 600 bytes (partial overflow: 400 written, 200 omitted)
+    w2 = writer.write(b"B" * 600)
+    assert w2 == 400
+    assert writer.bytes_written == 1000
+    assert writer.bytes_omitted == 200
+    assert writer.is_truncated
+
+    # Write 500 bytes (full overflow: 0 written, 500 omitted)
+    w3 = writer.write(b"C" * 500)
+    assert w3 == 0
+    assert writer.bytes_written == 1000
+    assert writer.bytes_omitted == 700
+    assert writer.is_truncated
+
+    writer.close()
+    assert writer.bytes_written == 1000
+    assert writer.bytes_omitted == 700
+    assert writer.is_truncated
+
+
+def test_r1_diagnostic_notice_disk_log_truncated_exact_byte_reporting(tmp_path):
+    """R1: Verify BoundedStreamBuffer.get_text() produces DISK_LOG_TRUNCATED notice with exact byte counts."""
+    log_path = tmp_path / "truncated_diag.log"
+    max_disk = 1000
+    buf = BoundedStreamBuffer(max_bytes=200, log_file=log_path, max_disk_bytes=max_disk)
+
+    # Append 3000 bytes: 1000 written to disk, 2000 omitted from disk
+    # In-memory: 200 retained (100 head + 100 tail), 2800 omitted
+    buf.append(b"H" * 100)
+    buf.append(b"M" * 2800)
+    buf.append(b"T" * 100)
+    buf.close()
+
+    text = buf.get_text()
+    assert text.startswith("H" * 100)
+    assert text.endswith("T" * 100)
+    assert "output truncated: 2800 bytes truncated in memory" in text
+    assert "Disk log reached 1000B quota (DISK_LOG_TRUNCATED: 1000 bytes saved, 2000 bytes omitted from disk)" in text
+
+
+def test_r3_communicate_with_pause_parameter_backwards_compatibility():
+    """R3: Verify _communicate_with_pause accepts both max_total_buffer_bytes and legacy max_buffer_bytes."""
+    class DummyProc:
+        def __init__(self):
+            self.stdout = None
+            self.stderr = None
+            self.args = ["dummy"]
+            self.returncode = 0
+        def poll(self):
+            return 0
+        def communicate(self, timeout=None):
+            return "out", "err"
+
+    proc = DummyProc()
+    out, err = CodexRuntime._communicate_with_pause(proc, timeout=1.0, pause_event=None, max_total_buffer_bytes=5000)
+    assert out == "out" and err == "err"
+
+    out2, err2 = CodexRuntime._communicate_with_pause(proc, timeout=1.0, pause_event=None, max_buffer_bytes=5000)
+    assert out2 == "out" and err2 == "err"
+
+
+def test_r4_diagnostic_notice_all_three_modes(tmp_path):
+    """R4 Test 1: Verify BoundedStreamBuffer.get_text() accurately differentiates all 3 truncation modes."""
+    # Case 1: No disk log configured (log_file is None)
+    buf_no_disk = BoundedStreamBuffer(max_bytes=200, log_file=None)
+    buf_no_disk.append(b"H" * 100)
+    buf_no_disk.append(b"M" * 500)
+    buf_no_disk.append(b"T" * 100)
+    text1 = buf_no_disk.get_text()
+    assert "output truncated: 500 bytes truncated in memory (no disk log configured)" in text1
+    assert "DISK_LOG_TRUNCATED" not in text1
+    assert "Full stream written" not in text1
+
+    # Case 2: Disk quota reached (is_truncated is True)
+    log_capped = tmp_path / "capped.log"
+    buf_capped = BoundedStreamBuffer(max_bytes=200, log_file=log_capped, max_disk_bytes=500)
+    buf_capped.append(b"H" * 100)
+    buf_capped.append(b"M" * 1000)
+    buf_capped.append(b"T" * 100)
+    buf_capped.close()
+    text2 = buf_capped.get_text()
+    assert "output truncated: 1000 bytes truncated in memory" in text2
+    assert "Disk log reached 500B quota (DISK_LOG_TRUNCATED: 500 bytes saved, 700 bytes omitted from disk)" in text2
+    assert "Full stream written" not in text2
+
+    # Case 3: Full stream written to log_file without hitting quota
+    log_full = tmp_path / "full.log"
+    buf_full = BoundedStreamBuffer(max_bytes=200, log_file=log_full, max_disk_bytes=10000)
+    buf_full.append(b"H" * 100)
+    buf_full.append(b"M" * 500)
+    buf_full.append(b"T" * 100)
+    buf_full.close()
+    text3 = buf_full.get_text()
+    assert "output truncated: 500 bytes truncated in memory. Full stream written to log_file." in text3
+    assert "DISK_LOG_TRUNCATED" not in text3
+    assert "(no disk log configured)" not in text3
+
+
+def test_r4_subprocess_60mb_stream_reports_disk_log_truncated_exact_counts(tmp_path):
+    """R4 Test 1: Subprocess emitting 60MB with 50MB disk quota verifies get_text() contains DISK_LOG_TRUNCATED with exact saved and omitted counts."""
+    total_bytes = 60 * 1024 * 1024  # 62,914,560 bytes
+    chunk_size = 65536
+    iterations = total_bytes // chunk_size
+
+    code = (
+        f"import sys\n"
+        f"chunk_head = ('HEAD_60MB_' + 'A' * {chunk_size - 10}).encode('ascii')\n"
+        f"chunk_mid = ('A' * {chunk_size}).encode('ascii')\n"
+        f"chunk_tail = ('A' * {chunk_size - 10} + '_TAIL_60MB').encode('ascii')\n"
+        f"sys.stdout.buffer.write(chunk_head)\n"
+        f"for _ in range({iterations - 2}):\n"
+        f"    sys.stdout.buffer.write(chunk_mid)\n"
+        f"sys.stdout.buffer.write(chunk_tail)\n"
+        f"sys.stdout.buffer.flush()\n"
+    )
+
+    proc = subprocess.Popen(
+        [sys.executable, "-c", code],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+
+    log_file = tmp_path / "stream_quota_60mb_exact.log"
+
+    try:
+        t0 = time.monotonic()
+        stdout_text, stderr_text = CodexRuntime._communicate_with_pause(
+            proc, timeout=30.0, pause_event=None, log_file=log_file
+        )
+        elapsed = time.monotonic() - t0
+        proc.wait(timeout=5.0)
+
+        assert proc.returncode == 0
+        assert elapsed < 15.0, f"Draining 60MB took {elapsed:.2f}s, expected < 15.0s"
+        assert stderr_text == ""
+
+        # RAM bound verification (10MB + notice buffer <= 10.1MB)
+        assert len(stdout_text) <= 10 * 1024 * 1024 + 500
+        assert stdout_text.startswith("HEAD_60MB_")
+        assert stdout_text.endswith("_TAIL_60MB")
+
+        # Disk Quota capped at 50MB (52,428,800 bytes)
+        assert log_file.exists()
+        disk_size = log_file.stat().st_size
+        expected_quota = 50 * 1024 * 1024
+        assert disk_size == expected_quota, f"Expected {expected_quota} bytes on disk, found {disk_size}!"
+
+        # Exact byte counts verification (Requirement R4 Test 1)
+        expected_saved = expected_quota
+        expected_omitted_disk = total_bytes - expected_quota
+        expected_omitted_ram = total_bytes - 10 * 1024 * 1024
+        assert (
+            f"DISK_LOG_TRUNCATED: {expected_saved} bytes saved, {expected_omitted_disk} bytes omitted from disk"
+            in stdout_text
+        )
+        assert f"output truncated: {expected_omitted_ram} bytes truncated in memory" in stdout_text
+        assert "Disk log reached 50MB quota" in stdout_text
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait(timeout=2.0)
+
+
 
 

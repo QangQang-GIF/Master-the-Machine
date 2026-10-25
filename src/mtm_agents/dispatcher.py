@@ -74,6 +74,117 @@ def _remove_link_or_reparse(path: Path) -> None:
             raise
 
 
+def _get_intermediate_ancestors(dest: Path, ws: Path) -> list[Path]:
+    """Return all intermediate ancestor directories from ws down to dest.parent (inclusive)."""
+    norm_dest = Path(os.path.normpath(dest))
+    norm_ws = Path(os.path.normpath(ws))
+    if not norm_dest.is_relative_to(norm_ws) or norm_dest == norm_ws:
+        raise ValueError(
+            f"Agent configuration path '{dest}' resolves outside workspace root '{ws}'"
+        )
+    ancestors: list[Path] = []
+    curr = norm_dest.parent
+    while curr != norm_ws:
+        if not curr.is_relative_to(norm_ws):
+            raise ValueError(
+                f"Ancestor directory '{curr}' resolves outside workspace root '{ws}'"
+            )
+        ancestors.append(curr)
+        parent = curr.parent
+        if parent == curr:
+            raise ValueError(
+                f"Agent configuration path '{dest}' resolves outside workspace root '{ws}'"
+            )
+        curr = parent
+    return list(reversed(ancestors))
+
+
+def _prepare_and_verify_ancestors(dest: Path, ws: Path) -> None:
+    """Safely prepare and verify all intermediate ancestor directories top-down.
+
+    Ensures no external symlink, junction, or reparse point exists before creating any directory.
+    """
+    ancestors = _get_intermediate_ancestors(dest, ws)
+    for anc in ancestors:
+        # 1. Symlink / junction / reparse point check
+        if _is_link_or_reparse(anc):
+            try:
+                res = anc.resolve()
+            except (RuntimeError, OSError) as exc:
+                raise ValueError(f"Cannot resolve ancestor link '{anc}': {exc}") from exc
+            if not res.is_relative_to(ws) or res == ws:
+                raise ValueError(
+                    f"Agent configuration path '{anc}' is an external symlink pointing outside workspace: '{res}'"
+                )
+
+        # 2. General resolution check if it exists
+        if anc.exists() or _is_link_or_reparse(anc):
+            try:
+                res = anc.resolve()
+            except (RuntimeError, OSError) as exc:
+                raise ValueError(f"Cannot resolve ancestor directory '{anc}': {exc}") from exc
+            if not res.is_relative_to(ws) or res == ws:
+                raise ValueError(
+                    f"Agent configuration path '{anc}' resolves outside workspace root '{ws}': '{res}'"
+                )
+            if not anc.is_dir():
+                raise ValueError(f"Ancestor '{anc}' exists but is not a directory")
+
+        # 3. Create missing ancestor top-down without parents=True
+        if not anc.exists():
+            if _is_link_or_reparse(anc):
+                raise ValueError(f"Ancestor directory '{anc}' is a broken link or junction")
+            try:
+                anc.mkdir()
+            except FileExistsError:
+                pass
+
+            # Verify immediately after creation
+            if _is_link_or_reparse(anc):
+                try:
+                    res = anc.resolve()
+                except (RuntimeError, OSError) as exc:
+                    raise ValueError(f"Cannot resolve ancestor link '{anc}': {exc}") from exc
+                if not res.is_relative_to(ws) or res == ws:
+                    raise ValueError(
+                        f"Agent configuration path '{anc}' was created as external link or junction: '{res}'"
+                    )
+            if not anc.is_dir():
+                raise ValueError(f"Ancestor '{anc}' is not a directory")
+
+
+def _verify_ancestors_containment(dest: Path, ws: Path) -> None:
+    """Verify all intermediate ancestor directories exist, are directories,
+
+    and do not link or resolve outside workspace. Fail-closed immediately.
+    """
+    ancestors = _get_intermediate_ancestors(dest, ws)
+    for anc in ancestors:
+        if not anc.exists():
+            raise ValueError(f"Ancestor directory '{anc}' does not exist")
+        if not anc.is_dir():
+            raise ValueError(f"Ancestor '{anc}' exists but is not a directory")
+
+        if _is_link_or_reparse(anc):
+            try:
+                res = anc.resolve()
+            except (RuntimeError, OSError) as exc:
+                raise ValueError(f"Cannot resolve ancestor link '{anc}': {exc}") from exc
+            if not res.is_relative_to(ws) or res == ws:
+                raise ValueError(
+                    f"Agent configuration path '{anc}' is an external symlink pointing outside workspace: '{res}'"
+                )
+
+        try:
+            res = anc.resolve()
+        except (RuntimeError, OSError) as exc:
+            raise ValueError(f"Cannot resolve ancestor directory '{anc}': {exc}") from exc
+        if not res.is_relative_to(ws) or res == ws:
+            raise ValueError(
+                f"Agent configuration path '{anc}' resolves outside workspace root '{ws}': '{res}'"
+            )
+
+
 @dataclass(frozen=True)
 class FileBackup:
     path: Path
@@ -109,10 +220,14 @@ class FileBackup:
         dest = self.path
         ws = Path(workspace_root or self.workspace_root or self.path.parent).resolve()
 
-        if not dest.parent.exists():
-            dest.parent.mkdir(parents=True, exist_ok=True)
+        if not dest.is_absolute():
+            dest = ws / dest
+
+        # Phase 1: Top-down ancestor preparation and verification (strictly before any write or mkdir)
+        _prepare_and_verify_ancestors(dest, ws)
         _verify_workspace_containment(dest.parent, ws)
 
+        # Phase 2: Prepare destination path
         if _is_link_or_reparse(dest):
             _remove_link_or_reparse(dest)
         elif dest.exists():
@@ -123,13 +238,17 @@ class FileBackup:
 
         _verify_workspace_containment(dest, ws)
 
-        temp_dir = dest.parent if dest.parent.exists() else ws
+        # Phase 3: Create temporary file strictly inside verified dest.parent
+        _verify_ancestors_containment(dest, ws)
+        temp_dir = dest.parent
         tmp_file = tempfile.NamedTemporaryFile(dir=temp_dir, prefix=".restore_", delete=False)
         tmp_path = Path(tmp_file.name)
         try:
             tmp_file.write(self.content)
             tmp_file.flush()
             tmp_file.close()
+
+            _verify_workspace_containment(tmp_path, ws)
 
             if _is_link_or_reparse(dest):
                 _remove_link_or_reparse(dest)
@@ -139,7 +258,10 @@ class FileBackup:
                 except OSError:
                     pass
 
+            # Phase 4: Pre-replace ancestor re-verification (Anti-TOCTOU)
+            _verify_ancestors_containment(dest, ws)
             _verify_workspace_containment(dest, ws)
+            _verify_workspace_containment(tmp_path, ws)
             os.replace(tmp_path, dest)
         finally:
             if tmp_path.exists():
@@ -148,6 +270,7 @@ class FileBackup:
                 except OSError:
                     pass
 
+        # Phase 5: Post-replace verification and attribute restoration
         if dest.is_symlink() or _is_link_or_reparse(dest):
             raise ValueError(f"Restored file {dest} is still a symlink or junction")
 

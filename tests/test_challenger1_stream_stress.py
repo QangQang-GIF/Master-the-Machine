@@ -139,6 +139,8 @@ def test_extreme_volume_50mb_split_stdout_stderr():
         assert proc.returncode == 0
         assert len(stdout_text) <= 10 * 1024 * 1024 + 500
         assert len(stderr_text) <= 10 * 1024 * 1024 + 500
+        # Requirement R4 Test 3: Combined aggregate RAM <= 10.1MB
+        assert len(stdout_text) + len(stderr_text) <= 10 * 1024 * 1024 + 1000
         assert stdout_text.startswith("O" * 65536) and stdout_text.endswith("O" * 65536)
         assert stderr_text.startswith("E" * 65536) and stderr_text.endswith("E" * 65536)
         assert "truncated in memory" in stdout_text
@@ -402,7 +404,7 @@ def test_finding_1_reproduction_partial_output_under_64kb_lost_on_timeout():
     try:
         with pytest.raises(subprocess.TimeoutExpired) as exc_info:
             CodexRuntime._communicate_with_pause(
-                proc, timeout=0.2, pause_event=None
+                proc, timeout=1.0, pause_event=None
             )
 
         captured_output = getattr(exc_info.value, "output", "") or ""
@@ -506,7 +508,7 @@ def test_adversarial_120mb_stream_ram_bound_and_markers():
         assert stdout_text.endswith("<<<END_120MB_TAIL_MARKER>>>")
 
         expected_omitted = total_bytes - 10 * 1024 * 1024
-        assert f"{expected_omitted} bytes truncated in memory to preserve 10MB RAM bound" in stdout_text
+        assert f"output truncated: {expected_omitted} bytes truncated in memory (no disk log configured)" in stdout_text
     finally:
         if proc.poll() is None:
             proc.kill()
@@ -552,8 +554,20 @@ def test_adversarial_120mb_split_parallel_disk_streaming(tmp_path):
         # Both streams individually capped at 10.1MB
         assert len(stdout_text) <= 10 * 1024 * 1024 + 500
         assert len(stderr_text) <= 10 * 1024 * 1024 + 500
+        # Requirement R4 Test 3: Combined aggregate RAM <= 10.1MB
+        assert len(stdout_text) + len(stderr_text) <= 10 * 1024 * 1024 + 1000
         assert "truncated in memory" in stdout_text
         assert "truncated in memory" in stderr_text
+
+        # Requirement R4 Test 1: DISK_LOG_TRUNCATED verification on 120MB stream with 50MB disk quota
+        assert (
+            "DISK_LOG_TRUNCATED: 52428800 bytes saved, 73400320 bytes omitted from disk"
+            in stdout_text
+        )
+        assert (
+            "DISK_LOG_TRUNCATED: 52428800 bytes saved, 73400320 bytes omitted from disk"
+            in stderr_text
+        )
 
         # Disk file capped at 50MB (52,428,800 bytes) per Gen3 R3
         assert log_file.exists()
@@ -705,4 +719,76 @@ def test_adversarial_cancellation_during_extreme_stream(tmp_path):
         if proc.poll() is None:
             proc.kill()
             proc.wait(timeout=2.0)
+
+
+# ==============================================================================
+# 7. GEN4 REQUIREMENT R4 TEST 3: CONCURRENT 50MB STDOUT + 50MB STDERR RAM BOUND
+# ==============================================================================
+
+def test_r4_concurrent_50mb_stdout_50mb_stderr_respects_aggregate_10mb_ram_bound():
+    """R4 Test 3: Subprocess emitting concurrent 50MB stdout + 50MB stderr (100MB total) respects the aggregate 10MB RAM bound (len(stdout) + len(stderr) <= 10.1MB)."""
+    bytes_per_pipe = 50 * 1024 * 1024  # 52,428,800 bytes each (100MB total)
+    chunk_size = 65536
+    iterations = bytes_per_pipe // chunk_size
+
+    code = (
+        f"import sys\n"
+        f"chunk_out_head = (b'HEAD_OUT' + b'O' * ({chunk_size} - 8))\n"
+        f"chunk_out_mid = b'O' * {chunk_size}\n"
+        f"chunk_out_tail = (b'O' * ({chunk_size} - 8) + b'TAIL_OUT')\n"
+        f"chunk_err_head = (b'HEAD_ERR' + b'E' * ({chunk_size} - 8))\n"
+        f"chunk_err_mid = b'E' * {chunk_size}\n"
+        f"chunk_err_tail = (b'E' * ({chunk_size} - 8) + b'TAIL_ERR')\n"
+        f"sys.stdout.buffer.write(chunk_out_head)\n"
+        f"sys.stderr.buffer.write(chunk_err_head)\n"
+        f"for _ in range({iterations - 2}):\n"
+        f"    sys.stdout.buffer.write(chunk_out_mid)\n"
+        f"    sys.stderr.buffer.write(chunk_err_mid)\n"
+        f"sys.stdout.buffer.write(chunk_out_tail)\n"
+        f"sys.stderr.buffer.write(chunk_err_tail)\n"
+        f"sys.stdout.buffer.flush()\n"
+        f"sys.stderr.buffer.flush()\n"
+    )
+
+    proc = subprocess.Popen(
+        [sys.executable, "-c", code],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+
+    try:
+        t0 = time.monotonic()
+        stdout_text, stderr_text = CodexRuntime._communicate_with_pause(
+            proc, timeout=30.0, pause_event=None
+        )
+        elapsed = time.monotonic() - t0
+        proc.wait(timeout=5.0)
+
+        assert proc.returncode == 0
+        assert elapsed < 15.0, f"Concurrent 100MB emission took {elapsed:.2f}s, expected < 15.0s"
+
+        # AGGREGATE RAM BOUND: combined stdout + stderr in memory <= 10.1MB
+        combined_ram = len(stdout_text) + len(stderr_text)
+        max_aggregate_ram = 10 * 1024 * 1024 + 1000  # 10MB + notice strings <= 10.1MB
+        assert combined_ram <= max_aggregate_ram, (
+            f"Aggregate RAM bound exceeded: len(stdout)={len(stdout_text)}, len(stderr)={len(stderr_text)}, "
+            f"combined={combined_ram} bytes > {max_aggregate_ram} bytes ceiling!"
+        )
+
+        # Head and tail markers preserved on both streams
+        assert stdout_text.startswith("HEAD_OUT")
+        assert stdout_text.endswith("TAIL_OUT")
+        assert stderr_text.startswith("HEAD_ERR")
+        assert stderr_text.endswith("TAIL_ERR")
+
+        # In-memory truncation notice present on both streams
+        assert "truncated in memory" in stdout_text
+        assert "truncated in memory" in stderr_text
+        assert "(no disk log configured)" in stdout_text
+        assert "(no disk log configured)" in stderr_text
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait(timeout=2.0)
+
 

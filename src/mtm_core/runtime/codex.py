@@ -36,28 +36,51 @@ class DiskLogWriter:
     ) -> None:
         self.path = Path(log_path)
         self.max_bytes = max_bytes
-        self.bytes_written: int = 0
+        self._bytes_written: int = 0
+        self._bytes_omitted: int = 0
         self.lock = threading.Lock()
         self.closed: bool = False
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._handle: Optional[io.BufferedWriter] = open(self.path, "wb")
 
+    @property
+    def is_truncated(self) -> bool:
+        with self.lock:
+            return self._bytes_omitted > 0
+
+    @property
+    def bytes_written(self) -> int:
+        with self.lock:
+            return self._bytes_written
+
+    @property
+    def bytes_omitted(self) -> int:
+        with self.lock:
+            return self._bytes_omitted
+
     def write(self, chunk: Any) -> int:
         if not chunk or self.closed:
             return 0
         raw = chunk if isinstance(chunk, bytes) else str(chunk).encode("utf-8", errors="replace")
+        chunk_len = len(raw)
         with self.lock:
-            if self.closed or self._handle is None or self.bytes_written >= self.max_bytes:
+            if self.closed or self._handle is None:
                 return 0
-            remaining_quota = self.max_bytes - self.bytes_written
-            allowed = min(len(raw), remaining_quota)
+            if self._bytes_written >= self.max_bytes:
+                self._bytes_omitted += chunk_len
+                return 0
+            remaining_quota = self.max_bytes - self._bytes_written
+            allowed = min(chunk_len, remaining_quota)
             if allowed > 0:
                 try:
                     self._handle.write(raw[:allowed])
                     self._handle.flush()
-                    self.bytes_written += allowed
+                    self._bytes_written += allowed
                 except Exception:
                     pass
+            omitted = chunk_len - allowed
+            if omitted > 0:
+                self._bytes_omitted += omitted
             return allowed
 
     def close(self) -> None:
@@ -99,6 +122,8 @@ class BoundedStreamBuffer:
         self.tail_bytes: int = 0
         self.total_bytes: int = 0
         self.lock = threading.Lock()
+        self.peer_buffer: Optional["BoundedStreamBuffer"] = None
+        self.fair_share: int = max_bytes // 2
 
         if isinstance(log_file, DiskLogWriter):
             self.disk_writer: Optional[DiskLogWriter] = log_file
@@ -112,6 +137,46 @@ class BoundedStreamBuffer:
             self.disk_writer = None
             self.log_file = None
             self._owns_disk_writer = False
+
+    def _check_peer_budget(self) -> None:
+        if self.peer_buffer is not None:
+            peer_bytes = self.peer_buffer.total_bytes
+            if peer_bytes > self.fair_share and self.max_bytes > self.fair_share:
+                self._shrink_to(self.fair_share)
+
+    def _shrink_to(self, new_max: int) -> None:
+        if self.max_bytes <= new_max:
+            return
+        self.max_bytes = new_max
+        self.head_budget = new_max // 2
+        self.tail_budget = new_max - self.head_budget
+
+        if self.head_bytes > self.head_budget:
+            new_head: List[bytes] = []
+            accum = 0
+            for c in self.head_chunks:
+                if accum + len(c) <= self.head_budget:
+                    new_head.append(c)
+                    accum += len(c)
+                else:
+                    needed = self.head_budget - accum
+                    if needed > 0:
+                        new_head.append(c[:needed])
+                        accum += needed
+                    break
+            self.head_chunks = new_head
+            self.head_bytes = accum
+
+        while self.tail_bytes > self.tail_budget and self.tail_chunks:
+            excess = self.tail_bytes - self.tail_budget
+            front = self.tail_chunks[0]
+            if len(front) <= excess:
+                self.tail_chunks.popleft()
+                self.tail_bytes -= len(front)
+            else:
+                self.tail_chunks[0] = front[excess:]
+                self.tail_bytes -= excess
+                break
 
     def append(self, chunk: Any) -> None:
         if not chunk:
@@ -127,6 +192,7 @@ class BoundedStreamBuffer:
 
         with self.lock:
             self.total_bytes += chunk_len
+            self._check_peer_budget()
 
             # 1. Fill head buffer up to head_budget
             if self.head_bytes < self.head_budget:
@@ -164,6 +230,7 @@ class BoundedStreamBuffer:
 
     def get_text(self) -> str:
         with self.lock:
+            self._check_peer_budget()
             if not self.head_chunks and not self.tail_chunks:
                 return ""
             if self.total_bytes <= (self.head_bytes + self.tail_bytes):
@@ -175,15 +242,22 @@ class BoundedStreamBuffer:
             tail_text = b"".join(self.tail_chunks).decode("utf-8", errors="replace")
             omitted = self.total_bytes - (self.head_bytes + self.tail_bytes)
 
-            if self.log_file is not None:
+            if self.disk_writer is None or self.log_file is None:
                 notice = (
-                    f"\n[... MTM STREAM BUFFER: {omitted} bytes truncated in memory to preserve 10MB RAM bound. "
-                    f"Full stream written to log_file. ...]\n"
+                    f"\n... [output truncated: {omitted} bytes truncated in memory (no disk log configured)] ...\n"
+                )
+            elif self.disk_writer.is_truncated:
+                quota_mb = self.disk_writer.max_bytes // (1024 * 1024)
+                quota_str = f"{quota_mb}MB" if quota_mb > 0 else f"{self.disk_writer.max_bytes}B"
+                notice = (
+                    f"\n... [output truncated: {omitted} bytes truncated in memory. "
+                    f"Disk log reached {quota_str} quota (DISK_LOG_TRUNCATED: "
+                    f"{self.disk_writer.bytes_written} bytes saved, {self.disk_writer.bytes_omitted} bytes omitted from disk)] ...\n"
                 )
             else:
                 notice = (
-                    f"\n[... MTM STREAM BUFFER: {omitted} bytes truncated in memory to preserve 10MB RAM bound "
-                    f"(no disk log configured). ...]\n"
+                    f"\n... [output truncated: {omitted} bytes truncated in memory. "
+                    f"Full stream written to log_file.] ...\n"
                 )
             return head_text + notice + tail_text
 
@@ -332,18 +406,32 @@ class CodexRuntime:
         timeout: float,
         pause_event: Optional[Any],
         log_file: Optional[Path | str] = None,
-        max_buffer_bytes: int = 10 * 1024 * 1024,
+        max_buffer_bytes: Optional[int] = None,
         max_disk_bytes: int = 50 * 1024 * 1024,
+        max_total_buffer_bytes: Optional[int] = None,
+        **kwargs: Any,
     ) -> tuple[str, str]:
         """Wait for subprocess output while freezing timeout depletion whenever `pause_event` is set.
 
         Continuously drains stdout and stderr pipes in background daemon threads so that
         child process output (even >10MB) never saturates OS pipe buffers (~64KB) or causes
         deadlocks, while strictly preserving monotonic pause/resume deadline freezing.
-        In-memory buffering is capped at max_buffer_bytes (default 10MB) with rolling head
-        and tail retention. If log_file is provided, chunks are streamed directly to disk
-        up to max_disk_bytes (default 50MB quota).
+        In-memory buffering is capped at max_total_buffer_bytes (default 10MB aggregate) across
+        both streams with rolling head and tail retention. If log_file is provided, chunks are
+        streamed directly to disk up to max_disk_bytes (default 50MB quota).
         """
+        if max_total_buffer_bytes is None and "max_total_buffer_bytes" in kwargs:
+            max_total_buffer_bytes = kwargs["max_total_buffer_bytes"]
+        if max_buffer_bytes is None and "max_buffer_bytes" in kwargs:
+            max_buffer_bytes = kwargs["max_buffer_bytes"]
+
+        if max_total_buffer_bytes is not None:
+            total_limit = max_total_buffer_bytes
+        elif max_buffer_bytes is not None:
+            total_limit = max_buffer_bytes
+        else:
+            total_limit = 10 * 1024 * 1024
+
         def _to_str(val: Any) -> str:
             if val is None:
                 return ""
@@ -371,8 +459,23 @@ class CodexRuntime:
         has_stdout = _is_pipe(stdout_pipe)
         has_stderr = _is_pipe(stderr_pipe) and stderr_pipe is not stdout_pipe
 
-        stdout_buf = BoundedStreamBuffer(max_bytes=max_buffer_bytes, log_file=disk_writer)
-        stderr_buf = BoundedStreamBuffer(max_bytes=max_buffer_bytes, log_file=disk_writer)
+        if has_stdout and has_stderr:
+            fair_share = total_limit // 2
+            stdout_buf = BoundedStreamBuffer(max_bytes=total_limit, log_file=disk_writer)
+            stderr_buf = BoundedStreamBuffer(max_bytes=total_limit, log_file=disk_writer)
+            stdout_buf.peer_buffer = stderr_buf
+            stdout_buf.fair_share = fair_share
+            stderr_buf.peer_buffer = stdout_buf
+            stderr_buf.fair_share = total_limit - fair_share
+        elif has_stdout:
+            stdout_buf = BoundedStreamBuffer(max_bytes=total_limit, log_file=disk_writer)
+            stderr_buf = BoundedStreamBuffer(max_bytes=0, log_file=disk_writer)
+        elif has_stderr:
+            stdout_buf = BoundedStreamBuffer(max_bytes=0, log_file=disk_writer)
+            stderr_buf = BoundedStreamBuffer(max_bytes=total_limit, log_file=disk_writer)
+        else:
+            stdout_buf = BoundedStreamBuffer(max_bytes=total_limit // 2, log_file=disk_writer)
+            stderr_buf = BoundedStreamBuffer(max_bytes=total_limit - (total_limit // 2), log_file=disk_writer)
 
         stdout_thread: Optional[threading.Thread] = None
         stderr_thread: Optional[threading.Thread] = None
@@ -448,9 +551,9 @@ class CodexRuntime:
                 if callable(poll_fn) and poll_fn() is not None:
                     # Child process has terminated
                     if stdout_thread is not None:
-                        stdout_thread.join(timeout=2.0)
+                        stdout_thread.join(timeout=0.5)
                     if stderr_thread is not None:
-                        stderr_thread.join(timeout=2.0)
+                        stderr_thread.join(timeout=0.5)
 
                     out_str = stdout_buf.get_text()
                     err_str = stderr_buf.get_text()

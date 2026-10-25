@@ -135,4 +135,15 @@ On 2026-10-25, following a comprehensive multi-backend code review of commit `42
    - Added automated stress and adversarial test suites covering process tree killing, anti-TOCTOU symlink attacks, 50MB disk quota capping, and non-blocking streaming.
    - Verified 225/225 offline tests passing with 0 failures (`pytest tests/ -q -m 'not live_cli and not staging_game_master'`: **225 passed, 1 skipped, 16 deselected in 82.29s**).
 
+## Post-Commit 5518ae5 Residual P2 Hardening
+
+Status: **implemented / simulation-verified**. Live Codex CLI and Game Master staging remain **BLOCKED** (unchanged).
+
+1. **Disk log truncation notice (`src/mtm_core/runtime/codex.py`)**: `DiskLogWriter` now exposes `bytes_written`, `bytes_omitted` and `is_truncated`. `BoundedStreamBuffer.get_text()` reports one of three accurate states: no disk log configured; `DISK_LOG_TRUNCATED` with exact bytes saved and omitted once the 50MB quota is hit; or full stream written to `log_file`.
+2. **Ancestor-directory TOCTOU hardening (`src/mtm_agents/dispatcher.py`)**: `FileBackup.restore()` validates every ancestor from the workspace root down to `dest.parent` (symlink, junction, reparse point, outside-workspace resolution) top-down before any write, and re-verifies immediately before `os.replace`. Fails closed.
+   - **Residual risk:** this is check-then-use validation, not fd-relative (`openat`) I/O. A concurrent actor with write access to the workspace could still race the final check and `os.replace`. Full elimination requires directory file descriptors or an exclusive workspace during cleanup.
+3. **Aggregate RAM bound (`_communicate_with_pause`)**: a single `max_total_buffer_bytes` budget (default 10MB) is split across stdout and stderr (previously 10MB per stream, about 20MB total). Decoded strings are additional transient copies.
+4. **Tests**: offline suite is **234 passed, 1 skipped, 16 deselected** locally (Windows, Py 3.12). Adds 60MB `DISK_LOG_TRUNCATED` exact-count, ancestor symlink/junction swap, and concurrent stdout/stderr RAM-bound tests. CI counts differ from this local run and should not be summed.
+5. **Independent audit note**: the Gen-4 swarm halted on a quota error before issuing final reviewer/challenger/auditor handoffs. Interim reports were positive but are not formal sign-off.
+
 **Release policy:** Keep `MTM_AGENT_CONTEXT_ENABLED` disabled in live competition until SV-04 is green. Do not claim native multi-agent parity before SV-03. Maintain the known-good isolated CLI backend as rollback.

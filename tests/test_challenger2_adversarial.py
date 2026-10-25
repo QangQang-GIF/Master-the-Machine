@@ -999,8 +999,101 @@ def test_challenger_anti_toctou_parent_directory_junction_escape_blocked(tmp_pat
     with pytest.raises((ValueError, PermissionError), match="workspace"):
         backup.restore(workspace_root=ws)
 
-    # Outside canary was untouched
+    # Outside canary was untouched and zero files created in external target (Requirement R4 Test 2)
     assert canary.read_bytes() == b"HOST_CANARY_DO_NOT_TOUCH"
+    assert [p.name for p in outside_dir.iterdir()] == ["bug-fixer.toml"]
+
+    # Zero temp files leaked anywhere
+    assert list(outside_dir.rglob(".restore_*")) == []
+    assert list(ws.rglob(".restore_*")) == []
+
+
+def test_r4_intermediate_ancestor_junction_swap_fail_closed_with_zero_leaks(tmp_path):
+    """R4 Test 2: If adversary replaces an intermediate ancestor directory (e.g. .codex)
+
+    with an external Windows directory junction before restore, FileBackup.restore()
+    verifies intermediate ancestors top-down and aborts fail-closed, leaving zero files
+    created in the external target and zero temp files leaked.
+    """
+    if os.name != "nt":
+        pytest.skip("Windows junction test only applicable on NT")
+
+    import _winapi
+    import shutil
+    ws = tmp_path / "workspace_ancestor"
+    ws.mkdir()
+    codex_dir = ws / ".codex"
+    nested_dir = codex_dir / "deep" / "agents"
+    nested_dir.mkdir(parents=True)
+    target = nested_dir / "bug-fixer.toml"
+    orig_content = b'name = "legit-agent-deep"\n'
+    target.write_bytes(orig_content)
+
+    backup = FileBackup.capture(target, workspace_root=ws)
+
+    # External sensitive directory
+    outside_dir = tmp_path / "outside_ancestor_vault"
+    outside_dir.mkdir()
+    canary = outside_dir / "canary.txt"
+    canary.write_bytes(b"HOST_CANARY_STRICTLY_PROTECTED")
+
+    # Adversary replaces intermediate grandparent directory (.codex) with junction to outside_dir
+    shutil.rmtree(codex_dir)
+    _winapi.CreateJunction(str(outside_dir), str(codex_dir))
+
+    # restore() must fail closed on intermediate ancestor link
+    with pytest.raises((ValueError, PermissionError), match="workspace"):
+        backup.restore(workspace_root=ws)
+
+    # Outside target contains ONLY the original canary file (zero files or directories created)
+    assert [p.name for p in outside_dir.iterdir()] == ["canary.txt"]
+    assert canary.read_bytes() == b"HOST_CANARY_STRICTLY_PROTECTED"
+
+    # Zero temp files leaked anywhere
+    assert list(outside_dir.rglob(".restore_*")) == []
+    assert list(ws.rglob(".restore_*")) == []
+
+
+def test_r4_intermediate_ancestor_symlink_swap_fail_closed_with_zero_leaks(tmp_path):
+    """R4 Test 2: If adversary replaces an intermediate ancestor directory with an
+
+    external symlink before restore, FileBackup.restore() aborts fail-closed,
+    leaving zero files created in external targets and zero temp files leaked.
+    """
+    import shutil
+    ws = tmp_path / "workspace_symlink"
+    ws.mkdir()
+    codex_dir = ws / ".codex"
+    nested_dir = codex_dir / "agents"
+    nested_dir.mkdir(parents=True)
+    target = nested_dir / "feature-implementer.toml"
+    orig_content = b'name = "feature-agent"\n'
+    target.write_bytes(orig_content)
+
+    backup = FileBackup.capture(target, workspace_root=ws)
+
+    outside_dir = tmp_path / "outside_symlink_vault"
+    outside_dir.mkdir()
+    canary = outside_dir / "secret.key"
+    canary.write_bytes(b"VERY_CONFIDENTIAL_KEY")
+
+    # Adversary replaces .codex with external directory symlink
+    shutil.rmtree(codex_dir)
+    try:
+        os.symlink(outside_dir, codex_dir, target_is_directory=True)
+    except OSError:
+        pytest.skip("Directory symlinks not supported in this environment")
+
+    with pytest.raises((ValueError, PermissionError), match="workspace"):
+        backup.restore(workspace_root=ws)
+
+    # Outside target contains ONLY the original canary file
+    assert [p.name for p in outside_dir.iterdir()] == ["secret.key"]
+    assert canary.read_bytes() == b"VERY_CONFIDENTIAL_KEY"
+
+    # Zero temp files leaked anywhere
+    assert list(outside_dir.rglob(".restore_*")) == []
+    assert list(ws.rglob(".restore_*")) == []
 
 
 # ==============================================================================

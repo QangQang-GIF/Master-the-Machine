@@ -817,3 +817,66 @@ def test_file_backup_restore_replaces_broken_symlink_and_directory_link(tmp_path
     assert canary.read_text(encoding="utf-8") == "safe"
 
 
+def test_r4_dispatcher_restore_fails_closed_on_ancestor_junction_swap(tmp_path):
+    """R4 Test 2: In NativeSubagentDispatcher, if adversary swaps ancestor directory (.codex)
+
+    with an external junction during task run, cleanup restore fails closed without creating
+    or modifying any files in the external target, and leaks zero temp files.
+    """
+    if os.name != "nt":
+        pytest.skip("Windows junction test only applicable on NT")
+
+    import _winapi
+    import shutil
+
+    ws = tmp_path / "workspace_dispatch_ancestor"
+    ws.mkdir()
+    codex_dir = ws / ".codex" / "agents"
+    codex_dir.mkdir(parents=True)
+    pre_file = codex_dir / "bug-fixer.toml"
+    orig_content = b'name = "pre-dispatch-agent"\n'
+    pre_file.write_bytes(orig_content)
+
+    outside_vault = tmp_path / "outside_dispatch_vault"
+    outside_vault.mkdir()
+    vault_canary = outside_vault / "vault_canary.txt"
+    vault_canary.write_text("IMMUTABLE VAULT DATA", encoding="utf-8")
+
+    mock_rt = MagicMock(spec=CodexRuntime)
+
+    def _adversarial_run(**kwargs):
+        w = Path(kwargs["workspace"])
+        # Adversary removes w / ".codex" and replaces it with a junction to outside_vault
+        shutil.rmtree(w / ".codex")
+        _winapi.CreateJunction(str(outside_vault), str(w / ".codex"))
+        return RuntimeResult(
+            exit_code=0,
+            timed_out=False,
+            trace=ExecutionTrace(),
+            usage={},
+            commands=1,
+            file_changes=1,
+            last_message="Adversarial run complete",
+            elapsed=0.05,
+        )
+
+    mock_rt.run.side_effect = _adversarial_run
+    dispatcher = NativeSubagentDispatcher(runtime=mock_rt)
+
+    with pytest.raises((ValueError, PermissionError), match="workspace"):
+        dispatcher.dispatch(
+            envelope={"task_type": "BUG"},
+            prompt="Adversarial ancestor junction attack",
+            workspace=ws,
+        )
+
+    # External vault was untouched and zero new files/directories created in external vault
+    assert vault_canary.read_text(encoding="utf-8") == "IMMUTABLE VAULT DATA"
+    assert [p.name for p in outside_vault.iterdir()] == ["vault_canary.txt"]
+
+    # Zero temp files leaked anywhere
+    assert list(outside_vault.rglob(".restore_*")) == []
+    assert list(ws.rglob(".restore_*")) == []
+
+
+
