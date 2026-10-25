@@ -6,6 +6,7 @@ import hashlib
 import os
 from pathlib import Path
 import stat
+import tempfile
 from typing import Any, Callable, Optional
 
 from mtm_core.config.loader import get_project_root
@@ -46,6 +47,33 @@ def _verify_workspace_containment(path: Path | str, workspace_root: Path | str) 
     return resolved
 
 
+def _is_link_or_reparse(path: Path) -> bool:
+    """Check if path is a symlink, Windows junction, or reparse point."""
+    if path.is_symlink():
+        return True
+    if hasattr(path, "is_junction") and path.is_junction():
+        return True
+    if os.name == "nt" and hasattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT"):
+        try:
+            st = os.lstat(path)
+            if hasattr(st, "st_file_attributes") and (st.st_file_attributes & stat.FILE_ATTRIBUTE_REPARSE_POINT):
+                return True
+        except (OSError, ValueError):
+            pass
+    return False
+
+
+def _remove_link_or_reparse(path: Path) -> None:
+    """Safely unlink/remove a symlink or junction without touching its target."""
+    try:
+        path.unlink()
+    except OSError:
+        if path.is_dir():
+            path.rmdir()
+        else:
+            raise
+
+
 @dataclass(frozen=True)
 class FileBackup:
     path: Path
@@ -54,13 +82,19 @@ class FileBackup:
     atime_ns: int
     mtime_ns: int
     mode: int
+    workspace_root: Optional[Path] = None
 
     @classmethod
-    def capture(cls, path: Path | str) -> "FileBackup":
+    def capture(
+        cls,
+        path: Path | str,
+        workspace_root: Optional[Path | str] = None,
+    ) -> "FileBackup":
         p = Path(path).resolve()
         st = p.stat()
         content = p.read_bytes()
         digest = hashlib.sha256(content).hexdigest()
+        ws = Path(workspace_root).resolve() if workspace_root is not None else None
         return cls(
             path=p,
             content=content,
@@ -68,33 +102,71 @@ class FileBackup:
             atime_ns=st.st_atime_ns,
             mtime_ns=st.st_mtime_ns,
             mode=st.st_mode,
+            workspace_root=ws,
         )
 
-    def restore(self) -> None:
-        if self.path.exists() or self.path.is_symlink():
+    def restore(self, workspace_root: Optional[Path | str] = None) -> None:
+        dest = self.path
+        ws = Path(workspace_root or self.workspace_root or self.path.parent).resolve()
+
+        if not dest.parent.exists():
+            dest.parent.mkdir(parents=True, exist_ok=True)
+        _verify_workspace_containment(dest.parent, ws)
+
+        if _is_link_or_reparse(dest):
+            _remove_link_or_reparse(dest)
+        elif dest.exists():
             try:
-                os.chmod(self.path, stat.S_IWRITE | stat.S_IREAD)
+                os.chmod(dest, stat.S_IWRITE | stat.S_IREAD)
             except OSError:
                 pass
-        else:
-            self.path.parent.mkdir(parents=True, exist_ok=True)
 
-        self.path.write_bytes(self.content)
-        restored_hash = hashlib.sha256(self.path.read_bytes()).hexdigest()
+        _verify_workspace_containment(dest, ws)
+
+        temp_dir = dest.parent if dest.parent.exists() else ws
+        tmp_file = tempfile.NamedTemporaryFile(dir=temp_dir, prefix=".restore_", delete=False)
+        tmp_path = Path(tmp_file.name)
+        try:
+            tmp_file.write(self.content)
+            tmp_file.flush()
+            tmp_file.close()
+
+            if _is_link_or_reparse(dest):
+                _remove_link_or_reparse(dest)
+            elif dest.exists():
+                try:
+                    os.chmod(dest, stat.S_IWRITE | stat.S_IREAD)
+                except OSError:
+                    pass
+
+            _verify_workspace_containment(dest, ws)
+            os.replace(tmp_path, dest)
+        finally:
+            if tmp_path.exists():
+                try:
+                    tmp_path.unlink()
+                except OSError:
+                    pass
+
+        if dest.is_symlink() or _is_link_or_reparse(dest):
+            raise ValueError(f"Restored file {dest} is still a symlink or junction")
+
+        restored_hash = hashlib.sha256(dest.read_bytes()).hexdigest()
         if restored_hash != self.sha256:
             raise ValueError(
-                f"Restored file {self.path} hash mismatch: expected {self.sha256}, got {restored_hash}"
+                f"Restored file {dest} hash mismatch: expected {self.sha256}, got {restored_hash}"
             )
+
         try:
-            os.utime(self.path, ns=(self.atime_ns, self.mtime_ns))
+            os.utime(dest, ns=(self.atime_ns, self.mtime_ns))
         except OSError:
             pass
         try:
-            os.chmod(self.path, self.mode)
+            os.chmod(dest, self.mode)
         except OSError:
             pass
         try:
-            os.utime(self.path, ns=(self.atime_ns, self.mtime_ns))
+            os.utime(dest, ns=(self.atime_ns, self.mtime_ns))
         except OSError:
             pass
 
@@ -103,16 +175,19 @@ class WrittenFiles(list):
     """List of written paths that also preserves backup metadata for unpack callers."""
     backups: dict[Path, FileBackup]
     ephemeral_files: list[Path]
+    workspace: Optional[Path]
 
     def __init__(
         self,
         items: list[Path],
         backups: dict[Path, FileBackup],
         ephemeral_files: list[Path],
+        workspace: Optional[Path] = None,
     ):
         super().__init__(items)
         self.backups = backups
         self.ephemeral_files = ephemeral_files
+        self.workspace = workspace
 
 
 class WorkspacePreparation(tuple):
@@ -121,6 +196,7 @@ class WorkspacePreparation(tuple):
     created_dirs: list[Path]
     backups: dict[Path, FileBackup]
     ephemeral_files: list[Path]
+    workspace: Optional[Path]
 
     def __new__(
         cls,
@@ -128,17 +204,19 @@ class WorkspacePreparation(tuple):
         created_dirs: list[Path],
         backups: dict[Path, FileBackup],
         ephemeral_files: list[Path],
+        workspace: Optional[Path] = None,
     ) -> "WorkspacePreparation":
         written_wrapped = (
             written_files
             if isinstance(written_files, WrittenFiles)
-            else WrittenFiles(written_files, backups, ephemeral_files)
+            else WrittenFiles(written_files, backups, ephemeral_files, workspace)
         )
         instance = super().__new__(cls, (written_wrapped, created_dirs))
         instance.written_files = written_wrapped
         instance.created_dirs = created_dirs
         instance.backups = backups
         instance.ephemeral_files = ephemeral_files
+        instance.workspace = workspace
         return instance
 
 
@@ -188,7 +266,7 @@ class NativeSubagentDispatcher:
         for dest in prospective_files:
             if dest.exists() or dest.is_symlink():
                 try:
-                    backups[dest] = FileBackup.capture(dest)
+                    backups[dest] = FileBackup.capture(dest, workspace_root=ws)
                 except (PermissionError, OSError) as exc:
                     raise PermissionError(
                         f"Cannot backup pre-existing agent configuration {dest}: {exc}"
@@ -218,6 +296,7 @@ class NativeSubagentDispatcher:
                 created_dirs=created_dirs,
                 backups=backups,
                 ephemeral_files=ephemeral_files,
+                workspace=ws,
             )
         except Exception:
             partial_prep = WorkspacePreparation(
@@ -225,6 +304,7 @@ class NativeSubagentDispatcher:
                 created_dirs=created_dirs,
                 backups=backups,
                 ephemeral_files=ephemeral_files,
+                workspace=ws,
             )
             self.cleanup_workspace_agents(partial_prep)
             raise
@@ -233,12 +313,16 @@ class NativeSubagentDispatcher:
     def cleanup_workspace_agents(
         written_files: WorkspacePreparation | list[Path] | tuple[Any, ...],
         created_dirs: Optional[list[Path]] = None,
+        workspace_root: Optional[Path | str] = None,
     ) -> None:
         """Remove ephemeral native agent definitions and restore backed-up files."""
+        ws: Optional[Path] = Path(workspace_root).resolve() if workspace_root is not None else None
         if isinstance(written_files, WorkspacePreparation):
             backups = written_files.backups
             ephemeral_files = written_files.ephemeral_files
             dirs_to_clean = created_dirs if created_dirs is not None else written_files.created_dirs
+            if ws is None:
+                ws = written_files.workspace
         elif (
             isinstance(written_files, tuple)
             and len(written_files) == 2
@@ -254,10 +338,16 @@ class NativeSubagentDispatcher:
                 backups = {}
                 ephemeral_files = list(target_files)
             dirs_to_clean = list(target_dirs)
+            if ws is None and hasattr(written_files, "workspace"):
+                ws = getattr(written_files, "workspace")
+            elif ws is None and hasattr(target_files, "workspace"):
+                ws = getattr(target_files, "workspace")
         elif hasattr(written_files, "backups") and hasattr(written_files, "ephemeral_files"):
             backups = getattr(written_files, "backups")
             ephemeral_files = getattr(written_files, "ephemeral_files")
             dirs_to_clean = created_dirs if created_dirs is not None else []
+            if ws is None and hasattr(written_files, "workspace"):
+                ws = getattr(written_files, "workspace")
         else:
             backups = {}
             ephemeral_files = list(written_files) if written_files else []
@@ -267,8 +357,8 @@ class NativeSubagentDispatcher:
         for f in ephemeral_files:
             try:
                 p = Path(f)
-                if p.is_symlink() or (hasattr(p, "is_junction") and p.is_junction()):
-                    p.unlink()
+                if _is_link_or_reparse(p):
+                    _remove_link_or_reparse(p)
                 elif p.exists():
                     try:
                         os.chmod(p, stat.S_IWRITE | stat.S_IREAD)
@@ -282,7 +372,7 @@ class NativeSubagentDispatcher:
         restore_errors: list[Exception] = []
         for backup in backups.values():
             try:
-                backup.restore()
+                backup.restore(workspace_root=ws)
             except Exception as e:
                 restore_errors.append(e)
 
@@ -290,8 +380,8 @@ class NativeSubagentDispatcher:
         for d in sorted(dirs_to_clean, key=lambda p: len(p.parts), reverse=True):
             try:
                 p = Path(d)
-                if p.is_symlink() or (hasattr(p, "is_junction") and p.is_junction()):
-                    p.unlink()
+                if _is_link_or_reparse(p):
+                    _remove_link_or_reparse(p)
                 elif p.exists() and not any(p.iterdir()):
                     p.rmdir()
             except OSError:

@@ -26,6 +26,52 @@ from .process import terminate_process_tree
 from .trace import ExecutionTrace, parse_codex_trace, parse_agy_trace
 
 
+class DiskLogWriter:
+    """Thread-safe disk logger with bounded disk quota capping (default 50MB)."""
+
+    def __init__(
+        self,
+        log_path: Path | str,
+        max_bytes: int = 50 * 1024 * 1024,
+    ) -> None:
+        self.path = Path(log_path)
+        self.max_bytes = max_bytes
+        self.bytes_written: int = 0
+        self.lock = threading.Lock()
+        self.closed: bool = False
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._handle: Optional[io.BufferedWriter] = open(self.path, "wb")
+
+    def write(self, chunk: Any) -> int:
+        if not chunk or self.closed:
+            return 0
+        raw = chunk if isinstance(chunk, bytes) else str(chunk).encode("utf-8", errors="replace")
+        with self.lock:
+            if self.closed or self._handle is None or self.bytes_written >= self.max_bytes:
+                return 0
+            remaining_quota = self.max_bytes - self.bytes_written
+            allowed = min(len(raw), remaining_quota)
+            if allowed > 0:
+                try:
+                    self._handle.write(raw[:allowed])
+                    self._handle.flush()
+                    self.bytes_written += allowed
+                except Exception:
+                    pass
+            return allowed
+
+    def close(self) -> None:
+        with self.lock:
+            if not self.closed:
+                self.closed = True
+                if self._handle is not None:
+                    try:
+                        self._handle.close()
+                    except Exception:
+                        pass
+                    self._handle = None
+
+
 class BoundedStreamBuffer:
     """Thread-safe bounded in-memory buffer preserving rolling head and tail chunks.
 
@@ -33,10 +79,18 @@ class BoundedStreamBuffer:
     If total bytes <= max_bytes, 100% of the stream is preserved verbatim.
     If total bytes > max_bytes, the first head_bytes and the last tail_bytes are retained,
     with an informative truncation notice between them for diagnostics.
+
+    Optionally writes to disk log up to max_disk_bytes (default 50MB quota).
     """
 
-    def __init__(self, max_bytes: int = 10 * 1024 * 1024):
+    def __init__(
+        self,
+        max_bytes: int = 10 * 1024 * 1024,
+        log_file: Optional[Path | str | DiskLogWriter] = None,
+        max_disk_bytes: int = 50 * 1024 * 1024,
+    ):
         self.max_bytes = max_bytes
+        self.max_disk_bytes = max_disk_bytes
         self.head_budget = max_bytes // 2
         self.tail_budget = max_bytes - self.head_budget
         self.head_chunks: List[bytes] = []
@@ -46,11 +100,30 @@ class BoundedStreamBuffer:
         self.total_bytes: int = 0
         self.lock = threading.Lock()
 
+        if isinstance(log_file, DiskLogWriter):
+            self.disk_writer: Optional[DiskLogWriter] = log_file
+            self.log_file: Optional[Path | str] = log_file.path
+            self._owns_disk_writer: bool = False
+        elif log_file is not None:
+            self.disk_writer = DiskLogWriter(log_file, max_bytes=max_disk_bytes)
+            self.log_file = log_file
+            self._owns_disk_writer = True
+        else:
+            self.disk_writer = None
+            self.log_file = None
+            self._owns_disk_writer = False
+
     def append(self, chunk: Any) -> None:
         if not chunk:
             return
         raw = chunk if isinstance(chunk, bytes) else str(chunk).encode("utf-8", errors="replace")
         chunk_len = len(raw)
+
+        if self._owns_disk_writer and self.disk_writer is not None:
+            try:
+                self.disk_writer.write(raw)
+            except Exception:
+                pass
 
         with self.lock:
             self.total_bytes += chunk_len
@@ -101,11 +174,22 @@ class BoundedStreamBuffer:
             head_text = b"".join(self.head_chunks).decode("utf-8", errors="replace")
             tail_text = b"".join(self.tail_chunks).decode("utf-8", errors="replace")
             omitted = self.total_bytes - (self.head_bytes + self.tail_bytes)
-            notice = (
-                f"\n[... MTM STREAM BUFFER: {omitted} bytes truncated in memory to preserve 10MB RAM bound. "
-                f"Full stream written to log_file. ...]\n"
-            )
+
+            if self.log_file is not None:
+                notice = (
+                    f"\n[... MTM STREAM BUFFER: {omitted} bytes truncated in memory to preserve 10MB RAM bound. "
+                    f"Full stream written to log_file. ...]\n"
+                )
+            else:
+                notice = (
+                    f"\n[... MTM STREAM BUFFER: {omitted} bytes truncated in memory to preserve 10MB RAM bound "
+                    f"(no disk log configured). ...]\n"
+                )
             return head_text + notice + tail_text
+
+    def close(self) -> None:
+        if self._owns_disk_writer and self.disk_writer is not None:
+            self.disk_writer.close()
 
 
 
@@ -249,6 +333,7 @@ class CodexRuntime:
         pause_event: Optional[Any],
         log_file: Optional[Path | str] = None,
         max_buffer_bytes: int = 10 * 1024 * 1024,
+        max_disk_bytes: int = 50 * 1024 * 1024,
     ) -> tuple[str, str]:
         """Wait for subprocess output while freezing timeout depletion whenever `pause_event` is set.
 
@@ -256,7 +341,8 @@ class CodexRuntime:
         child process output (even >10MB) never saturates OS pipe buffers (~64KB) or causes
         deadlocks, while strictly preserving monotonic pause/resume deadline freezing.
         In-memory buffering is capped at max_buffer_bytes (default 10MB) with rolling head
-        and tail retention. If log_file is provided, all chunks are streamed directly to disk.
+        and tail retention. If log_file is provided, chunks are streamed directly to disk
+        up to max_disk_bytes (default 50MB quota).
         """
         def _to_str(val: Any) -> str:
             if val is None:
@@ -276,20 +362,17 @@ class CodexRuntime:
                 pass
             return callable(getattr(stream, "read", None))
 
-        log_handle: Optional[io.BufferedWriter] = None
-        log_lock = threading.Lock()
-        if log_file:
-            log_path = Path(log_file)
-            log_path.parent.mkdir(parents=True, exist_ok=True)
-            log_handle = open(log_path, "wb")
+        disk_writer: Optional[DiskLogWriter] = (
+            DiskLogWriter(log_file, max_bytes=max_disk_bytes) if log_file else None
+        )
 
         stdout_pipe = getattr(proc, "stdout", None)
         stderr_pipe = getattr(proc, "stderr", None)
         has_stdout = _is_pipe(stdout_pipe)
         has_stderr = _is_pipe(stderr_pipe) and stderr_pipe is not stdout_pipe
 
-        stdout_buf = BoundedStreamBuffer(max_bytes=max_buffer_bytes)
-        stderr_buf = BoundedStreamBuffer(max_bytes=max_buffer_bytes)
+        stdout_buf = BoundedStreamBuffer(max_bytes=max_buffer_bytes, log_file=disk_writer)
+        stderr_buf = BoundedStreamBuffer(max_bytes=max_buffer_bytes, log_file=disk_writer)
 
         stdout_thread: Optional[threading.Thread] = None
         stderr_thread: Optional[threading.Thread] = None
@@ -301,13 +384,14 @@ class CodexRuntime:
                 out, err = proc.communicate(timeout=timeout)
                 out_str = _to_str(out)
                 err_str = _to_str(err)
-                if log_handle is not None:
-                    with log_lock:
-                        try:
-                            log_handle.write(out_str.encode("utf-8", errors="replace"))
-                            log_handle.flush()
-                        except Exception:
-                            pass
+                if disk_writer is not None:
+                    try:
+                        if out:
+                            disk_writer.write(out)
+                        if err:
+                            disk_writer.write(err)
+                    except Exception:
+                        pass
                 return out_str, err_str
 
             def _drain_stream(stream: Any, buf: BoundedStreamBuffer) -> None:
@@ -325,16 +409,11 @@ class CodexRuntime:
                         chunk = read_fn(65536)
                         if not chunk:
                             break
-                        if log_handle is not None:
-                            with log_lock:
-                                try:
-                                    if isinstance(chunk, bytes):
-                                        log_handle.write(chunk)
-                                    else:
-                                        log_handle.write(str(chunk).encode("utf-8", errors="replace"))
-                                    log_handle.flush()
-                                except Exception:
-                                    pass
+                        if disk_writer is not None:
+                            try:
+                                disk_writer.write(chunk)
+                            except Exception:
+                                pass
                         buf.append(chunk)
                 except Exception:
                     pass
@@ -382,13 +461,14 @@ class CodexRuntime:
                             out_c, err_c = proc.communicate(timeout=2)
                             out_str = _to_str(out_c)
                             err_str = _to_str(err_c)
-                            if log_handle is not None:
-                                with log_lock:
-                                    try:
-                                        log_handle.write(out_str.encode("utf-8", errors="replace"))
-                                        log_handle.flush()
-                                    except Exception:
-                                        pass
+                            if disk_writer is not None:
+                                try:
+                                    if out_c:
+                                        disk_writer.write(out_c)
+                                    if err_c:
+                                        disk_writer.write(err_c)
+                                except Exception:
+                                    pass
                             return out_str, err_str
                         except Exception:
                             pass
@@ -412,9 +492,9 @@ class CodexRuntime:
                             stderr=err_str,
                         )
         finally:
-            if log_handle is not None:
+            if disk_writer is not None:
                 try:
-                    log_handle.close()
+                    disk_writer.close()
                 except Exception:
                     pass
             # Ensure background threads are cleaned up if process has terminated

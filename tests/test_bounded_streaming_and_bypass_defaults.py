@@ -378,3 +378,108 @@ def test_r4_cancellation_unlinks_log_file(tmp_path):
             proc.kill()
             proc.wait(timeout=2.0)
 
+
+# ==============================================================================
+# Gen3 Requirements R3 & R4: Diagnostic Notices & 50MB Disk Quota Capping
+# ==============================================================================
+
+def test_r4_truncation_notice_when_log_file_is_none():
+    """R4: Verify get_text() explicitly notes in-memory truncation without disk log when log_file is None."""
+    buf = BoundedStreamBuffer(max_bytes=100)
+    assert buf.log_file is None
+
+    buf.append(b"H" * 50)
+    buf.append(b"M" * 200)
+    buf.append(b"T" * 50)
+
+    result = buf.get_text()
+    assert "200 bytes truncated in memory to preserve 10MB RAM bound" in result
+    assert "(no disk log configured)" in result
+    assert "Full stream written to log_file" not in result
+
+
+def test_r4_truncation_notice_when_log_file_is_provided(tmp_path):
+    """R4: Verify get_text() notes full stream written to disk when log_file is provided."""
+    log_file = tmp_path / "test.log"
+    buf = BoundedStreamBuffer(max_bytes=100, log_file=log_file)
+    assert buf.log_file is not None
+
+    buf.append(b"H" * 50)
+    buf.append(b"M" * 200)
+    buf.append(b"T" * 50)
+    buf.close()
+
+    result = buf.get_text()
+    assert "200 bytes truncated in memory to preserve 10MB RAM bound" in result
+    assert "Full stream written to log_file." in result
+    assert "(no disk log configured)" not in result
+
+
+def test_r3_bounded_stream_buffer_enforces_disk_quota(tmp_path):
+    """R3: Verify BoundedStreamBuffer stops writing to disk when max_disk_bytes is reached."""
+    log_file = tmp_path / "quota_unit_test.log"
+    max_disk = 1000
+    buf = BoundedStreamBuffer(max_bytes=200, log_file=log_file, max_disk_bytes=max_disk)
+
+    buf.append(b"D" * 2500)
+    buf.close()
+
+    assert log_file.exists()
+    assert log_file.stat().st_size == max_disk
+    assert buf.total_bytes == 2500
+
+
+def test_r3_subprocess_60mb_stream_capped_at_50mb_disk_quota(tmp_path):
+    """R3: Verify subprocess emitting >60MB stops writing to disk at exactly 50MB without deadlock."""
+    total_bytes = 60 * 1024 * 1024  # 60MB (62,914,560 bytes)
+    chunk_size = 65536
+    iterations = total_bytes // chunk_size
+
+    code = (
+        f"import sys\n"
+        f"chunk_head = ('HEAD_MARKER' + 'X' * {chunk_size - 11}).encode('ascii')\n"
+        f"chunk_mid = ('X' * {chunk_size}).encode('ascii')\n"
+        f"chunk_tail = ('X' * {chunk_size - 11} + 'TAIL_MARKER').encode('ascii')\n"
+        f"sys.stdout.buffer.write(chunk_head)\n"
+        f"for _ in range({iterations - 2}):\n"
+        f"    sys.stdout.buffer.write(chunk_mid)\n"
+        f"sys.stdout.buffer.write(chunk_tail)\n"
+        f"sys.stdout.buffer.flush()\n"
+    )
+
+    proc = subprocess.Popen(
+        [sys.executable, "-c", code],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+
+    log_file = tmp_path / "stream_quota_60mb.log"
+
+    try:
+        t0 = time.monotonic()
+        stdout_text, stderr_text = CodexRuntime._communicate_with_pause(
+            proc, timeout=30.0, pause_event=None, log_file=log_file
+        )
+        elapsed = time.monotonic() - t0
+        proc.wait(timeout=5.0)
+
+        assert proc.returncode == 0
+        assert elapsed < 15.0, f"Draining 60MB took {elapsed:.2f}s, expected < 15.0s"
+        assert stderr_text == ""
+
+        # Verify RAM bound <= 10.1MB
+        assert len(stdout_text) <= 10 * 1024 * 1024 + 500
+        assert stdout_text.startswith("HEAD_MARKER")
+        assert stdout_text.endswith("TAIL_MARKER")
+
+        # Verify Disk Quota capped at 50MB (52,428,800 bytes)
+        assert log_file.exists()
+        disk_size = log_file.stat().st_size
+        expected_quota = 50 * 1024 * 1024
+        assert disk_size == expected_quota, f"Expected {expected_quota} bytes on disk, found {disk_size}!"
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait(timeout=2.0)
+
+

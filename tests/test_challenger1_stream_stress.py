@@ -555,11 +555,12 @@ def test_adversarial_120mb_split_parallel_disk_streaming(tmp_path):
         assert "truncated in memory" in stdout_text
         assert "truncated in memory" in stderr_text
 
-        # Disk file contains 100% of all bytes (120MB total)
+        # Disk file capped at 50MB (52,428,800 bytes) per Gen3 R3
         assert log_file.exists()
         disk_size = log_file.stat().st_size
-        assert disk_size == (bytes_per_stream * 2), (
-            f"Expected {bytes_per_stream * 2} bytes on disk, found {disk_size}!"
+        expected_quota = 50 * 1024 * 1024
+        assert disk_size == expected_quota, (
+            f"Expected {expected_quota} bytes on disk, found {disk_size}!"
         )
     finally:
         if proc.poll() is None:

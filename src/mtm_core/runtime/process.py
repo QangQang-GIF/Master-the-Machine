@@ -102,9 +102,21 @@ def is_expected_worker_pid(
 
 
 def is_pid_alive(pid: int) -> bool:
-    """Check whether a process with the given PID is currently alive across Windows and POSIX."""
-    if pid <= 0:
+    """Check whether a process with the given PID is currently alive across Windows and POSIX.
+
+    Guarantees:
+    - Non-positive or non-integer PIDs return False.
+    - On Windows: Uses tasklist to confirm PID presence.
+    - On Linux:
+        * If /proc is mounted and /proc/<pid> does not exist, returns False immediately.
+        * Parses /proc/<pid>/status for 'State:\tZ' (zombie) and 'State:\tX' (dead).
+          Zombie processes waiting for reaper are never reported as alive.
+        * Never lets a non-existent /proc/<pid> fall through to return True.
+    - On non-Linux POSIX: Uses os.kill(pid, 0).
+    """
+    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
         return False
+
     if sys.platform == "win32":
         try:
             res = subprocess.run(
@@ -113,29 +125,81 @@ def is_pid_alive(pid: int) -> bool:
                 text=True,
                 timeout=5,
             )
-            return str(pid) in (res.stdout or "")
+            out = res.stdout or ""
+            if "No tasks are running" in out:
+                return False
+            for line in out.strip().splitlines():
+                parts = line.split()
+                if len(parts) >= 2 and parts[1] == str(pid):
+                    return True
+            return str(pid) in out
         except Exception:
             return False
-    else:
-        try:
-            os.kill(pid, 0)
-            # On Linux, also check if it is a zombie process
-            stat_file = Path(f"/proc/{pid}/stat")
-            if stat_file.exists():
-                content = stat_file.read_text(encoding="utf-8", errors="ignore")
-                # Format: pid (comm) state ...
-                rparen = content.rfind(")")
-                if rparen != -1 and len(content) > rparen + 2:
-                    state_char = content[rparen + 2]
-                    if state_char == "Z":
+
+    # Linux-specific /proc check
+    if sys.platform.startswith("linux"):
+        if Path("/proc").is_dir():
+            proc_pid_dir = Path(f"/proc/{pid}")
+            if not proc_pid_dir.exists():
+                return False
+
+            status_file = proc_pid_dir / "status"
+            if status_file.exists():
+                try:
+                    content = status_file.read_text(encoding="utf-8", errors="ignore")
+                    for line in content.splitlines():
+                        stripped = line.strip()
+                        if stripped.lower().startswith("state:"):
+                            parts = stripped.split(":", 1)
+                            if len(parts) == 2:
+                                val = parts[1].strip()
+                                if val and val[0].upper() in ("Z", "X"):
+                                    return False
+                            break
+                except (FileNotFoundError, ProcessLookupError):
+                    return False
+                except Exception:
+                    if not proc_pid_dir.exists():
                         return False
-            return True
-        except ProcessLookupError:
-            return False
-        except PermissionError:
-            return True
-        except Exception:
-            return False
+            else:
+                stat_file = proc_pid_dir / "stat"
+                if stat_file.exists():
+                    try:
+                        stat_content = stat_file.read_text(encoding="utf-8", errors="ignore")
+                        rparen = stat_content.rfind(")")
+                        if rparen != -1 and len(stat_content) > rparen + 2:
+                            state_char = stat_content[rparen + 2].upper()
+                            if state_char in ("Z", "X"):
+                                return False
+                    except Exception:
+                        if not proc_pid_dir.exists():
+                            return False
+                elif not proc_pid_dir.exists():
+                    return False
+
+            if not proc_pid_dir.exists():
+                return False
+
+            try:
+                os.kill(pid, 0)
+                return True
+            except ProcessLookupError:
+                return False
+            except PermissionError:
+                return True
+            except Exception:
+                return False
+
+    # Non-Linux POSIX fallback or when /proc is not mounted
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except Exception:
+        return False
 
 
 def _kill_unix_descendants(pid: int) -> None:
@@ -145,6 +209,8 @@ def _kill_unix_descendants(pid: int) -> None:
     ppid = getattr(os, "getppid", lambda: None)()
     if ppid and pid == ppid:
         return
+
+    child_pids: List[int] = []
     try:
         res = subprocess.run(
             ["pgrep", "-P", str(pid)],
@@ -156,15 +222,37 @@ def _kill_unix_descendants(pid: int) -> None:
             for line in res.stdout.strip().splitlines():
                 line = line.strip()
                 if line.isdigit():
-                    child_pid = int(line)
-                    if child_pid > 1 and child_pid != os.getpid() and child_pid != ppid:
-                        _kill_unix_descendants(child_pid)
-                        try:
-                            os.kill(child_pid, signal.SIGKILL)
-                        except ProcessLookupError:
-                            pass
+                    c_pid = int(line)
+                    if c_pid > 1 and c_pid != os.getpid() and c_pid != ppid:
+                        child_pids.append(c_pid)
     except Exception:
         pass
+
+    # Optional /proc fallback if pgrep returned nothing or failed on minimal Linux containers
+    if not child_pids and sys.platform.startswith("linux") and Path("/proc").is_dir():
+        try:
+            for p in Path("/proc").iterdir():
+                if p.is_dir() and p.name.isdigit():
+                    c_pid = int(p.name)
+                    if c_pid <= 1 or c_pid == os.getpid() or c_pid == ppid or c_pid == pid:
+                        continue
+                    status_f = p / "status"
+                    if status_f.exists():
+                        for s_line in status_f.read_text(encoding="utf-8", errors="ignore").splitlines():
+                            if s_line.startswith("PPid:"):
+                                ppid_val = s_line.split(":", 1)[1].strip()
+                                if ppid_val.isdigit() and int(ppid_val) == pid:
+                                    child_pids.append(c_pid)
+                                break
+        except Exception:
+            pass
+
+    for child_pid in child_pids:
+        _kill_unix_descendants(child_pid)
+        try:
+            os.kill(child_pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
 
 
 def run_command(
@@ -197,12 +285,12 @@ def terminate_process_tree(proc: subprocess.Popen) -> None:
     Guarantees:
     - On Windows: Uses taskkill /F /T to terminate child and grandchild trees.
     - On Unix:
+        * ALWAYS actively discovers and recursively terminates descendant processes
+          via _kill_unix_descendants.
         * If proc has its own process group (distinct from caller/parent), terminates
           the entire process group via os.killpg.
-        * If proc shares caller's process group, recursively kills all descendants via pgrep -P
-          and then kills the child process via proc.kill().
-          Guarantees os.killpg is NEVER dispatched to the parent's process group (e.g. orchestrator).
-    - Always issues proc.kill() as final fallback.
+        * Never dispatches os.killpg to the parent's process group (e.g. orchestrator).
+    - Always issues proc.kill() and proc.wait(timeout=1.0) as final fallback.
     """
     if proc is None:
         return
@@ -225,6 +313,9 @@ def terminate_process_tree(proc: subprocess.Popen) -> None:
                     timeout=5,
                 )
             else:
+                # Unix execution: ALWAYS discover and kill descendants first
+                _kill_unix_descendants(raw_pid)
+
                 try:
                     pgid = os.getpgid(raw_pid)
                     parent_pgid = os.getpgrp()
@@ -241,8 +332,6 @@ def terminate_process_tree(proc: subprocess.Popen) -> None:
                     ):
                         os.killpg(pgid, signal.SIGKILL)
                     else:
-                        # Child shares caller's process group - recursively kill descendants, then child
-                        _kill_unix_descendants(raw_pid)
                         proc.kill()
                 except ProcessLookupError:
                     pass

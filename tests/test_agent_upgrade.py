@@ -11,7 +11,7 @@ import pytest
 
 from mtm_agents.profiles import resolve_profile, export_native_agents
 from mtm_agents.context import compile_task_context
-from mtm_agents.dispatcher import NativeSubagentDispatcher
+from mtm_agents.dispatcher import FileBackup, NativeSubagentDispatcher
 from mtm_backends import probe_backend, select_available_backend
 from mtm_core.config.loader import verify_profile_checksums, verify_skill_checksums
 from mtm_core.runtime import CodexRuntime, ExecutionTrace, RuntimeResult, TokenUsage
@@ -627,5 +627,193 @@ def test_cleanup_workspace_agents_does_not_delete_symlink_target(tmp_path):
     assert not symlink_file.exists()
     assert external_target.exists()
     assert external_target.read_bytes() == b"DO NOT DELETE ME"
+
+
+def test_dispatcher_restore_replaces_adversarial_symlink_without_writing_to_target(tmp_path):
+    """R2: If an agent replaces a backed-up file with an external symlink during execution,
+
+    restore() unlinks the symlink, does not write to the external file, and recreates
+    the original file with exact pre-run content, SHA-256 hash, and nanosecond timestamps.
+    """
+    ws = tmp_path / "workspace"
+    ws.mkdir()
+    codex_dir = ws / ".codex" / "agents"
+    codex_dir.mkdir(parents=True)
+    pre_file = codex_dir / "bug-fixer.toml"
+    orig_content = b'# ORIGINAL CUSTOM TOML CONFIG\nname = "original-bug-fixer"\nversion = "1.0.0"\n'
+    pre_file.write_bytes(orig_content)
+    orig_hash = hashlib.sha256(orig_content).hexdigest()
+
+    # Set historical timestamp (aligned to 100ns for Windows NTFS precision)
+    hist_mtime_ns = int((time.time() - 3600) * 1_000_000_000) // 100 * 100
+    os.utime(pre_file, ns=(hist_mtime_ns, hist_mtime_ns))
+    pre_mtime_ns = pre_file.stat().st_mtime_ns
+
+    # Create external sensitive target
+    outside_dir = tmp_path / "outside_sensitive_dir"
+    outside_dir.mkdir()
+    sensitive_file = outside_dir / "host_sensitive.txt"
+    sensitive_bytes = b"SECRET HOST CREDENTIALS - NEVER OVERWRITE"
+    sensitive_file.write_bytes(sensitive_bytes)
+
+    mock_rt = MagicMock(spec=CodexRuntime)
+
+    def _adversarial_run(**kwargs):
+        w = Path(kwargs["workspace"])
+        target = w / ".codex" / "agents" / "bug-fixer.toml"
+        assert target.exists()
+        # Adversary replaces target with an external symlink pointing to sensitive_file
+        target.unlink()
+        try:
+            os.symlink(sensitive_file, target)
+        except OSError:
+            pytest.skip("Symlink creation not supported in this environment")
+        assert target.is_symlink()
+        return RuntimeResult(
+            exit_code=0,
+            timed_out=False,
+            trace=ExecutionTrace(),
+            usage={},
+            commands=1,
+            file_changes=1,
+            last_message="Adversarial run complete",
+            elapsed=0.05,
+        )
+
+    mock_rt.run.side_effect = _adversarial_run
+    dispatcher = NativeSubagentDispatcher(runtime=mock_rt)
+
+    res = dispatcher.dispatch(
+        envelope={"task_type": "BUG"},
+        prompt="Adversarial symlink test",
+        workspace=ws,
+    )
+    assert res.exit_code == 0
+
+    # 1. External sensitive file was NEVER written to or modified
+    assert sensitive_file.exists()
+    assert sensitive_file.read_bytes() == sensitive_bytes
+
+    # 2. Target file was restored as a real file (not a symlink)
+    assert pre_file.exists()
+    assert not pre_file.is_symlink()
+
+    # 3. Content and SHA-256 match original pre-run file exactly
+    restored_bytes = pre_file.read_bytes()
+    assert restored_bytes == orig_content
+    assert hashlib.sha256(restored_bytes).hexdigest() == orig_hash
+
+    # 4. Nanosecond timestamp fidelity is preserved
+    assert pre_file.stat().st_mtime_ns == pre_mtime_ns
+
+
+def test_dispatcher_restore_replaces_adversarial_junction_without_writing_to_target(tmp_path):
+    """R2: If an agent replaces a backed-up file with a Windows directory junction during execution,
+
+    restore() unlinks the junction, does not touch the outside target, and recreates the file.
+    """
+    if os.name != "nt":
+        pytest.skip("Windows junction test only applicable on NT")
+
+    import _winapi
+    ws = tmp_path / "workspace"
+    ws.mkdir()
+    codex_dir = ws / ".codex" / "agents"
+    codex_dir.mkdir(parents=True)
+    pre_file = codex_dir / "bug-fixer.toml"
+    orig_content = b'# ORIGINAL TOML\nname = "pre-junction"\n'
+    pre_file.write_bytes(orig_content)
+    orig_hash = hashlib.sha256(orig_content).hexdigest()
+
+    outside_dir = tmp_path / "outside_vault"
+    outside_dir.mkdir()
+    canary_file = outside_dir / "canary.txt"
+    canary_file.write_text("CANARY DATA", encoding="utf-8")
+
+    mock_rt = MagicMock(spec=CodexRuntime)
+
+    def _adversarial_run(**kwargs):
+        w = Path(kwargs["workspace"])
+        target = w / ".codex" / "agents" / "bug-fixer.toml"
+        target.unlink()
+        _winapi.CreateJunction(str(outside_dir), str(target))
+        return RuntimeResult(
+            exit_code=0,
+            timed_out=False,
+            trace=ExecutionTrace(),
+            usage={},
+            commands=1,
+            file_changes=1,
+            last_message="Adversarial junction run complete",
+            elapsed=0.05,
+        )
+
+    mock_rt.run.side_effect = _adversarial_run
+    dispatcher = NativeSubagentDispatcher(runtime=mock_rt)
+
+    res = dispatcher.dispatch(
+        envelope={"task_type": "BUG"},
+        prompt="Adversarial junction test",
+        workspace=ws,
+    )
+    assert res.exit_code == 0
+
+    # 1. External vault was untouched
+    assert outside_dir.exists()
+    assert canary_file.read_text(encoding="utf-8") == "CANARY DATA"
+
+    # 2. Target file was restored as a real file
+    assert pre_file.is_file()
+    assert not (hasattr(pre_file, "is_junction") and pre_file.is_junction())
+    assert pre_file.read_bytes() == orig_content
+    assert hashlib.sha256(pre_file.read_bytes()).hexdigest() == orig_hash
+
+
+def test_file_backup_restore_replaces_broken_symlink_and_directory_link(tmp_path):
+    """R2: Direct FileBackup.restore() recovers files when replaced by broken symlinks or directory symlinks."""
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    target = ws / "config.toml"
+    orig_bytes = b"sample_config = 42\n"
+    target.write_bytes(orig_bytes)
+
+    backup = FileBackup.capture(target, workspace_root=ws)
+    assert backup.workspace_root == ws.resolve()
+
+    # Case 1: Broken symlink replacement
+    target.unlink()
+    broken_link_target = tmp_path / "nonexistent.file"
+    try:
+        os.symlink(broken_link_target, target)
+    except OSError:
+        pytest.skip("Symlink creation not supported in this environment")
+
+    assert not target.exists()
+    assert target.is_symlink()
+
+    backup.restore(workspace_root=ws)
+    assert target.is_file()
+    assert not target.is_symlink()
+    assert target.read_bytes() == orig_bytes
+
+    # Case 2: Symlink pointing to outside directory
+    target.unlink()
+    outside_dir = tmp_path / "outside_dir"
+    outside_dir.mkdir(exist_ok=True)
+    canary = outside_dir / "canary.txt"
+    canary.write_text("safe", encoding="utf-8")
+
+    try:
+        os.symlink(outside_dir, target, target_is_directory=True)
+    except OSError:
+        pytest.skip("Directory symlink creation not supported")
+
+    assert target.is_symlink()
+
+    backup.restore(workspace_root=ws)
+    assert target.is_file()
+    assert not target.is_symlink()
+    assert target.read_bytes() == orig_bytes
+    assert canary.read_text(encoding="utf-8") == "safe"
 
 

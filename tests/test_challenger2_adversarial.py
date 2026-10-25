@@ -20,6 +20,7 @@ import time
 from unittest.mock import MagicMock, patch
 import pytest
 
+import sys
 from mtm_agents.dispatcher import (
     NativeSubagentDispatcher,
     WorkspacePreparation,
@@ -27,6 +28,7 @@ from mtm_agents.dispatcher import (
     FileBackup,
 )
 from mtm_core.runtime import CodexRuntime, RuntimeResult, ExecutionTrace
+from mtm_core.runtime.process import is_pid_alive, terminate_process_tree, _kill_unix_descendants
 
 
 # ==============================================================================
@@ -799,4 +801,342 @@ def test_exhaustive_permission_bypass_cartesian_product_matrix(caplog):
     for k in ["MTM_AGY_DANGEROUSLY_SKIP_PERMISSIONS", "MTM_AGY_SKIP_PERMISSIONS"]:
         if k in os.environ:
             del os.environ[k]
+
+
+# ==============================================================================
+# Area 13: Gen 3 Empirical Challenge — Anti-TOCTOU Symlink & Junction Substitution
+# ==============================================================================
+
+def test_challenger_anti_toctou_multi_target_adversarial_substitution(tmp_path):
+    """Gen 3 Challenge R2: Empirically verify multi-target adversarial substitution defense.
+
+    Simulates an agent during task execution replacing multiple backed-up files with:
+    1. External symlink to a sensitive host file
+    2. Windows directory junction (or directory symlink) to a sensitive external directory
+    3. A broken symlink to a nonexistent target
+    4. An in-place corrupted file
+
+    Proves FileBackup.restore() unlinks links/junctions, never writes to external targets,
+    and recreates original files with exact content, SHA-256 hash, and nanosecond timestamps.
+    """
+    ws = tmp_path / "workspace"
+    ws.mkdir()
+    codex_dir = ws / ".codex" / "agents"
+    agy_dir = ws / ".agents" / "agents"
+    codex_dir.mkdir(parents=True)
+    agy_dir.mkdir(parents=True)
+
+    # 1. Target 1: bug-fixer.toml
+    f1 = codex_dir / "bug-fixer.toml"
+    content1 = b'# CUSTOM BUG FIXER\nname = "bug-fixer"\nversion = "2.0.0"\n'
+    f1.write_bytes(content1)
+    hash1 = hashlib.sha256(content1).hexdigest()
+    t1_ns = int((time.time() - 7200) * 1_000_000_000) // 100 * 100
+    os.utime(f1, ns=(t1_ns, t1_ns))
+    mtime1_ns = f1.stat().st_mtime_ns
+
+    # 2. Target 2: feature-implementer.toml
+    f2 = codex_dir / "feature-implementer.toml"
+    content2 = b'# CUSTOM FEATURE IMPLEMENTER\nname = "feature-implementer"\n'
+    f2.write_bytes(content2)
+    hash2 = hashlib.sha256(content2).hexdigest()
+    t2_ns = int((time.time() - 3600) * 1_000_000_000) // 100 * 100
+    os.utime(f2, ns=(t2_ns, t2_ns))
+    mtime2_ns = f2.stat().st_mtime_ns
+
+    # 3. Target 3: general-task-worker.md
+    f3 = agy_dir / "general-task-worker.md"
+    content3 = b'# General Task Worker\nCustom profile instructions\n'
+    f3.write_bytes(content3)
+    hash3 = hashlib.sha256(content3).hexdigest()
+    t3_ns = int((time.time() - 1800) * 1_000_000_000) // 100 * 100
+    os.utime(f3, ns=(t3_ns, t3_ns))
+    mtime3_ns = f3.stat().st_mtime_ns
+
+    # 4. Target 4: incident-responder.md
+    f4 = agy_dir / "incident-responder.md"
+    content4 = b'# Incident Responder\nOriginal emergency procedures\n'
+    f4.write_bytes(content4)
+    hash4 = hashlib.sha256(content4).hexdigest()
+    t4_ns = int((time.time() - 900) * 1_000_000_000) // 100 * 100
+    os.utime(f4, ns=(t4_ns, t4_ns))
+    mtime4_ns = f4.stat().st_mtime_ns
+
+    # External sensitive targets
+    outside = tmp_path / "outside_host"
+    outside.mkdir()
+    sensitive_file = outside / "secret_vault.key"
+    sensitive_file_bytes = b"TOP_SECRET_MASTER_ENCRYPTION_KEY_DO_NOT_TOUCH"
+    sensitive_file.write_bytes(sensitive_file_bytes)
+
+    sensitive_vault_dir = outside / "confidential_dir"
+    sensitive_vault_dir.mkdir()
+    vault_canary = sensitive_vault_dir / "canary.log"
+    vault_canary_bytes = b"CANARY_VAULT_RECORD"
+    vault_canary.write_bytes(vault_canary_bytes)
+
+    mock_rt = MagicMock(spec=CodexRuntime)
+
+    def _hostile_agent_run(**kwargs):
+        w = Path(kwargs["workspace"])
+        c_dir = w / ".codex" / "agents"
+        a_dir = w / ".agents" / "agents"
+
+        # Attack 1: Replace bug-fixer.toml with symlink to outside sensitive file
+        target1 = c_dir / "bug-fixer.toml"
+        target1.unlink()
+        try:
+            os.symlink(sensitive_file, target1)
+        except OSError:
+            pytest.skip("Symlink creation not supported in this environment")
+
+        # Attack 2: Replace feature-implementer.toml with junction to outside vault
+        target2 = c_dir / "feature-implementer.toml"
+        target2.unlink()
+        if os.name == "nt":
+            import _winapi
+            _winapi.CreateJunction(str(sensitive_vault_dir), str(target2))
+        else:
+            os.symlink(sensitive_vault_dir, target2, target_is_directory=True)
+
+        # Attack 3: Replace general-task-worker.md with broken symlink
+        target3 = a_dir / "general-task-worker.md"
+        target3.unlink()
+        os.symlink(outside / "nonexistent_file.txt", target3)
+
+        # Attack 4: Overwrite incident-responder.md with adversarial payload
+        target4 = a_dir / "incident-responder.md"
+        target4.write_bytes(b"MALICIOUS_INJECTED_INSTRUCTIONS_ROOTKIT")
+
+        return RuntimeResult(
+            exit_code=0,
+            timed_out=False,
+            trace=ExecutionTrace(),
+            usage={},
+            commands=2,
+            file_changes=4,
+            last_message="Adversarial substitutions complete",
+            elapsed=0.08,
+        )
+
+    mock_rt.run.side_effect = _hostile_agent_run
+    dispatcher = NativeSubagentDispatcher(runtime=mock_rt)
+
+    res = dispatcher.dispatch(
+        envelope={"task_type": "BUG"},
+        prompt="Adversarial multi-target substitution challenge",
+        workspace=ws,
+    )
+    assert res.exit_code == 0
+
+    # EMPIRICAL ORACLE 1: External files & directories were NEVER written to or modified
+    assert sensitive_file.exists()
+    assert sensitive_file.read_bytes() == sensitive_file_bytes
+    assert sensitive_vault_dir.exists()
+    assert vault_canary.exists()
+    assert vault_canary.read_bytes() == vault_canary_bytes
+
+    # EMPIRICAL ORACLE 2: None of the restored targets are symlinks or junctions
+    for p in (f1, f2, f3, f4):
+        assert p.exists(), f"Restored file {p} does not exist"
+        assert p.is_file(), f"Restored file {p} is not a regular file"
+        assert not p.is_symlink(), f"Restored file {p} is still a symlink"
+        if hasattr(p, "is_junction"):
+            assert not p.is_junction(), f"Restored file {p} is still a junction"
+
+    # EMPIRICAL ORACLE 3: Exact binary content & SHA-256 restored
+    assert f1.read_bytes() == content1
+    assert hashlib.sha256(f1.read_bytes()).hexdigest() == hash1
+
+    assert f2.read_bytes() == content2
+    assert hashlib.sha256(f2.read_bytes()).hexdigest() == hash2
+
+    assert f3.read_bytes() == content3
+    assert hashlib.sha256(f3.read_bytes()).hexdigest() == hash3
+
+    assert f4.read_bytes() == content4
+    assert hashlib.sha256(f4.read_bytes()).hexdigest() == hash4
+
+    # EMPIRICAL ORACLE 4: Nanosecond timestamps preserved accurately
+    assert f1.stat().st_mtime_ns == mtime1_ns
+    assert f2.stat().st_mtime_ns == mtime2_ns
+    assert f3.stat().st_mtime_ns == mtime3_ns
+    assert f4.stat().st_mtime_ns == mtime4_ns
+
+
+def test_challenger_anti_toctou_parent_directory_junction_escape_blocked(tmp_path):
+    """Gen 3 Challenge R2: If adversary replaces .codex/agents parent directory with an
+
+    external directory junction before restore, FileBackup.restore() verifies destination
+    parent containment and aborts without writing to the external target.
+    """
+    if os.name != "nt":
+        pytest.skip("Windows junction test only applicable on NT")
+
+    import _winapi
+    ws = tmp_path / "workspace"
+    ws.mkdir()
+    agents_dir = ws / ".codex" / "agents"
+    agents_dir.mkdir(parents=True)
+    target = agents_dir / "bug-fixer.toml"
+    orig_content = b'name = "legit-agent"\n'
+    target.write_bytes(orig_content)
+
+    backup = FileBackup.capture(target, workspace_root=ws)
+
+    # External sensitive directory
+    outside_dir = tmp_path / "outside_parent_vault"
+    outside_dir.mkdir()
+    canary = outside_dir / "bug-fixer.toml"
+    canary.write_bytes(b"HOST_CANARY_DO_NOT_TOUCH")
+
+    # Adversary replaces the parent directory (.codex/agents) with junction to outside_dir
+    target.unlink()
+    agents_dir.rmdir()
+    _winapi.CreateJunction(str(outside_dir), str(agents_dir))
+
+    # restore() must detect destination parent containment escape and fail closed
+    with pytest.raises((ValueError, PermissionError), match="workspace"):
+        backup.restore(workspace_root=ws)
+
+    # Outside canary was untouched
+    assert canary.read_bytes() == b"HOST_CANARY_DO_NOT_TOUCH"
+
+
+# ==============================================================================
+# Area 14: Gen 3 Empirical Challenge — Process Termination & Zombie Detection
+# ==============================================================================
+
+def test_challenger_is_pid_alive_exhaustive_proc_status_matrix(tmp_path, monkeypatch):
+    """Gen 3 Challenge R1: Empirically stress-test is_pid_alive with all Linux /proc status variations."""
+    monkeypatch.setattr(sys, "platform", "linux")
+
+    mock_proc_root = tmp_path / "proc"
+    mock_proc_root.mkdir()
+
+    def fake_path(*args):
+        if args:
+            p_str = str(args[0]).replace("\\", "/")
+            if p_str == "/proc" or p_str.startswith("/proc/"):
+                rel = p_str[len("/proc"):].lstrip("/")
+                return mock_proc_root / rel if rel else mock_proc_root
+        return Path(*args)
+
+    monkeypatch.setattr("mtm_core.runtime.process.Path", fake_path)
+
+    pid = 99999
+
+    # Case 1: /proc/<pid> absent -> must return False immediately
+    assert not is_pid_alive(pid)
+
+    # Helper to setup mock status file
+    pid_dir = mock_proc_root / str(pid)
+    pid_dir.mkdir()
+    status_file = pid_dir / "status"
+
+    # Case 2: State variations that mean dead / zombie -> MUST return False
+    zombie_variations = [
+        "State:\tZ (zombie)",
+        "State:\tZ",
+        "State:\tz (zombie)",
+        "State:\tz",
+        "State:  Z (zombie)",
+        "State: Z",
+        "state: Z (zombie)",
+        "State:\tX (dead)",
+        "State:\tX",
+        "State:\tx (dead)",
+        "State:\tx",
+        "State:  X",
+        "state: x",
+    ]
+
+    for variant in zombie_variations:
+        status_file.write_text(f"Name:\tpython\n{variant}\nTgid:\t{pid}\n", encoding="utf-8")
+        assert not is_pid_alive(pid), f"Failed for variant: {variant}"
+
+    # Case 3: State: S (sleeping) or R (running) with os.kill succeeding -> returns True
+    monkeypatch.setattr(os, "kill", lambda p, sig: None)
+    status_file.write_text("Name:\tpython\nState:\tS (sleeping)\n", encoding="utf-8")
+    assert is_pid_alive(pid)
+
+    status_file.write_text("Name:\tpython\nState:\tR (running)\n", encoding="utf-8")
+    assert is_pid_alive(pid)
+
+    # Case 4: State: S but os.kill raises ProcessLookupError -> returns False
+    def _raise_lookup(p, sig):
+        raise ProcessLookupError()
+    monkeypatch.setattr(os, "kill", _raise_lookup)
+    assert not is_pid_alive(pid)
+
+    # Case 5: status file missing, falling back to stat file with zombie state
+    status_file.unlink()
+    stat_file = pid_dir / "stat"
+    stat_file.write_text(f"{pid} (python) Z 1 1 1 0 -1", encoding="utf-8")
+    assert not is_pid_alive(pid)
+
+    stat_file.write_text(f"{pid} (python) X 1 1 1 0 -1", encoding="utf-8")
+    assert not is_pid_alive(pid)
+
+
+def test_challenger_terminate_process_tree_deep_hierarchy_grandchild_kill(tmp_path):
+    """Gen 3 Challenge R1: Empirically verify terminate_process_tree kills child and grandchild trees without hang."""
+    child_pid_file = tmp_path / "child.pid"
+    grandchild_pid_file = tmp_path / "grandchild.pid"
+
+    gc_file_posix = grandchild_pid_file.as_posix()
+    c_file_posix = child_pid_file.as_posix()
+
+    # Python script for child that spawns a grandchild and both wait
+    script_content = f"""
+import subprocess, sys, time, os
+from pathlib import Path
+
+grandchild_code = '''
+import time, os, sys
+from pathlib import Path
+Path({repr(gc_file_posix)}).write_text(str(os.getpid()), encoding="utf-8")
+while True:
+    time.sleep(0.1)
+'''
+# Spawn grandchild
+gc = subprocess.Popen([sys.executable, "-c", grandchild_code])
+Path({repr(c_file_posix)}).write_text(str(os.getpid()), encoding="utf-8")
+while True:
+    time.sleep(0.1)
+"""
+    parent_proc = subprocess.Popen([sys.executable, "-c", script_content])
+
+    # Wait for grandchild and child to write PIDs
+    start_wait = time.time()
+    while time.time() - start_wait < 10.0:
+        if child_pid_file.exists() and grandchild_pid_file.exists():
+            break
+        time.sleep(0.1)
+
+    assert child_pid_file.exists(), "Child PID file was not created"
+    assert grandchild_pid_file.exists(), "Grandchild PID file was not created"
+
+    c_pid = int(child_pid_file.read_text(encoding="utf-8").strip())
+    gc_pid = int(grandchild_pid_file.read_text(encoding="utf-8").strip())
+
+    # Both child and grandchild should be alive before termination
+    assert is_pid_alive(c_pid)
+    assert is_pid_alive(gc_pid)
+    assert is_pid_alive(parent_proc.pid)
+
+    # Terminate process tree
+    terminate_process_tree(parent_proc)
+
+    # Verify both child and grandchild are terminated within 5s
+    quiesce_deadline = time.time() + 5.0
+    while time.time() < quiesce_deadline:
+        if not is_pid_alive(gc_pid) and not is_pid_alive(c_pid) and not is_pid_alive(parent_proc.pid):
+            break
+        time.sleep(0.1)
+
+    assert not is_pid_alive(gc_pid), f"Grandchild PID {gc_pid} still alive after terminate_process_tree"
+    assert not is_pid_alive(c_pid), f"Child PID {c_pid} still alive after terminate_process_tree"
+    assert not is_pid_alive(parent_proc.pid), f"Parent PID {parent_proc.pid} still alive after terminate_process_tree"
+    assert parent_proc.poll() is not None, "Parent process poll() returned None (did not terminate)"
 

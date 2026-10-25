@@ -114,21 +114,25 @@ MTM_ENV=production python -m pytest tests/test_agent_upgrade_integration.py -q
 | SV-07 | `166b7dce` | 2026-10-25 07:42Z | Pair Engineer | Win11 / Py 3.12.0 | `test_sv07_paired_contest_simulator` | **simulation-verified (PASS)** | Paired contest simulation, 3-way merge conflict detection, and normalized credits verified. |
 | SV-08 | `166b7dce` | 2026-10-25 07:25Z | Pair Engineer | Win11 / Py 3.12.0 | `pytest tests/test_agent_upgrade.py -k "dataset or training or checksum"` | **simulation-verified (PASS)** | Offline dataset loading, proposal diffs, and `releases/checksums.sha256` verified for all 13 skills and 4 profiles. |
 
-## Post-Commit 42631e4 Review Remediation & Victory Audit
+## Post-Commit 42631e4 & 87ca4d1 Review Remediation & Victory Audit
 
-On 2026-10-25, following a comprehensive multi-backend code review of commit `42631e4`, a dedicated Teamwork multi-agent swarm executed and completed an independent forensic remediation and audit cycle (**Verdict: VICTORY CONFIRMED**):
+On 2026-10-25, following a comprehensive multi-backend code review of commit `42631e4` and follow-up CI analysis on `87ca4d1`, dedicated Teamwork multi-agent swarms executed and completed independent forensic remediation and audit cycles (**Verdict: VICTORY CONFIRMED** across all iterations):
 
-1. **P1 — Deadlock Immunity in Subprocess Stream Draining (`src/mtm_core/runtime/codex.py`)**:
-   - Replaced blocking pipes with background daemon reader threads utilizing `read1(65536)` on underlying binary stream buffers, preventing OS pipe saturation deadlocks on continuous output streams up to 50MB.
-   - Preserved monotonic pause-freeze deadline deduction during streaming.
-   - Captured diagnostic output directly into `TimeoutExpired.output` without stalls.
-2. **P2 — Non-Destructive Agent Configuration Dispatcher (`src/mtm_agents/dispatcher.py`)**:
+1. **P1 — Deadlock Immunity & 50MB Disk Quota Capping (`src/mtm_core/runtime/codex.py`)**:
+   - Replaced blocking pipes with background daemon reader threads utilizing `read1(65536)` on underlying binary stream buffers, preventing OS pipe saturation deadlocks on continuous output streams up to 50MB/120MB.
+   - Enforced a hard 50MB disk quota cap (`DiskLogWriter`) to prevent runaway worker log exhaustion, while continuing non-blocking pipe draining into RAM to guarantee deadlock immunity.
+   - Corrected buffer truncation diagnostic notices in `BoundedStreamBuffer.get_text()` to accurately state `(no disk log configured)` when `log_file is None`.
+2. **P1 — Anti-TOCTOU Symlink & Junction Replacement Defense (`src/mtm_agents/dispatcher.py`)**:
    - Implemented `FileBackup` dataclass capturing binary content, SHA-256 digest, nanosecond timestamps (`st_atime_ns`, `st_mtime_ns`), and permissions (`st_mode`).
-   - Pre-existing configuration files in `.codex/agents/` and `.agents/agents/` are safely restored upon cleanup. Ephemeral dispatcher files are cleanly unlinked.
-3. **P2 — Sandbox Enforcement & Permission Bypass Decoupling (`src/mtm_core/runtime/codex.py`)**:
+   - In `FileBackup.restore()`, re-verifies destination containment within workspace root immediately before writing. Safely detects and unlinks existing symlinks, directory junctions, and reparse points without writing through to external targets.
+   - Restored content is written via a secure workspace tempfile and atomically replaced (`os.replace`), followed by nanosecond timestamp and permission restoration.
+3. **P1 — Process Tree Grandchild Termination & Zombie State Detection (`src/mtm_core/runtime/process.py`)**:
+   - Resolved Python 3.13 Linux CI failure (`test_terminate_process_tree_kills_grandchild_processes`) by executing `_kill_unix_descendants` unconditionally at entry on Unix to actively discover and terminate child/grandchild processes.
+   - Enhanced `is_pid_alive` to inspect `/proc/<pid>/status` for `State:\tZ` (zombie) and `State:\tX` (dead), returning `False` immediately, and failing closed if `/proc/<pid>` is absent on Linux.
+4. **P2 — Sandbox Enforcement & Permission Bypass Decoupling (`src/mtm_core/runtime/codex.py`)**:
    - Decoupled sandbox modes (`read-only`, `sandbox`, `restricted`) from `--dangerously-skip-permissions` in `build_agy_cmd()`. Permission bypass is now opt-in via explicit parameter or `MTM_AGY_DANGEROUSLY_SKIP_PERMISSIONS`.
-4. **P2 — High-Volume Stream Stress & Soak Verification (`tests/`)**:
-   - Added automated stress suites (`tests/test_stream_deadlock.py`, `tests/test_challenger1_stream_stress.py`, `tests/test_challenger2_adversarial.py`, `tests/test_challenger_retest_adversarial.py`).
-   - Verified 182/182 tests passing with zero failures (`pytest tests/ -q -m 'not live_cli and not staging_game_master'`: **182 passed, 16 deselected in 86.08s**).
+5. **P2 — Comprehensive Stress & Adversarial Verification (`tests/`)**:
+   - Added automated stress and adversarial test suites covering process tree killing, anti-TOCTOU symlink attacks, 50MB disk quota capping, and non-blocking streaming.
+   - Verified 225/225 offline tests passing with 0 failures (`pytest tests/ -q -m 'not live_cli and not staging_game_master'`: **225 passed, 1 skipped, 16 deselected in 82.29s**).
 
 **Release policy:** Keep `MTM_AGENT_CONTEXT_ENABLED` disabled in live competition until SV-04 is green. Do not claim native multi-agent parity before SV-03. Maintain the known-good isolated CLI backend as rollback.

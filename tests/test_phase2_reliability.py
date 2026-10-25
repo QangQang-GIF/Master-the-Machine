@@ -330,6 +330,119 @@ def test_terminate_process_tree_kills_grandchild_processes(tmp_path):
     assert not is_pid_alive(grandchild_pid), f"Grandchild process {grandchild_pid} must be terminated"
 
 
+def test_is_pid_alive_linux_proc_absent_returns_false():
+    """Verify is_pid_alive returns False immediately when /proc/<pid> does not exist on Linux."""
+    from mtm_core.runtime.process import is_pid_alive
+
+    with patch("sys.platform", "linux"), \
+         patch.object(Path, "is_dir", return_value=True), \
+         patch.object(Path, "exists", return_value=False), \
+         patch("os.kill") as mock_kill:
+        assert is_pid_alive(54321) is False
+        # Must never fall through to os.kill
+        mock_kill.assert_not_called()
+
+
+def test_is_pid_alive_linux_zombie_and_dead_states():
+    """Verify is_pid_alive parses /proc/<pid>/status for State: Z and State: X (case-insensitive) and returns False."""
+    from mtm_core.runtime.process import is_pid_alive
+
+    status_variations = [
+        "Name:\tworker\nState:\tZ (zombie)\nTgid:\t100\n",
+        "Name:\tworker\nState:\tz (zombie)\nTgid:\t100\n",
+        "Name:\tworker\nState: Z\nTgid:\t100\n",
+        "Name:\tworker\nState:\tz\nTgid:\t100\n",
+        "Name:\tworker\nState:\tX (dead)\nTgid:\t100\n",
+        "Name:\tworker\nState:\tx (dead)\nTgid:\t100\n",
+        "Name:\tworker\nState: X\nTgid:\t100\n",
+        "Name:\tworker\nState:  x\nTgid:\t100\n",
+        "Name:\tworker\nstate:\tZ\nTgid:\t100\n",
+    ]
+
+    for status_content in status_variations:
+        with patch("sys.platform", "linux"), \
+             patch.object(Path, "is_dir", return_value=True), \
+             patch.object(Path, "exists", return_value=True), \
+             patch.object(Path, "read_text", return_value=status_content), \
+             patch("os.kill") as mock_kill:
+            assert is_pid_alive(12345) is False, f"Failed for status content:\n{status_content}"
+            mock_kill.assert_not_called()
+
+
+def test_is_pid_alive_linux_running_process_returns_true():
+    """Verify is_pid_alive returns True when /proc/<pid>/status indicates a non-zombie running state."""
+    from mtm_core.runtime.process import is_pid_alive
+
+    status_running = "Name:\tpython\nState:\tS (sleeping)\nTgid:\t100\n"
+    with patch("sys.platform", "linux"), \
+         patch.object(Path, "is_dir", return_value=True), \
+         patch.object(Path, "exists", return_value=True), \
+         patch.object(Path, "read_text", return_value=status_running), \
+         patch("os.kill", return_value=None) as mock_kill:
+        assert is_pid_alive(12345) is True
+        mock_kill.assert_called_once_with(12345, 0)
+
+
+def test_is_pid_alive_invalid_and_boundary_pids():
+    """Verify is_pid_alive returns False for invalid PID inputs (0, negative, non-int, boolean)."""
+    from mtm_core.runtime.process import is_pid_alive
+
+    assert is_pid_alive(0) is False
+    assert is_pid_alive(-1) is False
+    assert is_pid_alive(True) is False  # bool is subclass of int in Python
+    assert is_pid_alive(False) is False
+    assert is_pid_alive(None) is False  # type: ignore
+    assert is_pid_alive("12345") is False  # type: ignore
+
+
+def test_terminate_process_tree_always_kills_unix_descendants():
+    """Verify terminate_process_tree unconditionally calls _kill_unix_descendants on Unix in all branches."""
+    from mtm_core.runtime.process import terminate_process_tree
+
+    # 1. Child with distinct process group (session leader)
+    proc_leader = MagicMock()
+    proc_leader.pid = 77777
+    proc_leader.poll.return_value = None
+    with patch("sys.platform", "linux"), \
+         patch("mtm_core.runtime.process._kill_unix_descendants") as mock_desc, \
+         patch("os.getpgid", return_value=77777, create=True), \
+         patch("os.getpgrp", return_value=11111, create=True), \
+         patch("signal.SIGKILL", 9, create=True), \
+         patch("os.killpg", create=True) as mock_killpg:
+        terminate_process_tree(proc_leader)
+        mock_desc.assert_called_once_with(77777)
+        mock_killpg.assert_called_once_with(77777, 9)
+
+    # 2. Child sharing caller's process group
+    proc_shared = MagicMock()
+    proc_shared.pid = 66666
+    proc_shared.poll.return_value = None
+    with patch("sys.platform", "linux"), \
+         patch("mtm_core.runtime.process._kill_unix_descendants") as mock_desc, \
+         patch("os.getpgid", return_value=11111, create=True), \
+         patch("os.getpgrp", return_value=11111, create=True), \
+         patch("signal.SIGKILL", 9, create=True), \
+         patch("os.killpg", create=True) as mock_killpg:
+        terminate_process_tree(proc_shared)
+        mock_desc.assert_called_once_with(66666)
+        mock_killpg.assert_not_called()
+        proc_shared.kill.assert_called()
+
+    # 3. ProcessLookupError when getting pgid (process exited right before pgid check)
+    proc_exited = MagicMock()
+    proc_exited.pid = 55555
+    proc_exited.poll.return_value = None
+    with patch("sys.platform", "linux"), \
+         patch("mtm_core.runtime.process._kill_unix_descendants") as mock_desc, \
+         patch("os.getpgid", side_effect=ProcessLookupError, create=True), \
+         patch("signal.SIGKILL", 9, create=True), \
+         patch("os.killpg", create=True) as mock_killpg:
+        terminate_process_tree(proc_exited)
+        # Even if os.getpgid fails with ProcessLookupError, descendants MUST have been killed first!
+        mock_desc.assert_called_once_with(55555)
+        mock_killpg.assert_not_called()
+
+
 def test_orchestrator_worker_timeout_state_machine(tmp_path):
     """P1 State Machine: When worker times out in Orchestrator.step(), state transitions to TIMED_OUT and frees capacity."""
     from mtm_core.git import git_init, run_git
