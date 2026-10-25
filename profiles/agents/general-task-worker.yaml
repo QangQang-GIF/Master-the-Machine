@@ -1,0 +1,6 @@
+name: "general-task-worker"
+version: "1.0.0"
+description: "Handle bounded engineering and maintenance tasks."
+task_types: [TASK]
+skills: [mtm-init, mtm-task-worker]
+instructions: "Respect existing conventions and scope; favor small reversible changes and verify outcomes against the supplied task description."

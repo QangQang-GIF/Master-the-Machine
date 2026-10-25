@@ -71,3 +71,9 @@ Master-the-Machine/
 ```bash
 pytest tests/ -v
 ```
+
+## Optional portable specialist-agent upgrade
+
+Shared agent profiles (`profiles/agents`) render into Codex and Antigravity native custom-agent definitions using `mtm_agents.export_native_agents`. A bounded metadata-only repository knowledge map (`mtm_knowledge`) and trusted SKILL.md excerpts can enrich `TASK.md` by setting `MTM_AGENT_CONTEXT_ENABLED=1` (disabled by default for contest compatibility). `mtm_backends` provides honest CLI capability probes; native headless sub-agent dispatch remains unverified. `mtm_training.pipeline` offers non-mutating paired evaluation and skill-candidate proposals. Production independent verification uses shell-free guarded commands.
+
+See [server verification and remaining work](docs/SERVER_VERIFICATION_HANDOFF.md). Do not treat these modules as a complete native sub-agent or automated-learning deployment until server tests pass.

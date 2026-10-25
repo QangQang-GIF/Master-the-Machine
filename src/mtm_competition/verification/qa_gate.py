@@ -28,6 +28,10 @@ def validate_schema(data: Dict[str, Any], schema_name: str) -> None:
         jsonschema.validate(instance=data, schema=schema)
     except ImportError:
         _manual_validate(data, schema_name)
+    except jsonschema.exceptions.ValidationError as exc:
+        raise QAGateError(f"Schema validation failed for {schema_name}: {exc.message}") from exc
+    except jsonschema.exceptions.SchemaError as exc:
+        raise QAGateError(f"Invalid JSON schema {schema_name}: {exc.message}") from exc
 
 
 def _manual_validate(data: Dict[str, Any], schema_name: str) -> None:
@@ -251,16 +255,14 @@ def reverify_tests_independently(
 ) -> bool:
     """Independently re-run test commands to verify worker's reported claims."""
     import subprocess
+    from .command_safety import run_verification_command
     ws = Path(workspace_dir).resolve()
     logs = []
     for cmd in commands:
         try:
-            proc = subprocess.run(
+            proc = run_verification_command(
                 cmd,
-                shell=True,
-                cwd=str(ws),
-                capture_output=True,
-                text=True,
+                cwd=ws,
                 timeout=timeout,
             )
             logs.append(f"$ {cmd}\nexit: {proc.returncode}\n{proc.stdout}\n{proc.stderr}")

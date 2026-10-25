@@ -134,6 +134,13 @@ class WorkerLauncher:
 
         # Build prompt & write TASK.md (atomic write; re-checked against cancellation at the check/write boundary)
         prompt_content = PromptBuilder.build_prompt(env_dict, selected_skills=skills)
+        # Opt-in portable role, source metadata and trusted skills. Baseline remains unchanged.
+        if os.environ.get("MTM_AGENT_CONTEXT_ENABLED") == "1":
+            from mtm_agents.context import compile_task_context
+            try:
+                prompt_content += "\n\n" + compile_task_context(env_dict, skills)
+            except (OSError, ValueError, KeyError) as exc:
+                prompt_content += f"\n\nAgent context unavailable: {type(exc).__name__}"
         if not _write_task_file_guarded(ws_path / "TASK.md", prompt_content, cancel_event):
             return (
                 WorkerResult(

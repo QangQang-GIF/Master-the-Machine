@@ -469,7 +469,11 @@ class CompetitionOrchestrator:
         except Exception as e:
             logger.warning("Could not sync match state from Game Master: %s", e)
 
-        backlog = self.gm.list_backlog()
+        try:
+            backlog = self.gm.list_backlog()
+        except Exception as exc:
+            logger.warning("Could not poll Game Master backlog: %s", exc)
+            return 0
         count = 0
         for item in backlog:
             task_id = item["task_id"]
@@ -1001,7 +1005,11 @@ class CompetitionOrchestrator:
             if not step_res:
                 time.sleep(poll_interval)
 
-        final_match_state = self.gm.get_match_state()
+        try:
+            final_match_state = self.gm.get_match_state()
+        except Exception as exc:
+            logger.warning("Final Game Master state unavailable: %s", exc)
+            final_match_state = {}
         return {
             "cycles": cycles,
             "total_score": final_match_state.get("total_score", 0),

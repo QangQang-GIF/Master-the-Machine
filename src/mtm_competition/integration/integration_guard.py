@@ -9,6 +9,7 @@ from typing import Any, Dict, List, Optional
 
 from mtm_core.contracts import WorkerResult
 from mtm_core.git import git_diff, git_status, run_git, get_head_sha
+from mtm_competition.verification.command_safety import run_verification_command
 
 
 @dataclass
@@ -146,20 +147,20 @@ class IntegrationGuard:
 
         # Post-integration verification before commit/push
         if self.verify_post_integration and verification_cmd:
-            verify_proc = subprocess.run(
-                verification_cmd,
-                shell=True,
-                cwd=str(self.target_repo),
-                capture_output=True,
-                text=True,
-            )
-            if verify_proc.returncode != 0:
+            try:
+                verify_proc = run_verification_command(verification_cmd, cwd=self.target_repo, timeout=120)
+                verify_error = verify_proc.stderr or verify_proc.stdout
+                passed = verify_proc.returncode == 0
+            except (ValueError, OSError, subprocess.TimeoutExpired) as exc:
+                verify_error = str(exc)
+                passed = False
+            if not passed:
                 # Safe rollback: Revert only touched files, DO NOT clean -fd or reset --hard canonical repo
                 self._rollback_applied_files(applied_files, pre_existing_files, newly_created_files)
                 return IntegrationResult(
                     success=False,
                     verification_passed=False,
-                    error_message=f"Post-integration verification failed: {verify_proc.stderr or verify_proc.stdout}",
+                    error_message=f"Post-integration verification failed: {verify_error}",
                 )
 
         msg = commit_message or f"feat({worker_result.task_id}): apply verified fix"

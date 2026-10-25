@@ -33,7 +33,7 @@ class PromptBuilder:
         # Include MVS section if officially announced
         mvs = task_envelope.get("mvs")
         if mvs:
-            lines.append("## Minimum Viable Solution (MVS) Criteria")
+            lines.append("## Minimum Verification Scenarios (MVS) Criteria")
             for item in mvs:
                 if isinstance(item, dict):
                     m_id = item.get("id", "")
