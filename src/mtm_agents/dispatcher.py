@@ -227,6 +227,11 @@ class FileBackup:
         _prepare_and_verify_ancestors(dest, ws)
         _verify_workspace_containment(dest.parent, ws)
 
+        # POSIX: pin the verified directory by file descriptor so later path swaps cannot redirect the write.
+        if _dirfd_restore_supported():
+            self._restore_via_dirfd(dest, ws)
+            return
+
         # Phase 2: Prepare destination path
         if _is_link_or_reparse(dest):
             _remove_link_or_reparse(dest)
@@ -292,6 +297,101 @@ class FileBackup:
             os.utime(dest, ns=(self.atime_ns, self.mtime_ns))
         except OSError:
             pass
+
+    def _restore_via_dirfd(self, dest: Path, ws: Path) -> None:
+        """Fd-relative restore (POSIX). Fails closed if any component is a symlink.
+
+        Each directory from the workspace root to dest.parent is opened with O_NOFOLLOW relative to the
+        previous fd, so replacing an ancestor with a symlink after verification cannot redirect the write.
+        The temp file is created and renamed relative to the pinned directory fd; rename replaces a
+        symlink at the destination itself instead of following it.
+        """
+        try:
+            rel_parts = dest.parent.relative_to(ws).parts
+        except ValueError as exc:
+            raise ValueError(f"Agent configuration path '{dest}' resolves outside workspace root '{ws}'") from exc
+
+        dir_flags = os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_CLOEXEC", 0)
+        fd = os.open(str(ws), dir_flags)
+        try:
+            for part in rel_parts:
+                try:
+                    nfd = os.open(part, dir_flags | os.O_NOFOLLOW, dir_fd=fd)
+                except OSError as exc:
+                    raise ValueError(
+                        f"Ancestor '{part}' of '{dest}' is a symlink or not a directory (fail-closed): {exc}"
+                    ) from exc
+                os.close(fd)
+                fd = nfd
+
+            name = dest.name
+            tmp_name = f".restore_{os.urandom(8).hex()}"
+            tfd = os.open(
+                tmp_name,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0),
+                0o600,
+                dir_fd=fd,
+            )
+            replaced = False
+            try:
+                try:
+                    view = memoryview(self.content)
+                    while view:
+                        written = os.write(tfd, view)
+                        view = view[written:]
+                    os.fsync(tfd)
+                    if hashlib.sha256(self.content).hexdigest() != self.sha256:
+                        raise ValueError(f"Restored content for {dest} does not match recorded SHA-256")
+                    try:
+                        os.fchmod(tfd, self.mode & 0o7777)
+                    except OSError:
+                        pass
+                    try:
+                        os.utime(tfd, ns=(self.atime_ns, self.mtime_ns))
+                    except (OSError, NotImplementedError):
+                        pass
+                finally:
+                    os.close(tfd)
+                os.replace(tmp_name, name, src_dir_fd=fd, dst_dir_fd=fd)
+                replaced = True
+            finally:
+                if not replaced:
+                    try:
+                        os.unlink(tmp_name, dir_fd=fd)
+                    except OSError:
+                        pass
+
+            # Post-replace verification through the pinned directory (never via a re-resolved path).
+            rfd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0), dir_fd=fd)
+            try:
+                chunks = []
+                while True:
+                    block = os.read(rfd, 1 << 20)
+                    if not block:
+                        break
+                    chunks.append(block)
+            finally:
+                os.close(rfd)
+            restored_hash = hashlib.sha256(b"".join(chunks)).hexdigest()
+            if restored_hash != self.sha256:
+                raise ValueError(
+                    f"Restored file {dest} hash mismatch: expected {self.sha256}, got {restored_hash}"
+                )
+        finally:
+            os.close(fd)
+
+
+def _dirfd_restore_supported() -> bool:
+    """True when fd-relative, no-follow directory operations are available (POSIX)."""
+    return (
+        os.name == "posix"
+        and hasattr(os, "O_DIRECTORY")
+        and hasattr(os, "O_NOFOLLOW")
+        and os.open in os.supports_dir_fd
+        and os.replace in os.supports_dir_fd
+        and os.unlink in os.supports_dir_fd
+        and os.utime in os.supports_fd
+    )
 
 
 class WrittenFiles(list):
