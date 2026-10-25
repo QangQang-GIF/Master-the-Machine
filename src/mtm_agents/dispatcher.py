@@ -352,7 +352,7 @@ class FileBackup:
                         pass
                 finally:
                     os.close(tfd)
-                os.replace(tmp_name, name, src_dir_fd=fd, dst_dir_fd=fd)
+                os.rename(tmp_name, name, src_dir_fd=fd, dst_dir_fd=fd)  # atomic overwrite on POSIX
                 replaced = True
             finally:
                 if not replaced:
@@ -388,7 +388,7 @@ def _dirfd_restore_supported() -> bool:
         and hasattr(os, "O_DIRECTORY")
         and hasattr(os, "O_NOFOLLOW")
         and os.open in os.supports_dir_fd
-        and os.replace in os.supports_dir_fd
+        and os.rename in os.supports_dir_fd  # os.replace is not listed in supports_dir_fd
         and os.unlink in os.supports_dir_fd
         and os.utime in os.supports_fd
     )
