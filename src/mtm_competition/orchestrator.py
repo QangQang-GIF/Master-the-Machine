@@ -657,10 +657,10 @@ class CompetitionOrchestrator:
                 return {"task_id": task_id, "status": "FINISHED"}
 
             if self.scheduler.is_paused:
-                # Extend worker timeout while match clock is paused
-                supervised_proc.timeout_seconds += 0.2
+                self.supervisor.pause_all()
                 time.sleep(0.2)
                 continue
+            self.supervisor.resume_all()
 
             # Poll backlog to detect if high-priority PI arrived that preempts us
             self.sync_backlog()

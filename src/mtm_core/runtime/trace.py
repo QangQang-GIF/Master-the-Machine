@@ -1,6 +1,6 @@
 """JSONL Execution Trace Parser for Codex CLI and Antigravity.
 
-Migrated from runner/trace_parser.py → single source of truth for both
+Migrated from runner/trace_parser.py -> single source of truth for both
 Competition and Arena subsystems (Refactor R1).
 """
 from __future__ import annotations
@@ -9,6 +9,8 @@ import json
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+
+from .usage import calculate_normalized_credits
 
 
 @dataclass
@@ -25,6 +27,8 @@ class ExecutionTrace:
     reasoning_output_tokens: int = 0
     last_message: str = ""
     structured_result: Optional[Dict[str, Any]] = None
+    model: str = ""
+    backend: str = ""
 
     @property
     def total_tokens(self) -> int:
@@ -36,11 +40,23 @@ class ExecutionTrace:
         uncached_input = max(0, self.input_tokens - self.cached_input_tokens)
         return uncached_input + self.output_tokens
 
+    @property
+    def normalized_credits(self) -> float:
+        """Normalized cross-backend credit cost."""
+        return calculate_normalized_credits(
+            input_tokens=self.input_tokens,
+            cached_input_tokens=self.cached_input_tokens,
+            output_tokens=self.output_tokens,
+            reasoning_output_tokens=self.reasoning_output_tokens,
+            model=self.model,
+            backend=self.backend,
+        )
+
 
 def parse_codex_trace(content_or_lines: str | List[str]) -> ExecutionTrace:
     """Parse Codex CLI JSONL output stream."""
     lines = content_or_lines if isinstance(content_or_lines, list) else content_or_lines.splitlines()
-    trace = ExecutionTrace(raw_lines=lines)
+    trace = ExecutionTrace(raw_lines=lines, backend="codex")
 
     for line in lines:
         line_str = line.strip()
@@ -80,7 +96,7 @@ def parse_codex_trace(content_or_lines: str | List[str]) -> ExecutionTrace:
 def parse_agy_trace(content_or_lines: str | List[str]) -> ExecutionTrace:
     """Parse Antigravity CLI JSON/NDJSON output stream."""
     lines = content_or_lines if isinstance(content_or_lines, list) else content_or_lines.splitlines()
-    trace = ExecutionTrace(raw_lines=lines)
+    trace = ExecutionTrace(raw_lines=lines, backend="antigravity")
 
     for line in reversed(lines):
         line_str = line.strip()

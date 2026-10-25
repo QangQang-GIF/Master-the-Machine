@@ -11,6 +11,7 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = [
+    "editables>=0.5",
     "pytest>=8.0,<9",
     "pytest-timeout>=2.3,<3",
 ]
@@ -24,6 +25,7 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/mtm_core", "src/mtm_competition", "src/mtm_arena", "src/mtm_training", "src/mtm_agents", "src/mtm_backends", "src/mtm_knowledge"]
+dev-mode-exact = true
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

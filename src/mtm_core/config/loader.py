@@ -95,3 +95,39 @@ def verify_skill_checksums(
             )
 
     return True
+
+
+def verify_profile_checksums(
+    root_dir: Path | str = ".",
+    checksum_file: Optional[Path | str] = None,
+) -> bool:
+    """Verify that all agent profiles in profiles/agents/*.yaml are pinned in releases/checksums.sha256."""
+    import hashlib
+
+    base = get_project_root() if not root_dir or str(root_dir) == "." else Path(root_dir).resolve()
+    cs_path = Path(checksum_file).resolve() if checksum_file else base / "releases" / "checksums.sha256"
+    if not cs_path.exists():
+        raise FileNotFoundError(f"Checksum file not found: {cs_path}")
+
+    pinned: Dict[str, str] = {}
+    for line in cs_path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        parts = line.split(None, 1)
+        if len(parts) == 2:
+            pinned[parts[1].strip()] = parts[0].lower()
+
+    profiles_dir = base / "profiles" / "agents"
+    if profiles_dir.is_dir():
+        for profile_path in sorted(profiles_dir.glob("*.yaml")):
+            rel_path = profile_path.relative_to(base).as_posix()
+            if rel_path not in pinned:
+                raise RuntimeError(f"Unpinned agent profile in release manifest: {rel_path}")
+            actual_hash = hashlib.sha256(profile_path.read_bytes().replace(b"\r\n", b"\n")).hexdigest().lower()
+            if actual_hash != pinned[rel_path]:
+                raise RuntimeError(
+                    f"Profile checksum mismatch for {rel_path}: expected {pinned[rel_path]}, calculated {actual_hash}"
+                )
+    return verify_skill_checksums(base, cs_path)
+

@@ -81,6 +81,7 @@ class WorkerLauncher:
         backend: Optional[str] = None,
         on_process_start: Optional[Callable[[Any], None]] = None,
         cancel_event: Optional[Any] = None,
+        pause_event: Optional[Any] = None,
     ) -> Tuple[WorkerResult, ExecutionTrace, Path]:
         """Execute task in an isolated workspace.
 
@@ -161,26 +162,45 @@ class WorkerLauncher:
         )
 
         trace_log = ws_path / "trace.jsonl"
-        run_kwargs: Dict[str, Any] = {
-            "workspace": ws_path,
-            "prompt": kickoff,
-            "model": model,
-            "effort": effort,
-            "timeout": timeout,
-            "log_file": trace_log,
-            "backend": routing.backend,
-            "on_process_start": on_process_start,
-        }
-        try:
-            sig = inspect.signature(self.runtime.run)
-            if "cancel_event" in sig.parameters or any(
-                p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()
-            ):
-                run_kwargs["cancel_event"] = cancel_event
-        except Exception:
-            pass
+        if os.environ.get("MTM_NATIVE_AGENT_DISPATCH") == "1":
+            from mtm_agents.dispatcher import NativeSubagentDispatcher
 
-        runtime_res = self.runtime.run(**run_kwargs)
+            dispatcher = NativeSubagentDispatcher(runtime=self.runtime)
+            runtime_res = dispatcher.dispatch(
+                envelope=env_dict,
+                prompt=kickoff,
+                workspace=ws_path,
+                backend=routing.backend,
+                model=model,
+                effort=effort,
+                timeout=timeout,
+                log_file=trace_log,
+                on_process_start=on_process_start,
+                cancel_event=cancel_event,
+                pause_event=pause_event,
+            )
+        else:
+            run_kwargs: Dict[str, Any] = {
+                "workspace": ws_path,
+                "prompt": kickoff,
+                "model": model,
+                "effort": effort,
+                "timeout": timeout,
+                "log_file": trace_log,
+                "backend": routing.backend,
+                "on_process_start": on_process_start,
+            }
+            try:
+                sig = inspect.signature(self.runtime.run)
+                has_var_kw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values())
+                if "cancel_event" in sig.parameters or has_var_kw:
+                    run_kwargs["cancel_event"] = cancel_event
+                if ("pause_event" in sig.parameters or has_var_kw) and pause_event is not None:
+                    run_kwargs["pause_event"] = pause_event
+            except Exception:
+                pass
+
+            runtime_res = self.runtime.run(**run_kwargs)
 
         trace = runtime_res.trace
         elapsed = runtime_res.elapsed
@@ -236,7 +256,12 @@ class WorkerLauncher:
         try:
             status_files = git_status(ws)
             for f in status_files:
-                if f not in ("TASK.md", "trace.jsonl", "worker_result.json"):
+                norm_f = f.replace("\\", "/")
+                if (
+                    norm_f not in ("TASK.md", "trace.jsonl", "worker_result.json")
+                    and not norm_f.startswith(".codex/agents/")
+                    and not norm_f.startswith(".agents/agents/")
+                ):
                     changed.append(f)
         except Exception:
             pass

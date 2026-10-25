@@ -1,7 +1,8 @@
 """CodexRuntime: Unified execution engine for OpenAI Codex CLI (and Antigravity fallback).
 
 Single canonical runtime for both Competition Orchestrator and Arena Subsystems.
-Enforces deterministic timeout semantics, process sandbox policies, and trace harvesting.
+Enforces deterministic timeout semantics, pause-aware deadlines, policy-aware sandboxing,
+native agent profile targeting, and trace harvesting.
 """
 from __future__ import annotations
 
@@ -79,6 +80,7 @@ class CodexRuntime:
         sandbox_policy: str = "workspace-write",
         network_access: bool = True,
         codex_config: Optional[Dict[str, Any]] = None,
+        agent: Optional[str] = None,
     ) -> List[str]:
         """Construct codex exec command matching official CLI contracts."""
         cmd = [
@@ -96,6 +98,9 @@ class CodexRuntime:
         if sys.platform == "win32":
             cmd += ["-c", 'windows.sandbox="unelevated"']
 
+        if agent:
+            cmd += ["-c", f"agent={json.dumps(agent)}"]
+
         if codex_config:
             for k, v in codex_config.items():
                 cmd += ["-c", f"{k}={json.dumps(v)}"]
@@ -108,18 +113,57 @@ class CodexRuntime:
         prompt: str,
         effort: Optional[str] = None,
         model: Optional[str] = None,
+        sandbox_policy: Optional[str] = None,
+        agent: Optional[str] = None,
     ) -> List[str]:
-        """Construct Antigravity CLI command."""
-        cmd = [
-            "agy", "-p", prompt,
-            "--dangerously-skip-permissions",
-            "--output-format", "json"
-        ]
+        """Construct Antigravity CLI command with optional policy-aware sandbox and agent role."""
+        policy = (sandbox_policy or os.environ.get("MTM_AGY_SANDBOX_POLICY") or "").lower()
+        cmd = ["agy", "-p", prompt]
+
+        if policy == "read-only":
+            cmd += ["--sandbox", "--mode", "plan"]
+        elif policy in ("sandbox", "restricted", "workspace-sandbox") or os.environ.get("MTM_AGY_SANDBOX") == "1":
+            cmd += ["--sandbox", "--mode", "accept-edits", "--dangerously-skip-permissions"]
+        else:
+            cmd += ["--dangerously-skip-permissions"]
+
+        cmd += ["--output-format", "json"]
+        if agent:
+            cmd += ["--agent", agent]
         if model:
             cmd += ["--model", model]
         if effort:
             cmd += ["--effort", effort]
         return cmd
+
+    @staticmethod
+    def _communicate_with_pause(
+        proc: Any,
+        timeout: float,
+        pause_event: Optional[Any],
+    ) -> tuple[str, str]:
+        """Wait for subprocess output while freezing timeout depletion whenever `pause_event` is set."""
+        if pause_event is None:
+            out, err = proc.communicate(timeout=timeout)
+            return out or "", err or ""
+
+        remaining = float(timeout)
+        t_last = time.monotonic()
+        while True:
+            poll_fn = getattr(proc, "poll", None)
+            if callable(poll_fn) and poll_fn() is not None:
+                out, err = proc.communicate(timeout=2)
+                return out or "", err or ""
+
+            time.sleep(0.04)
+            t_now = time.monotonic()
+            elapsed_slice = t_now - t_last
+            t_last = t_now
+
+            if not pause_event.is_set():
+                remaining -= elapsed_slice
+                if remaining <= 0:
+                    raise subprocess.TimeoutExpired(cmd=getattr(proc, "args", ["worker"]), timeout=timeout)
 
     def run(
         self,
@@ -135,11 +179,14 @@ class CodexRuntime:
         backend: Optional[str] = None,
         on_process_start: Optional[Callable[[Any], None]] = None,
         cancel_event: Optional[Any] = None,
+        pause_event: Optional[Any] = None,
+        agent: Optional[str] = None,
     ) -> RuntimeResult:
         """Execute a worker in the given workspace.
 
         Guarantees strict timeout semantics:
         - If the process exceeds timeout, it is killed immediately and timed_out=True.
+        - While pause_event is set, timeout budget is frozen and does not expire.
         - timed_out != READY_FOR_REVIEW.
         - Backend selection: 'codex' or 'antigravity' (no silent fallbacks if explicitly requested).
         """
@@ -156,6 +203,7 @@ class CodexRuntime:
                     "reasoning_output_tokens": 0,
                     "total_tokens": 0,
                     "billable_tokens": 0,
+                    "normalized_credits": 0.0,
                 },
                 commands=0,
                 file_changes=0,
@@ -199,6 +247,8 @@ class CodexRuntime:
                     "Ensure Codex CLI is installed or configure fallback."
                 )
 
+        resolved_backend = "codex" if use_codex else "antigravity"
+
         if use_codex:
             cmd = self.build_codex_cmd(
                 workspace=ws,
@@ -208,6 +258,7 @@ class CodexRuntime:
                 sandbox_policy=sandbox_policy,
                 network_access=network_access,
                 codex_config=codex_config,
+                agent=agent,
             )
             if cancel_event is not None and cancel_event.is_set():
                 timed_out = True
@@ -252,8 +303,7 @@ class CodexRuntime:
 
                         threading.Thread(target=_watch_codex_cancel, daemon=True).start()
                     try:
-                        out, _ = proc.communicate(timeout=timeout)
-                        stdout_text = out or ""
+                        stdout_text, _ = self._communicate_with_pause(proc, timeout=timeout, pause_event=pause_event)
                         exit_code = proc.returncode
                     except subprocess.TimeoutExpired:
                         timed_out = True
@@ -270,7 +320,14 @@ class CodexRuntime:
             trace = parse_codex_trace(stdout_text)
 
         else:
-            cmd = self.build_agy_cmd(prompt=prompt, effort=effort, model=model)
+            agy_sandbox = sandbox_policy if sandbox_policy in ("read-only", "sandbox", "restricted", "workspace-sandbox") else None
+            cmd = self.build_agy_cmd(
+                prompt=prompt,
+                effort=effort,
+                model=model,
+                sandbox_policy=agy_sandbox,
+                agent=agent,
+            )
             if cancel_event is not None and cancel_event.is_set():
                 timed_out = True
                 exit_code = -1
@@ -314,8 +371,7 @@ class CodexRuntime:
 
                         threading.Thread(target=_watch_agy_cancel, daemon=True).start()
                     try:
-                        out, _ = proc.communicate(timeout=timeout)
-                        stdout_text = out or ""
+                        stdout_text, _ = self._communicate_with_pause(proc, timeout=timeout, pause_event=pause_event)
                         exit_code = proc.returncode
                     except subprocess.TimeoutExpired:
                         timed_out = True
@@ -331,6 +387,8 @@ class CodexRuntime:
 
             trace = parse_agy_trace(stdout_text)
 
+        trace.model = model or ""
+        trace.backend = resolved_backend
         elapsed = round(time.time() - t0, 2)
 
         if cancel_event is not None and cancel_event.is_set():
@@ -348,6 +406,7 @@ class CodexRuntime:
             "reasoning_output_tokens": trace.reasoning_output_tokens,
             "total_tokens": trace.total_tokens,
             "billable_tokens": trace.billable_tokens,
+            "normalized_credits": trace.normalized_credits,
         }
 
         return RuntimeResult(

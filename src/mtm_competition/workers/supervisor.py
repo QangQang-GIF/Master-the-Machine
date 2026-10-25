@@ -1,4 +1,4 @@
-"""WorkerSupervisor: Supervises active worker execution, process liveness, async dispatch, and preemption."""
+"""WorkerSupervisor: Supervises active worker execution, process liveness, async dispatch, pause/resume, and preemption."""
 from __future__ import annotations
 
 import concurrent.futures
@@ -39,12 +39,15 @@ class SupervisedProcess:
     result: Optional[Tuple[WorkerResult, ExecutionTrace, Path]] = None
     subprocess_handle: Optional[Any] = None
     cancel_event: threading.Event = field(default_factory=threading.Event, repr=False)
+    pause_event: threading.Event = field(default_factory=threading.Event, repr=False)
+    paused_at: Optional[float] = None
+    paused_seconds: float = 0.0
     quiesced: bool = False
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
 
 class WorkerSupervisor:
-    """Supervises active worker processes and handles async dispatch, timeouts, and preemption."""
+    """Supervises active worker processes and handles async dispatch, pause/resume deadlines, timeouts, and preemption."""
 
     def __init__(self, max_workers: int = 2, quiesce_timeout: float = 5.0):
         self.max_workers = max_workers
@@ -111,6 +114,44 @@ class WorkerSupervisor:
     def get_worker(self, task_id: str) -> Optional[SupervisedProcess]:
         return self.get_process(task_id)
 
+    def pause_worker(self, task_id: str) -> bool:
+        """Freeze active worker deadline budget while match is PAUSED."""
+        proc = self._active_workers.get(task_id)
+        if not proc:
+            return False
+        with proc._lock:
+            if not proc.pause_event.is_set():
+                proc.paused_at = time.time()
+                proc.pause_event.set()
+        return True
+
+    def resume_worker(self, task_id: str) -> bool:
+        """Resume active worker deadline budget after match PAUSED ends."""
+        proc = self._active_workers.get(task_id)
+        if not proc:
+            return False
+        with proc._lock:
+            if proc.pause_event.is_set():
+                if proc.paused_at is not None:
+                    proc.paused_seconds += max(0.0, time.time() - proc.paused_at)
+                proc.paused_at = None
+                proc.pause_event.clear()
+        return True
+
+    def pause_all(self) -> int:
+        count = 0
+        for tid in list(self._active_workers.keys()):
+            if self.pause_worker(tid):
+                count += 1
+        return count
+
+    def resume_all(self) -> int:
+        count = 0
+        for tid in list(self._active_workers.keys()):
+            if self.resume_worker(tid):
+                count += 1
+        return count
+
     def launch_async(
         self,
         launcher_fn: Callable[..., Tuple[WorkerResult, ExecutionTrace, Path]],
@@ -140,6 +181,7 @@ class WorkerSupervisor:
         sig = inspect.signature(target_fn)
         has_on_proc = "on_process_start" in sig.parameters
         has_cancel_ev = "cancel_event" in sig.parameters
+        has_pause_ev = "pause_event" in sig.parameters
 
         def _runner():
             if proc.cancel_event.is_set():
@@ -149,6 +191,8 @@ class WorkerSupervisor:
                 kwargs["on_process_start"] = lambda p: self._register_proc_subprocess(proc, p, on_pid_callback)
             if has_cancel_ev:
                 kwargs["cancel_event"] = proc.cancel_event
+            if has_pause_ev:
+                kwargs["pause_event"] = proc.pause_event
             return launcher_fn(envelope, **kwargs)
 
         self._active_workers[task_id] = proc
@@ -241,6 +285,7 @@ class WorkerSupervisor:
         if join_timeout is None:
             join_timeout = self.quiesce_timeout
         with proc._lock:
+            proc.pause_event.clear()
             proc.cancel_event.set()
             proc.status = target_status
             handle = proc.subprocess_handle
@@ -389,7 +434,12 @@ class WorkerSupervisor:
         proc = self._active_workers.get(task_id)
         if not proc:
             return False
-        return (time.time() - proc.started_at) > proc.timeout_seconds
+        with proc._lock:
+            if proc.pause_event.is_set():
+                return False
+            paused = proc.paused_seconds
+        effective_elapsed = (time.time() - proc.started_at) - paused
+        return effective_elapsed > proc.timeout_seconds
 
     def active_worker_count(self) -> int:
         return len(self._active_workers)

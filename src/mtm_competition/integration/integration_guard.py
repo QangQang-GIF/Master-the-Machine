@@ -1,8 +1,9 @@
-"""IntegrationGuard: Integrates validated worker patches into the canonical submission repository."""
+"""IntegrationGuard: Integrates validated worker patches into the canonical submission repository with 3-way conflict detection."""
 from __future__ import annotations
 
 import os
 import subprocess
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -22,8 +23,50 @@ class IntegrationResult:
     verification_passed: bool = True
 
 
+def _has_git_head(repo: Path) -> bool:
+    if not (repo / ".git").exists():
+        return False
+    res = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "--verify", "HEAD"],
+        capture_output=True,
+        check=False,
+    )
+    return res.returncode == 0
+
+
+def _read_git_head_blob(repo: Path, rel_posix: str) -> Optional[bytes]:
+    res = subprocess.run(
+        ["git", "-C", str(repo), "show", f"HEAD:{rel_posix}"],
+        capture_output=True,
+        check=False,
+    )
+    if res.returncode == 0:
+        return res.stdout
+    return None
+
+
+def _three_way_merge_bytes(current_bytes: bytes, base_bytes: bytes, worker_bytes: bytes) -> Optional[bytes]:
+    """Run `git merge-file -p` on three byte buffers; return merged bytes if clean, or None on conflict."""
+    with tempfile.TemporaryDirectory(prefix="mtm_3way_") as tmp_dir:
+        td = Path(tmp_dir)
+        cur_f = td / "current"
+        base_f = td / "base"
+        wrk_f = td / "worker"
+        cur_f.write_bytes(current_bytes)
+        base_f.write_bytes(base_bytes)
+        wrk_f.write_bytes(worker_bytes)
+        res = subprocess.run(
+            ["git", "merge-file", "-p", str(cur_f), str(base_f), str(wrk_f)],
+            capture_output=True,
+            check=False,
+        )
+        if res.returncode == 0:
+            return res.stdout
+        return None
+
+
 class IntegrationGuard:
-    """Safely stages, applies, verifies, commits, and pushes worker patches onto the submission branch."""
+    """Safely stages, 3-way merges, verifies, commits, and pushes worker patches onto the submission branch."""
 
     def __init__(
         self,
@@ -86,7 +129,9 @@ class IntegrationGuard:
                 error_message="Worker reported changes but diff is empty",
             )
 
-        # Validate and apply patch files safely
+        ws_has_head = _has_git_head(ws)
+
+        # Validate and apply patch files safely (with 3-way conflict resolution when ws has a base HEAD)
         applied_files: List[str] = []
         newly_created_files: List[Path] = []
         pre_existing_files: Dict[str, bytes] = {}
@@ -94,13 +139,23 @@ class IntegrationGuard:
         for rel_file in worker_result.changed_files:
             rel_path = Path(rel_file)
             if rel_path.is_absolute() or ".." in rel_path.parts:
+                self._rollback_applied_files(applied_files, pre_existing_files, newly_created_files)
                 return IntegrationResult(
                     success=False,
                     error_message=f"Invalid path traversal in worker result: {rel_file}",
                 )
 
+            rel_posix = rel_path.as_posix()
+            if rel_posix.startswith((".codex/agents/", ".agents/agents/")):
+                self._rollback_applied_files(applied_files, pre_existing_files, newly_created_files)
+                return IntegrationResult(
+                    success=False,
+                    error_message=f"Native agent profile paths cannot be integrated into customer repo: {rel_file}",
+                )
+
             src_file = ws / rel_file
             if src_file.is_symlink():
+                self._rollback_applied_files(applied_files, pre_existing_files, newly_created_files)
                 return IntegrationResult(
                     success=False,
                     error_message=f"Symlinks are disallowed in worker patches: {rel_file}",
@@ -110,6 +165,7 @@ class IntegrationGuard:
             try:
                 dest_file.relative_to(self.target_repo)
             except (ValueError, RuntimeError):
+                self._rollback_applied_files(applied_files, pre_existing_files, newly_created_files)
                 return IntegrationResult(
                     success=False,
                     error_message=f"Path escape detected: {rel_file} is outside canonical repository",
@@ -118,13 +174,36 @@ class IntegrationGuard:
             if dest_file.exists():
                 pre_existing_files[rel_file] = dest_file.read_bytes()
 
+            ws_base_bytes = _read_git_head_blob(ws, rel_posix) if ws_has_head else None
+
             if src_file.exists():
+                worker_bytes = src_file.read_bytes()
+                target_bytes_to_write = worker_bytes
+
+                if ws_has_head and rel_file in pre_existing_files and ws_base_bytes is not None:
+                    current_target_bytes = pre_existing_files[rel_file]
+                    if current_target_bytes != ws_base_bytes:
+                        merged = _three_way_merge_bytes(current_target_bytes, ws_base_bytes, worker_bytes)
+                        if merged is None:
+                            self._rollback_applied_files(applied_files, pre_existing_files, newly_created_files)
+                            return IntegrationResult(
+                                success=False,
+                                error_message=f"Three-way merge conflict on {rel_file}: canonical repo has conflicting concurrent edits",
+                            )
+                        target_bytes_to_write = merged
+
                 dest_file.parent.mkdir(parents=True, exist_ok=True)
-                dest_file.write_bytes(src_file.read_bytes())
+                dest_file.write_bytes(target_bytes_to_write)
                 applied_files.append(rel_file)
                 if rel_file not in pre_existing_files:
                     newly_created_files.append(dest_file)
             elif not src_file.exists() and dest_file.exists():
+                if ws_has_head and ws_base_bytes is not None and pre_existing_files[rel_file] != ws_base_bytes:
+                    self._rollback_applied_files(applied_files, pre_existing_files, newly_created_files)
+                    return IntegrationResult(
+                        success=False,
+                        error_message=f"Three-way merge conflict (modify/delete) on {rel_file}",
+                    )
                 # Handled deletion
                 dest_file.unlink()
                 applied_files.append(rel_file)
@@ -234,7 +313,8 @@ class IntegrationGuard:
         newly_created_files: List[Path],
     ) -> None:
         """Safely revert only touched files without reset --hard or clean -fd."""
-        run_git(self.target_repo, ["reset", "HEAD", "--"] + applied_files)
+        if applied_files:
+            run_git(self.target_repo, ["reset", "HEAD", "--"] + applied_files)
         for rel_file, original_content in pre_existing_files.items():
             dest = self.target_repo / rel_file
             dest.write_bytes(original_content)
