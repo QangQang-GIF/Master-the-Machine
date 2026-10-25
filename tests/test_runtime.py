@@ -39,6 +39,95 @@ def test_agy_command_builder():
     assert "--dangerously-skip-permissions" in cmd
 
 
+def test_agy_sandbox_and_permission_bypass_decoupling(monkeypatch):
+    """R3: Verify build_agy_cmd decouples sandbox policies from permission bypass flags."""
+    rt = CodexRuntime()
+
+    # 1. Sandboxed mode defaults to NO permission bypass
+    cmd_sb = rt.build_agy_cmd("Fix bug", sandbox_policy="sandbox")
+    assert "--sandbox" in cmd_sb
+    assert "accept-edits" in cmd_sb
+    assert "--dangerously-skip-permissions" not in cmd_sb
+
+    # 2. Restricted mode defaults to NO permission bypass
+    cmd_res = rt.build_agy_cmd("Fix bug", sandbox_policy="restricted")
+    assert "--sandbox" in cmd_res
+    assert "accept-edits" in cmd_res
+    assert "--dangerously-skip-permissions" not in cmd_res
+
+    # 3. Workspace-sandbox mode defaults to NO permission bypass
+    cmd_ws_sb = rt.build_agy_cmd("Fix bug", sandbox_policy="workspace-sandbox")
+    assert "--sandbox" in cmd_ws_sb
+    assert "accept-edits" in cmd_ws_sb
+    assert "--dangerously-skip-permissions" not in cmd_ws_sb
+
+    # 4. Read-only mode defaults to NO permission bypass
+    cmd_ro = rt.build_agy_cmd("Audit code", sandbox_policy="read-only")
+    assert "--sandbox" in cmd_ro
+    assert "plan" in cmd_ro
+    assert "--dangerously-skip-permissions" not in cmd_ro
+
+    # 5. Sandboxed mode with explicit dangerously_skip_permissions=True includes bypass
+    cmd_sb_bypass = rt.build_agy_cmd("Fix bug", sandbox_policy="sandbox", dangerously_skip_permissions=True)
+    assert "--sandbox" in cmd_sb_bypass
+    assert "accept-edits" in cmd_sb_bypass
+    assert "--dangerously-skip-permissions" in cmd_sb_bypass
+
+    # 6. Sandboxed mode with alias skip_permissions=True includes bypass
+    cmd_alias = rt.build_agy_cmd("Fix bug", sandbox_policy="sandbox", skip_permissions=True)
+    assert "--sandbox" in cmd_alias
+    assert "--dangerously-skip-permissions" in cmd_alias
+
+    # 7. Read-only mode with explicit bypass flag includes bypass
+    cmd_ro_bypass = rt.build_agy_cmd("Audit code", sandbox_policy="read-only", dangerously_skip_permissions=True)
+    assert "--sandbox" in cmd_ro_bypass
+    assert "plan" in cmd_ro_bypass
+    assert "--dangerously-skip-permissions" in cmd_ro_bypass
+
+    # 8. Unrestricted mode with explicit dangerously_skip_permissions=False suppresses bypass
+    cmd_unres_no_bypass = rt.build_agy_cmd("Fix bug", sandbox_policy="workspace-write", dangerously_skip_permissions=False)
+    assert "--dangerously-skip-permissions" not in cmd_unres_no_bypass
+
+    cmd_none_no_bypass = rt.build_agy_cmd("Fix bug", sandbox_policy=None, dangerously_skip_permissions=False)
+    assert "--dangerously-skip-permissions" not in cmd_none_no_bypass
+
+    # 9. Unrestricted default continues to include bypass (backward-compatibility)
+    cmd_def = rt.build_agy_cmd("Fix bug")
+    assert "--dangerously-skip-permissions" in cmd_def
+
+    cmd_ws_write = rt.build_agy_cmd("Fix bug", sandbox_policy="workspace-write")
+    assert "--dangerously-skip-permissions" in cmd_ws_write
+
+    # 10. Case-insensitive sandbox policy matching
+    cmd_case = rt.build_agy_cmd("Fix bug", sandbox_policy="SANDBOX")
+    assert "--sandbox" in cmd_case
+    assert "--dangerously-skip-permissions" not in cmd_case
+
+    # 11. Environment variable overrides
+    # MTM_AGY_DANGEROUSLY_SKIP_PERMISSIONS=1 enables bypass even in sandbox
+    monkeypatch.setenv("MTM_AGY_DANGEROUSLY_SKIP_PERMISSIONS", "1")
+    cmd_env_bypass = rt.build_agy_cmd("Fix bug", sandbox_policy="sandbox")
+    assert "--dangerously-skip-permissions" in cmd_env_bypass
+
+    # Explicit argument overrides environment variable
+    cmd_arg_wins = rt.build_agy_cmd("Fix bug", sandbox_policy="sandbox", dangerously_skip_permissions=False)
+    assert "--dangerously-skip-permissions" not in cmd_arg_wins
+
+    monkeypatch.delenv("MTM_AGY_DANGEROUSLY_SKIP_PERMISSIONS", raising=False)
+
+    # MTM_AGY_DANGEROUSLY_SKIP_PERMISSIONS=0 disables bypass in unrestricted mode
+    monkeypatch.setenv("MTM_AGY_DANGEROUSLY_SKIP_PERMISSIONS", "0")
+    cmd_env_suppress = rt.build_agy_cmd("Fix bug")
+    assert "--dangerously-skip-permissions" not in cmd_env_suppress
+
+    # MTM_AGY_SANDBOX=1 triggers sandbox mode when no policy is set
+    monkeypatch.delenv("MTM_AGY_DANGEROUSLY_SKIP_PERMISSIONS", raising=False)
+    monkeypatch.setenv("MTM_AGY_SANDBOX", "1")
+    cmd_env_sandbox = rt.build_agy_cmd("Fix bug")
+    assert "--sandbox" in cmd_env_sandbox
+    assert "--dangerously-skip-permissions" not in cmd_env_sandbox
+
+
 def test_strict_timeout_semantics(tmp_path):
     """Exit gate requirement: timeout must set timed_out=True and status=TIMED_OUT, NOT READY_FOR_REVIEW."""
     runtime = CodexRuntime(prefer_codex=True, allow_agy_fallback=True, codex_path="/usr/bin/codex")

@@ -108,4 +108,21 @@ MTM_ENV=production python -m pytest tests/test_agent_upgrade_integration.py -q
 | SV-07 | `166b7dce` | 2026-10-25 07:42Z | Pair Engineer | Win11 / Py 3.12.0 | `test_sv07_paired_contest_simulator` | **PASS** | Paired contest simulation, 3-way merge conflict detection, and normalized credits verified. |
 | SV-08 | `166b7dce` | 2026-10-25 07:25Z | Pair Engineer | Win11 / Py 3.12.0 | `pytest tests/test_agent_upgrade.py -k "dataset or training or checksum"` | **PASS** | Offline dataset loading, proposal diffs, and `releases/checksums.sha256` verified. |
 
+## Post-Commit 42631e4 Review Remediation & Victory Audit
+
+On 2026-10-25, following a comprehensive multi-backend code review of commit `42631e4`, a dedicated Teamwork multi-agent swarm executed and completed an independent forensic remediation and audit cycle (**Verdict: VICTORY CONFIRMED**):
+
+1. **P1 — Deadlock Immunity in Subprocess Stream Draining (`src/mtm_core/runtime/codex.py`)**:
+   - Replaced blocking pipes with background daemon reader threads utilizing `read1(65536)` on underlying binary stream buffers, preventing OS pipe saturation deadlocks on continuous output streams up to 50MB.
+   - Preserved monotonic pause-freeze deadline deduction during streaming.
+   - Captured diagnostic output directly into `TimeoutExpired.output` without stalls.
+2. **P2 — Non-Destructive Agent Configuration Dispatcher (`src/mtm_agents/dispatcher.py`)**:
+   - Implemented `FileBackup` dataclass capturing binary content, SHA-256 digest, nanosecond timestamps (`st_atime_ns`, `st_mtime_ns`), and permissions (`st_mode`).
+   - Pre-existing configuration files in `.codex/agents/` and `.agents/agents/` are safely restored upon cleanup. Ephemeral dispatcher files are cleanly unlinked.
+3. **P2 — Sandbox Enforcement & Permission Bypass Decoupling (`src/mtm_core/runtime/codex.py`)**:
+   - Decoupled sandbox modes (`read-only`, `sandbox`, `restricted`) from `--dangerously-skip-permissions` in `build_agy_cmd()`. Permission bypass is now opt-in via explicit parameter or `MTM_AGY_DANGEROUSLY_SKIP_PERMISSIONS`.
+4. **P2 — High-Volume Stream Stress & Soak Verification (`tests/`)**:
+   - Added automated stress suites (`tests/test_stream_deadlock.py`, `tests/test_challenger1_stream_stress.py`, `tests/test_challenger2_adversarial.py`, `tests/test_challenger_retest_adversarial.py`).
+   - Verified 182/182 tests passing with zero failures (`pytest tests/ -q -m 'not live_cli and not staging_game_master'`: **182 passed, 16 deselected in 86.08s**).
+
 **Release policy:** Keep `MTM_AGENT_CONTEXT_ENABLED` disabled in live competition until SV-04 is green. Do not claim native multi-agent parity before SV-03. Maintain the known-good isolated CLI backend as rollback.

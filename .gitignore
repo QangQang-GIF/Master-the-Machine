@@ -40,6 +40,7 @@ AI-Arena/arena/data/results/
 AI-Arena/arena/data/catalog.jsonl
 
 .superpowers/
+.agents/teamwork/
 
 # runtime/benchmark artifacts
 bench_results.json

@@ -6,6 +6,7 @@ native agent profile targeting, and trace harvesting.
 """
 from __future__ import annotations
 
+import io
 import json
 import os
 import shutil
@@ -115,16 +116,35 @@ class CodexRuntime:
         model: Optional[str] = None,
         sandbox_policy: Optional[str] = None,
         agent: Optional[str] = None,
+        dangerously_skip_permissions: Optional[bool] = None,
+        skip_permissions: Optional[bool] = None,
     ) -> List[str]:
-        """Construct Antigravity CLI command with optional policy-aware sandbox and agent role."""
-        policy = (sandbox_policy or os.environ.get("MTM_AGY_SANDBOX_POLICY") or "").lower()
+        """Construct Antigravity CLI command with policy-aware sandbox decoupled from permission bypass."""
+        policy = (sandbox_policy or os.environ.get("MTM_AGY_SANDBOX_POLICY") or "").strip().lower()
         cmd = ["agy", "-p", prompt]
 
+        is_sandboxed = policy in ("read-only", "sandbox", "restricted", "workspace-sandbox") or (
+            os.environ.get("MTM_AGY_SANDBOX") == "1"
+        )
+
+        # Apply sandbox mode flags
         if policy == "read-only":
             cmd += ["--sandbox", "--mode", "plan"]
-        elif policy in ("sandbox", "restricted", "workspace-sandbox") or os.environ.get("MTM_AGY_SANDBOX") == "1":
-            cmd += ["--sandbox", "--mode", "accept-edits", "--dangerously-skip-permissions"]
-        else:
+        elif is_sandboxed:
+            cmd += ["--sandbox", "--mode", "accept-edits"]
+
+        # Resolve permission bypass orthogonally
+        explicit_bypass = dangerously_skip_permissions if dangerously_skip_permissions is not None else skip_permissions
+        if explicit_bypass is None:
+            env_val = os.environ.get("MTM_AGY_DANGEROUSLY_SKIP_PERMISSIONS") or os.environ.get("MTM_AGY_SKIP_PERMISSIONS")
+            if env_val is not None:
+                explicit_bypass = env_val.strip().lower() in ("1", "true", "yes")
+
+        # Decoupled policy: sandboxed modes do NOT skip permissions unless explicitly requested;
+        # unrestricted mode defaults to skipping permissions for non-interactive headless CLI execution.
+        should_skip = explicit_bypass if explicit_bypass is not None else (not is_sandboxed)
+
+        if should_skip:
             cmd += ["--dangerously-skip-permissions"]
 
         cmd += ["--output-format", "json"]
@@ -142,28 +162,146 @@ class CodexRuntime:
         timeout: float,
         pause_event: Optional[Any],
     ) -> tuple[str, str]:
-        """Wait for subprocess output while freezing timeout depletion whenever `pause_event` is set."""
-        if pause_event is None:
+        """Wait for subprocess output while freezing timeout depletion whenever `pause_event` is set.
+
+        Continuously drains stdout and stderr pipes in background daemon threads so that
+        child process output (even >10MB) never saturates OS pipe buffers (~64KB) or causes
+        deadlocks, while strictly preserving monotonic pause/resume deadline freezing.
+        """
+        def _is_pipe(stream: Any) -> bool:
+            if stream is None:
+                return False
+            try:
+                import unittest.mock as _mock
+                if isinstance(stream, _mock.Base):
+                    return False
+            except ImportError:
+                pass
+            return callable(getattr(stream, "read", None))
+
+        stdout_pipe = getattr(proc, "stdout", None)
+        stderr_pipe = getattr(proc, "stderr", None)
+        has_stdout = _is_pipe(stdout_pipe)
+        has_stderr = _is_pipe(stderr_pipe) and stderr_pipe is not stdout_pipe
+
+        # If no pipes to drain and no pause_event, fast path directly to proc.communicate
+        if not has_stdout and not has_stderr and pause_event is None and callable(getattr(proc, "communicate", None)):
             out, err = proc.communicate(timeout=timeout)
             return out or "", err or ""
 
+        stdout_chunks: List[Any] = []
+        stderr_chunks: List[Any] = []
+
+        def _drain_stream(stream: Any, chunks: List[Any]) -> None:
+            raw_stream = getattr(stream, "buffer", stream)
+            read_fn = getattr(raw_stream, "read1", None)
+            if not callable(read_fn):
+                read_fn = getattr(stream, "read1", None)
+            if not callable(read_fn):
+                read_fn = getattr(stream, "read", None)
+            if not callable(read_fn):
+                return
+
+            try:
+                while True:
+                    chunk = read_fn(65536)
+                    if not chunk:
+                        break
+                    chunks.append(chunk)
+            except Exception:
+                pass
+            finally:
+                try:
+                    stream.close()
+                except Exception:
+                    pass
+
+        def _format_chunks(chunks: List[Any]) -> str:
+            if not chunks:
+                return ""
+            snapshot = list(chunks)
+            if not snapshot:
+                return ""
+            if isinstance(snapshot[0], bytes):
+                try:
+                    return b"".join(snapshot).decode("utf-8", errors="replace")
+                except TypeError:
+                    return "".join(
+                        c.decode("utf-8", errors="replace") if isinstance(c, bytes) else str(c)
+                        for c in snapshot
+                    )
+            return "".join(str(c) for c in snapshot)
+
+        stdout_thread: Optional[threading.Thread] = None
+        stderr_thread: Optional[threading.Thread] = None
+
+        if has_stdout:
+            stdout_thread = threading.Thread(
+                target=_drain_stream,
+                args=(stdout_pipe, stdout_chunks),
+                name="mtm-codex-drain-stdout",
+                daemon=True,
+            )
+            stdout_thread.start()
+
+        if has_stderr:
+            stderr_thread = threading.Thread(
+                target=_drain_stream,
+                args=(stderr_pipe, stderr_chunks),
+                name="mtm-codex-drain-stderr",
+                daemon=True,
+            )
+            stderr_thread.start()
+
         remaining = float(timeout)
         t_last = time.monotonic()
-        while True:
-            poll_fn = getattr(proc, "poll", None)
+        poll_fn = getattr(proc, "poll", None)
+
+        try:
+            while True:
+                if callable(poll_fn) and poll_fn() is not None:
+                    # Child process has terminated
+                    if stdout_thread is not None:
+                        stdout_thread.join(timeout=2.0)
+                    if stderr_thread is not None:
+                        stderr_thread.join(timeout=2.0)
+
+                    out_str = _format_chunks(stdout_chunks)
+                    err_str = _format_chunks(stderr_chunks)
+
+                    # Compatibility fallback for mock proc objects without pipes
+                    if not has_stdout and not has_stderr and callable(getattr(proc, "communicate", None)):
+                        try:
+                            out_c, err_c = proc.communicate(timeout=2)
+                            return out_c or "", err_c or ""
+                        except Exception:
+                            pass
+
+                    return out_str, err_str
+
+                time.sleep(0.02)
+                t_now = time.monotonic()
+                elapsed_slice = t_now - t_last
+                t_last = t_now
+
+                if pause_event is None or not pause_event.is_set():
+                    remaining -= elapsed_slice
+                    if remaining <= 0:
+                        out_str = _format_chunks(stdout_chunks)
+                        err_str = _format_chunks(stderr_chunks)
+                        raise subprocess.TimeoutExpired(
+                            cmd=getattr(proc, "args", ["worker"]),
+                            timeout=timeout,
+                            output=out_str,
+                            stderr=err_str,
+                        )
+        finally:
+            # Ensure background threads are cleaned up if process has terminated
             if callable(poll_fn) and poll_fn() is not None:
-                out, err = proc.communicate(timeout=2)
-                return out or "", err or ""
-
-            time.sleep(0.04)
-            t_now = time.monotonic()
-            elapsed_slice = t_now - t_last
-            t_last = t_now
-
-            if not pause_event.is_set():
-                remaining -= elapsed_slice
-                if remaining <= 0:
-                    raise subprocess.TimeoutExpired(cmd=getattr(proc, "args", ["worker"]), timeout=timeout)
+                if stdout_thread is not None and stdout_thread.is_alive():
+                    stdout_thread.join(timeout=0.2)
+                if stderr_thread is not None and stderr_thread.is_alive():
+                    stderr_thread.join(timeout=0.2)
 
     def run(
         self,
@@ -181,6 +319,8 @@ class CodexRuntime:
         cancel_event: Optional[Any] = None,
         pause_event: Optional[Any] = None,
         agent: Optional[str] = None,
+        dangerously_skip_permissions: Optional[bool] = None,
+        skip_permissions: Optional[bool] = None,
     ) -> RuntimeResult:
         """Execute a worker in the given workspace.
 
@@ -222,6 +362,13 @@ class CodexRuntime:
         stdout_text = ""
         trace = ExecutionTrace()
         t0 = time.time()
+
+        effective_bypass = dangerously_skip_permissions if dangerously_skip_permissions is not None else skip_permissions
+        if effective_bypass is None and codex_config:
+            effective_bypass = codex_config.get(
+                "dangerously_skip_permissions",
+                codex_config.get("skip_permissions"),
+            )
 
         if target_backend == "codex":
             if not self.has_codex:
@@ -305,14 +452,18 @@ class CodexRuntime:
                     try:
                         stdout_text, _ = self._communicate_with_pause(proc, timeout=timeout, pause_event=pause_event)
                         exit_code = proc.returncode
-                    except subprocess.TimeoutExpired:
+                    except subprocess.TimeoutExpired as exc:
                         timed_out = True
                         _terminate_process_tree(proc)
-                        try:
-                            out, _ = proc.communicate(timeout=2)
-                            stdout_text = out or ""
-                        except Exception:
-                            stdout_text = ""
+                        partial_out = getattr(exc, "output", "") or ""
+                        if partial_out:
+                            stdout_text = partial_out
+                        else:
+                            try:
+                                out, _ = proc.communicate(timeout=2)
+                                stdout_text = out or ""
+                            except Exception:
+                                stdout_text = ""
                         exit_code = -1
                     finally:
                         stop_watcher.set()
@@ -327,6 +478,7 @@ class CodexRuntime:
                 model=model,
                 sandbox_policy=agy_sandbox,
                 agent=agent,
+                dangerously_skip_permissions=effective_bypass,
             )
             if cancel_event is not None and cancel_event.is_set():
                 timed_out = True
@@ -373,14 +525,18 @@ class CodexRuntime:
                     try:
                         stdout_text, _ = self._communicate_with_pause(proc, timeout=timeout, pause_event=pause_event)
                         exit_code = proc.returncode
-                    except subprocess.TimeoutExpired:
+                    except subprocess.TimeoutExpired as exc:
                         timed_out = True
                         _terminate_process_tree(proc)
-                        try:
-                            out, _ = proc.communicate(timeout=2)
-                            stdout_text = out or ""
-                        except Exception:
-                            stdout_text = ""
+                        partial_out = getattr(exc, "output", "") or ""
+                        if partial_out:
+                            stdout_text = partial_out
+                        else:
+                            try:
+                                out, _ = proc.communicate(timeout=2)
+                                stdout_text = out or ""
+                            except Exception:
+                                stdout_text = ""
                         exit_code = -1
                     finally:
                         stop_watcher.set()

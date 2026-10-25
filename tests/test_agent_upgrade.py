@@ -1,5 +1,8 @@
 """Offline regression tests: portable profiles, native dispatcher, incremental knowledge, credits, and DEV learning."""
+import hashlib
+import os
 from pathlib import Path
+import stat
 import time
 import tomllib
 from unittest.mock import MagicMock
@@ -235,3 +238,214 @@ def test_release_manifest_pins_both_skills_and_agent_profiles():
     root = Path(__file__).resolve().parent.parent
     assert verify_skill_checksums(root) is True
     assert verify_profile_checksums(root) is True
+
+
+def test_dispatcher_collision_backup_and_restore_exact_content_and_hash(tmp_path):
+    """R2: Pre-existing colliding files retain exact pre-run content, SHA-256 hash, and ephemeral files are unlinked."""
+    codex_dir = tmp_path / ".codex" / "agents"
+    codex_dir.mkdir(parents=True)
+    pre_codex = codex_dir / "bug-fixer.toml"
+    pre_codex_content = b'# CUSTOM PRE-EXISTING CODEX CONFIG\nname = "my-custom-bug-fixer"\nversion = "9.9.9"\n'
+    pre_codex.write_bytes(pre_codex_content)
+    pre_codex_hash = hashlib.sha256(pre_codex_content).hexdigest()
+
+    agy_dir = tmp_path / ".agents" / "agents"
+    agy_dir.mkdir(parents=True)
+    pre_agy = agy_dir / "bug-fixer.md"
+    pre_agy_content = b'# CUSTOM PRE-EXISTING AGY AGENT\nrole: custom-bug-fixer\nspecialization: high-priority-audit\n'
+    pre_agy.write_bytes(pre_agy_content)
+    pre_agy_hash = hashlib.sha256(pre_agy_content).hexdigest()
+
+    mock_rt = MagicMock(spec=CodexRuntime)
+
+    def _inspect_in_flight(**kwargs):
+        ws = Path(kwargs["workspace"])
+        # During dispatch, injected profile content replaced custom content
+        assert (ws / ".codex/agents/bug-fixer.toml").read_bytes() != pre_codex_content
+        assert (ws / ".agents/agents/bug-fixer.md").read_bytes() != pre_agy_content
+        # Ephemeral files exist during execution
+        assert (ws / ".codex/agents/feature-implementer.toml").is_file()
+        assert (ws / ".agents/agents/feature-implementer.md").is_file()
+        return RuntimeResult(
+            exit_code=0,
+            timed_out=False,
+            trace=ExecutionTrace(input_tokens=150, output_tokens=30),
+            usage={},
+            commands=1,
+            file_changes=1,
+            last_message="Completed",
+            elapsed=0.1,
+        )
+
+    mock_rt.run.side_effect = _inspect_in_flight
+    dispatcher = NativeSubagentDispatcher(runtime=mock_rt)
+    result = dispatcher.dispatch(
+        envelope={"task_type": "BUG"},
+        prompt="Fix edge case",
+        workspace=tmp_path,
+        backend="antigravity",
+    )
+
+    assert result.exit_code == 0
+
+    # 1. Colliding files exist and retain exact content and SHA-256 hash
+    assert pre_codex.exists()
+    assert pre_codex.read_bytes() == pre_codex_content
+    assert hashlib.sha256(pre_codex.read_bytes()).hexdigest() == pre_codex_hash
+
+    assert pre_agy.exists()
+    assert pre_agy.read_bytes() == pre_agy_content
+    assert hashlib.sha256(pre_agy.read_bytes()).hexdigest() == pre_agy_hash
+
+    # 2. Ephemeral files generated during injection are unlinked
+    assert not (codex_dir / "feature-implementer.toml").exists()
+    assert not (agy_dir / "feature-implementer.md").exists()
+    assert not (codex_dir / "incident-responder.toml").exists()
+    assert not (agy_dir / "incident-responder.md").exists()
+
+
+def test_dispatcher_preserves_nanosecond_timestamps(tmp_path):
+    """R2: Pre-existing colliding files preserve exact nanosecond timestamps across dispatch."""
+    codex_dir = tmp_path / ".codex" / "agents"
+    codex_dir.mkdir(parents=True)
+    target_file = codex_dir / "bug-fixer.toml"
+    target_file.write_bytes(b'name = "timestamp-fidelity-test"\n')
+
+    # Set historical timestamp (1 hour ago, rounded to 100ns for Windows NTFS precision)
+    hist_mtime_ns = int((time.time() - 3600) * 1_000_000_000)
+    hist_mtime_ns = (hist_mtime_ns // 100) * 100
+    os.utime(target_file, ns=(hist_mtime_ns, hist_mtime_ns))
+    pre_mtime_ns = target_file.stat().st_mtime_ns
+
+    mock_rt = MagicMock(spec=CodexRuntime)
+    mock_rt.run.return_value = RuntimeResult(
+        exit_code=0,
+        timed_out=False,
+        trace=ExecutionTrace(),
+        usage={},
+        commands=0,
+        file_changes=0,
+        last_message="OK",
+        elapsed=0.05,
+    )
+
+    dispatcher = NativeSubagentDispatcher(runtime=mock_rt)
+    dispatcher.dispatch(
+        envelope={"task_type": "BUG"},
+        prompt="Check mtime",
+        workspace=tmp_path,
+    )
+
+    post_mtime_ns = target_file.stat().st_mtime_ns
+    assert post_mtime_ns == pre_mtime_ns, f"mtime changed from {pre_mtime_ns} to {post_mtime_ns}"
+
+
+def test_dispatcher_non_colliding_files_and_directories_untouched(tmp_path):
+    """R2: Pre-existing custom files and directories in .codex and .agents are not removed."""
+    codex_dir = tmp_path / ".codex" / "agents"
+    codex_dir.mkdir(parents=True)
+    user_tool = codex_dir / "custom-user-tool.toml"
+    user_content = b'tool_name = "secret-scanner"\nversion = "2.1.0"\n'
+    user_tool.write_bytes(user_content)
+
+    custom_subdir = tmp_path / ".agents" / "custom_dir"
+    custom_subdir.mkdir(parents=True)
+    custom_file = custom_subdir / "custom_doc.txt"
+    custom_file.write_text("pre-existing custom document", encoding="utf-8")
+
+    mock_rt = MagicMock(spec=CodexRuntime)
+    mock_rt.run.return_value = RuntimeResult(
+        exit_code=0,
+        timed_out=False,
+        trace=ExecutionTrace(),
+        usage={},
+        commands=0,
+        file_changes=0,
+        last_message="OK",
+        elapsed=0.05,
+    )
+
+    dispatcher = NativeSubagentDispatcher(runtime=mock_rt)
+    dispatcher.dispatch(
+        envelope={"task_type": "BUG"},
+        prompt="Verify untouched files",
+        workspace=tmp_path,
+    )
+
+    assert user_tool.exists()
+    assert user_tool.read_bytes() == user_content
+    assert codex_dir.exists()
+
+    assert custom_file.exists()
+    assert custom_file.read_text(encoding="utf-8") == "pre-existing custom document"
+    assert custom_subdir.exists()
+
+
+def test_dispatcher_restores_on_runtime_exception(tmp_path):
+    """R2: In-memory backup restores colliding files even if runtime throws an unexpected exception."""
+    codex_dir = tmp_path / ".codex" / "agents"
+    codex_dir.mkdir(parents=True)
+    target_file = codex_dir / "bug-fixer.toml"
+    initial_bytes = b'name = "crash-resilience-check"\n'
+    target_file.write_bytes(initial_bytes)
+    initial_hash = hashlib.sha256(initial_bytes).hexdigest()
+
+    mock_rt = MagicMock(spec=CodexRuntime)
+    mock_rt.run.side_effect = RuntimeError("Worker process crashed unexpectedly with SIGSEGV")
+
+    dispatcher = NativeSubagentDispatcher(runtime=mock_rt)
+    with pytest.raises(RuntimeError, match="Worker process crashed"):
+        dispatcher.dispatch(
+            envelope={"task_type": "BUG"},
+            prompt="Crash simulation",
+            workspace=tmp_path,
+        )
+
+    assert target_file.exists()
+    assert target_file.read_bytes() == initial_bytes
+    assert hashlib.sha256(target_file.read_bytes()).hexdigest() == initial_hash
+    # Ephemeral files are still unlinked
+    assert not (codex_dir / "feature-implementer.toml").exists()
+
+
+def test_dispatcher_read_only_preexisting_file(tmp_path):
+    """R2: Windows and Linux read-only pre-existing files are safely backed up and restored without PermissionError."""
+    codex_dir = tmp_path / ".codex" / "agents"
+    codex_dir.mkdir(parents=True)
+    ro_file = codex_dir / "bug-fixer.toml"
+    ro_content = b'# READONLY PROTECTED TOML\nlocked = true\nimmutable = true\n'
+    ro_file.write_bytes(ro_content)
+
+    os.chmod(ro_file, stat.S_IREAD)
+    assert not os.access(ro_file, os.W_OK)
+
+    mock_rt = MagicMock(spec=CodexRuntime)
+    mock_rt.run.return_value = RuntimeResult(
+        exit_code=0,
+        timed_out=False,
+        trace=ExecutionTrace(),
+        usage={},
+        commands=0,
+        file_changes=0,
+        last_message="OK",
+        elapsed=0.05,
+    )
+
+    dispatcher = NativeSubagentDispatcher(runtime=mock_rt)
+    try:
+        dispatcher.dispatch(
+            envelope={"task_type": "BUG"},
+            prompt="Read-only test",
+            workspace=tmp_path,
+        )
+
+        assert ro_file.exists()
+        assert ro_file.read_bytes() == ro_content
+        assert not os.access(ro_file, os.W_OK)
+    finally:
+        # Reset writable permission so pytest tmp_path cleanup succeeds
+        try:
+            os.chmod(ro_file, stat.S_IWRITE | stat.S_IREAD)
+        except OSError:
+            pass
+
