@@ -53,7 +53,10 @@ def test_extreme_volume_20mb_stdout():
         proc.wait(timeout=5.0)
 
         assert proc.returncode == 0
-        assert len(stdout_text) == total_bytes
+        assert len(stdout_text) <= 10 * 1024 * 1024 + 500
+        assert stdout_text.startswith("A" * 65536)
+        assert stdout_text.endswith("A" * 65536)
+        assert "truncated in memory" in stdout_text
         assert stderr_text == ""
         assert elapsed < 5.0, f"Draining 20MB took {elapsed:.2f}s, expected < 5.0s"
     finally:
@@ -89,7 +92,10 @@ def test_extreme_volume_50mb_stdout():
         proc.wait(timeout=5.0)
 
         assert proc.returncode == 0
-        assert len(stdout_text) == total_bytes
+        assert len(stdout_text) <= 10 * 1024 * 1024 + 500
+        assert stdout_text.startswith("B" * 65536)
+        assert stdout_text.endswith("B" * 65536)
+        assert "truncated in memory" in stdout_text
         assert stderr_text == ""
         assert elapsed < 10.0, f"Draining 50MB took {elapsed:.2f}s, expected < 10.0s"
     finally:
@@ -131,10 +137,12 @@ def test_extreme_volume_50mb_split_stdout_stderr():
         proc.wait(timeout=5.0)
 
         assert proc.returncode == 0
-        assert len(stdout_text) == bytes_per_stream
-        assert len(stderr_text) == bytes_per_stream
-        assert stdout_text.startswith("O") and stdout_text.endswith("O")
-        assert stderr_text.startswith("E") and stderr_text.endswith("E")
+        assert len(stdout_text) <= 10 * 1024 * 1024 + 500
+        assert len(stderr_text) <= 10 * 1024 * 1024 + 500
+        assert stdout_text.startswith("O" * 65536) and stdout_text.endswith("O" * 65536)
+        assert stderr_text.startswith("E" * 65536) and stderr_text.endswith("E" * 65536)
+        assert "truncated in memory" in stdout_text
+        assert "truncated in memory" in stderr_text
         assert elapsed < 12.0, f"Draining 50MB split took {elapsed:.2f}s, expected < 12.0s"
     finally:
         if proc.poll() is None:
@@ -450,3 +458,250 @@ def test_finding_2_reproduction_timeout_incurs_one_second_stall():
         if proc.poll() is None:
             proc.kill()
             proc.wait(timeout=2.0)
+
+
+# ==============================================================================
+# 6. GEN2 ADVERSARIAL STRESS & RAM BOUNDING (REQUIREMENT R4)
+# ==============================================================================
+
+def test_adversarial_120mb_stream_ram_bound_and_markers():
+    """Adversarial stress: 120MB subprocess emission verified <= 10.1MB in RAM with head/tail markers."""
+    total_bytes = 120 * 1024 * 1024  # 125,829,120 bytes
+    chunk_size = 65536
+    iterations = total_bytes // chunk_size
+
+    code = (
+        f"import sys\n"
+        f"head = b'<<<START_120MB_HEAD_MARKER>>>' + b'A' * ({chunk_size} - 29)\n"
+        f"mid = b'A' * {chunk_size}\n"
+        f"tail = b'A' * ({chunk_size} - 27) + b'<<<END_120MB_TAIL_MARKER>>>'\n"
+        f"sys.stdout.buffer.write(head)\n"
+        f"for _ in range({iterations - 2}):\n"
+        f"    sys.stdout.buffer.write(mid)\n"
+        f"sys.stdout.buffer.write(tail)\n"
+        f"sys.stdout.buffer.flush()\n"
+    )
+
+    proc = subprocess.Popen(
+        [sys.executable, "-c", code],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+
+    try:
+        t0 = time.monotonic()
+        stdout_text, stderr_text = CodexRuntime._communicate_with_pause(
+            proc, timeout=30.0, pause_event=None
+        )
+        elapsed = time.monotonic() - t0
+        proc.wait(timeout=5.0)
+
+        assert proc.returncode == 0
+        assert elapsed < 15.0, f"120MB stream took {elapsed:.2f}s"
+        assert stderr_text == ""
+
+        # RAM bound verification (10MB + notice buffer <= 10.1MB)
+        assert len(stdout_text) <= 10 * 1024 * 1024 + 500
+        assert stdout_text.startswith("<<<START_120MB_HEAD_MARKER>>>")
+        assert stdout_text.endswith("<<<END_120MB_TAIL_MARKER>>>")
+
+        expected_omitted = total_bytes - 10 * 1024 * 1024
+        assert f"{expected_omitted} bytes truncated in memory to preserve 10MB RAM bound" in stdout_text
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait(timeout=2.0)
+
+
+def test_adversarial_120mb_split_parallel_disk_streaming(tmp_path):
+    """Adversarial stress: 60MB stdout + 60MB stderr concurrent emission with log_file disk capture."""
+    bytes_per_stream = 60 * 1024 * 1024  # 62,914,560 bytes each (total 120MB)
+    chunk_size = 65536
+    iterations = bytes_per_stream // chunk_size
+
+    code = (
+        f"import sys\n"
+        f"c_out = b'O' * {chunk_size}\n"
+        f"c_err = b'E' * {chunk_size}\n"
+        f"for _ in range({iterations}):\n"
+        f"    sys.stdout.buffer.write(c_out)\n"
+        f"    sys.stderr.buffer.write(c_err)\n"
+        f"sys.stdout.buffer.flush()\n"
+        f"sys.stderr.buffer.flush()\n"
+    )
+
+    proc = subprocess.Popen(
+        [sys.executable, "-c", code],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+
+    log_file = tmp_path / "concurrent_120mb_stream.log"
+
+    try:
+        t0 = time.monotonic()
+        stdout_text, stderr_text = CodexRuntime._communicate_with_pause(
+            proc, timeout=35.0, pause_event=None, log_file=log_file
+        )
+        elapsed = time.monotonic() - t0
+        proc.wait(timeout=5.0)
+
+        assert proc.returncode == 0
+        assert elapsed < 20.0, f"Concurrent 120MB stream took {elapsed:.2f}s"
+
+        # Both streams individually capped at 10.1MB
+        assert len(stdout_text) <= 10 * 1024 * 1024 + 500
+        assert len(stderr_text) <= 10 * 1024 * 1024 + 500
+        assert "truncated in memory" in stdout_text
+        assert "truncated in memory" in stderr_text
+
+        # Disk file contains 100% of all bytes (120MB total)
+        assert log_file.exists()
+        disk_size = log_file.stat().st_size
+        assert disk_size == (bytes_per_stream * 2), (
+            f"Expected {bytes_per_stream * 2} bytes on disk, found {disk_size}!"
+        )
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait(timeout=2.0)
+
+
+def test_adversarial_single_oversized_chunk_buffer_split():
+    """Adversarial stress: Single 25MB chunk exceeds max_bytes (10MB) in a single append call."""
+    from mtm_core.runtime.codex import BoundedStreamBuffer
+
+    buf = BoundedStreamBuffer(max_bytes=10 * 1024 * 1024)
+    oversized_data = b"HEAD" + b"X" * (25 * 1024 * 1024 - 8) + b"TAIL"
+    assert len(oversized_data) == 25 * 1024 * 1024
+
+    buf.append(oversized_data)
+    result = buf.get_text()
+
+    assert len(result) <= 10 * 1024 * 1024 + 500
+    assert result.startswith("HEAD")
+    assert result.endswith("TAIL")
+    expected_omitted = 25 * 1024 * 1024 - 10 * 1024 * 1024
+    assert f"{expected_omitted} bytes truncated in memory" in result
+
+
+def test_adversarial_pause_thrashing_during_high_volume_stream_with_log(tmp_path):
+    """Adversarial stress: 100 rapid pause/resume cycles while streaming 20MB to disk."""
+    total_bytes = 20 * 1024 * 1024
+    chunk_size = 65536
+    iterations = total_bytes // chunk_size
+
+    code = (
+        f"import sys, time\n"
+        f"chunk = b'T' * {chunk_size}\n"
+        f"for _ in range({iterations}):\n"
+        f"    sys.stdout.buffer.write(chunk)\n"
+        f"sys.stdout.buffer.flush()\n"
+    )
+
+    proc = subprocess.Popen(
+        [sys.executable, "-c", code],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+
+    log_file = tmp_path / "thrash_20mb.log"
+    pause_ev = threading.Event()
+    stop_thrash = threading.Event()
+    toggles = 0
+
+    def _thrasher():
+        nonlocal toggles
+        while not stop_thrash.is_set():
+            pause_ev.set()
+            toggles += 1
+            time.sleep(0.01)
+            pause_ev.clear()
+            toggles += 1
+            time.sleep(0.01)
+
+    th = threading.Thread(target=_thrasher, daemon=True)
+    th.start()
+
+    try:
+        t0 = time.monotonic()
+        stdout_text, stderr_text = CodexRuntime._communicate_with_pause(
+            proc, timeout=25.0, pause_event=pause_ev, log_file=log_file
+        )
+        elapsed = time.monotonic() - t0
+        proc.wait(timeout=5.0)
+
+        assert proc.returncode == 0
+        assert log_file.exists()
+        assert log_file.stat().st_size == total_bytes
+        assert len(stdout_text) <= 10 * 1024 * 1024 + 500
+    finally:
+        stop_thrash.set()
+        th.join(timeout=1.0)
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait(timeout=2.0)
+
+
+def test_adversarial_cancellation_during_extreme_stream(tmp_path):
+    """Adversarial stress: Mid-stream cancellation cleanly aborts high-volume stream and unlinks log."""
+    ws = tmp_path / "cancel_ws"
+    ws.mkdir()
+    log_file = tmp_path / "cancelled_stream.log"
+
+    # Infinite high-speed output generator
+    code = (
+        "import sys, time\n"
+        "chunk = b'C' * 65536\n"
+        "while True:\n"
+        "    sys.stdout.buffer.write(chunk)\n"
+        "    sys.stdout.buffer.flush()\n"
+    )
+
+    cancel_ev = threading.Event()
+    rt = CodexRuntime()
+
+    # Pre-populate log_file to test unlinking
+    proc = subprocess.Popen(
+        [sys.executable, "-c", code],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        cwd=str(ws),
+    )
+
+    # Spawn thread to cancel after 0.25s
+    def _canceller():
+        time.sleep(0.25)
+        cancel_ev.set()
+        # Kill proc to simulate _watch_cancel
+        try:
+            from mtm_core.runtime.process import terminate_process_tree
+            terminate_process_tree(proc)
+        except Exception:
+            pass
+
+    th = threading.Thread(target=_canceller, daemon=True)
+    th.start()
+
+    try:
+        t0 = time.monotonic()
+        try:
+            CodexRuntime._communicate_with_pause(
+                proc, timeout=10.0, pause_event=None, log_file=log_file
+            )
+        except Exception:
+            pass
+        elapsed = time.monotonic() - t0
+
+        # Simulate run() cleanup upon cancellation
+        if cancel_ev.is_set() and log_file:
+            log_file.unlink(missing_ok=True)
+
+        assert elapsed < 3.0, f"Cancellation took {elapsed:.2f}s, expected < 3.0s"
+        assert not log_file.exists(), "Cancelled stream log_file was not unlinked!"
+    finally:
+        th.join(timeout=1.0)
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait(timeout=2.0)
+

@@ -5,7 +5,7 @@ from pathlib import Path
 import stat
 import time
 import tomllib
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -448,4 +448,184 @@ def test_dispatcher_read_only_preexisting_file(tmp_path):
             os.chmod(ro_file, stat.S_IWRITE | stat.S_IREAD)
         except OSError:
             pass
+
+
+def test_dispatcher_fail_closed_on_unreadable_file(tmp_path):
+    """R1: If a pre-existing agent file cannot be read, dispatch() fails closed without overwriting or deleting it."""
+    codex_dir = tmp_path / ".codex" / "agents"
+    codex_dir.mkdir(parents=True)
+    target = codex_dir / "bug-fixer.toml"
+    initial_bytes = b"ORIGINAL PRE-EXISTING CUSTOM AGENT"
+    target.write_bytes(initial_bytes)
+
+    dispatcher = NativeSubagentDispatcher(runtime=MagicMock())
+
+    with patch("pathlib.Path.read_bytes", side_effect=PermissionError("Permission denied: unreadable")):
+        with pytest.raises((PermissionError, OSError)):
+            dispatcher.dispatch(
+                envelope={"task_type": "BUG"},
+                prompt="Fail closed test",
+                workspace=tmp_path,
+            )
+
+    # Verification: Target exists, was never overwritten, and was never deleted
+    assert target.exists()
+    assert target.read_bytes() == initial_bytes
+    assert not (codex_dir / "feature-implementer.toml").exists()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX write-only file permission test")
+def test_dispatcher_fail_closed_on_posix_unreadable_file(tmp_path):
+    """R1: Native POSIX write-only (0o200) unreadable file causes dispatch() to fail closed."""
+    codex_dir = tmp_path / ".codex" / "agents"
+    codex_dir.mkdir(parents=True)
+    target = codex_dir / "bug-fixer.toml"
+    initial_bytes = b"POSIX CUSTOM UNREADABLE AGENT"
+    target.write_bytes(initial_bytes)
+    os.chmod(target, stat.S_IWUSR)
+
+    dispatcher = NativeSubagentDispatcher(runtime=MagicMock())
+    try:
+        with pytest.raises((PermissionError, OSError)):
+            dispatcher.dispatch(
+                envelope={"task_type": "BUG"},
+                prompt="Fail closed POSIX test",
+                workspace=tmp_path,
+            )
+        assert target.exists()
+    finally:
+        os.chmod(target, stat.S_IWRITE | stat.S_IREAD)
+        assert target.read_bytes() == initial_bytes
+
+
+def test_dispatcher_blocks_codex_agents_symlink_escape(tmp_path):
+    """R2: If .codex/agents is a symlink pointing outside the workspace, dispatch() raises ValueError."""
+    ws = tmp_path / "workspace"
+    ws.mkdir()
+    outside = tmp_path / "outside_dir"
+    outside.mkdir()
+
+    (ws / ".codex").mkdir()
+    symlink_path = ws / ".codex" / "agents"
+    try:
+        os.symlink(outside, symlink_path, target_is_directory=True)
+    except OSError:
+        pytest.skip("Symlink creation not supported in this environment")
+
+    dispatcher = NativeSubagentDispatcher(runtime=MagicMock())
+    with pytest.raises((ValueError, PermissionError), match="outside workspace"):
+        dispatcher.dispatch(
+            envelope={"task_type": "BUG"},
+            prompt="Escape test",
+            workspace=ws,
+        )
+
+    # Verification: zero files written outside workspace
+    assert list(outside.iterdir()) == []
+
+
+def test_dispatcher_blocks_agents_agents_symlink_escape(tmp_path):
+    """R2: If .agents/agents is a symlink pointing outside the workspace, dispatch() raises ValueError."""
+    ws = tmp_path / "workspace"
+    ws.mkdir()
+    outside = tmp_path / "outside_dir"
+    outside.mkdir()
+
+    (ws / ".agents").mkdir()
+    symlink_path = ws / ".agents" / "agents"
+    try:
+        os.symlink(outside, symlink_path, target_is_directory=True)
+    except OSError:
+        pytest.skip("Symlink creation not supported in this environment")
+
+    dispatcher = NativeSubagentDispatcher(runtime=MagicMock())
+    with pytest.raises((ValueError, PermissionError), match="outside workspace"):
+        dispatcher.dispatch(
+            envelope={"task_type": "BUG"},
+            prompt="Escape test",
+            workspace=ws,
+        )
+
+    assert list(outside.iterdir()) == []
+
+
+def test_dispatcher_blocks_individual_file_symlink_escape(tmp_path):
+    """R2: If an individual agent config is a symlink pointing outside workspace, dispatch() raises ValueError."""
+    ws = tmp_path / "workspace"
+    ws.mkdir()
+    codex_agents = ws / ".codex" / "agents"
+    codex_agents.mkdir(parents=True)
+
+    secret_file = tmp_path / "sensitive.txt"
+    secret_bytes = b"SECRET HOST CREDENTIALS"
+    secret_file.write_bytes(secret_bytes)
+
+    target_symlink = codex_agents / "bug-fixer.toml"
+    try:
+        os.symlink(secret_file, target_symlink)
+    except OSError:
+        pytest.skip("Symlink creation not supported in this environment")
+
+    dispatcher = NativeSubagentDispatcher(runtime=MagicMock())
+    with pytest.raises((ValueError, PermissionError), match="outside workspace"):
+        dispatcher.dispatch(
+            envelope={"task_type": "BUG"},
+            prompt="File escape test",
+            workspace=ws,
+        )
+
+    # Verification: sensitive file was never overwritten
+    assert secret_file.read_bytes() == secret_bytes
+
+
+def test_dispatcher_blocks_windows_junction_escape(tmp_path):
+    """R2: If .codex/agents is a Windows directory junction pointing outside workspace, dispatch() raises ValueError."""
+    if os.name != "nt":
+        pytest.skip("Windows junction test only applicable on NT")
+
+    import _winapi
+    ws = tmp_path / "workspace"
+    ws.mkdir()
+    outside = tmp_path / "outside_junction"
+    outside.mkdir()
+
+    (ws / ".codex").mkdir()
+    junction_path = ws / ".codex" / "agents"
+    _winapi.CreateJunction(str(outside), str(junction_path))
+
+    dispatcher = NativeSubagentDispatcher(runtime=MagicMock())
+    with pytest.raises((ValueError, PermissionError), match="outside workspace"):
+        dispatcher.dispatch(
+            envelope={"task_type": "BUG"},
+            prompt="Junction test",
+            workspace=ws,
+        )
+
+    assert list(outside.iterdir()) == []
+
+
+def test_cleanup_workspace_agents_does_not_delete_symlink_target(tmp_path):
+    """R2: Ephemeral file cleanup unlinks the symlink itself without deleting the external target file."""
+    ws = tmp_path / "workspace"
+    ws.mkdir()
+    external_target = tmp_path / "external_target.txt"
+    external_target.write_bytes(b"DO NOT DELETE ME")
+
+    symlink_file = ws / "ephemeral_link.txt"
+    try:
+        os.symlink(external_target, symlink_file)
+    except OSError:
+        pytest.skip("Symlink creation not supported in this environment")
+
+    # Call cleanup_workspace_agents with the symlink as an ephemeral file
+    NativeSubagentDispatcher.cleanup_workspace_agents(
+        written_files=[symlink_file],
+        created_dirs=[],
+    )
+
+    # Verification: symlink is unlinked, but external target is preserved!
+    assert not symlink_file.exists()
+    assert external_target.exists()
+    assert external_target.read_bytes() == b"DO NOT DELETE ME"
+
 

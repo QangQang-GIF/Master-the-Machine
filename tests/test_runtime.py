@@ -36,7 +36,7 @@ def test_agy_command_builder():
     assert "-p" in cmd and "Hello AGY" in cmd
     assert "--model" in cmd and "gemini-3.8-flash-high" in cmd
     assert "--effort" in cmd and "medium" in cmd
-    assert "--dangerously-skip-permissions" in cmd
+    assert "--dangerously-skip-permissions" not in cmd
 
 
 def test_agy_sandbox_and_permission_bypass_decoupling(monkeypatch):
@@ -91,12 +91,15 @@ def test_agy_sandbox_and_permission_bypass_decoupling(monkeypatch):
     cmd_none_no_bypass = rt.build_agy_cmd("Fix bug", sandbox_policy=None, dangerously_skip_permissions=False)
     assert "--dangerously-skip-permissions" not in cmd_none_no_bypass
 
-    # 9. Unrestricted default continues to include bypass (backward-compatibility)
+    # 9. Unrestricted default defaults to NO bypass (R3 safe default)
     cmd_def = rt.build_agy_cmd("Fix bug")
-    assert "--dangerously-skip-permissions" in cmd_def
+    assert "--dangerously-skip-permissions" not in cmd_def
 
     cmd_ws_write = rt.build_agy_cmd("Fix bug", sandbox_policy="workspace-write")
-    assert "--dangerously-skip-permissions" in cmd_ws_write
+    assert "--dangerously-skip-permissions" not in cmd_ws_write
+
+    cmd_ws_write_bypass = rt.build_agy_cmd("Fix bug", sandbox_policy="workspace-write", dangerously_skip_permissions=True)
+    assert "--dangerously-skip-permissions" in cmd_ws_write_bypass
 
     # 10. Case-insensitive sandbox policy matching
     cmd_case = rt.build_agy_cmd("Fix bug", sandbox_policy="SANDBOX")

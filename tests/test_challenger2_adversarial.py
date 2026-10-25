@@ -340,7 +340,7 @@ def test_decoupling_conflicting_parameters_and_env_vars(monkeypatch):
     # 8. Empty string env var treats var as unset (falling back to mode default)
     monkeypatch.setenv("MTM_AGY_DANGEROUSLY_SKIP_PERMISSIONS", "")
     cmd_empty_env_unres = rt.build_agy_cmd("Test", sandbox_policy="workspace-write")
-    assert "--dangerously-skip-permissions" in cmd_empty_env_unres  # Unrestricted defaults to bypass
+    assert "--dangerously-skip-permissions" not in cmd_empty_env_unres  # Safe default: no bypass across all modes
 
     cmd_empty_env_sandboxed = rt.build_agy_cmd("Test", sandbox_policy="sandbox")
     assert "--dangerously-skip-permissions" not in cmd_empty_env_sandboxed  # Sandboxed defaults to NO bypass
@@ -363,11 +363,11 @@ def test_decoupling_conflicting_parameters_and_env_vars(monkeypatch):
     # 10. Empty strings & whitespace-only strings
     cmd_empty_policy = rt.build_agy_cmd("Test", sandbox_policy="")
     assert "--sandbox" not in cmd_empty_policy
-    assert "--dangerously-skip-permissions" in cmd_empty_policy  # Unrestricted default
+    assert "--dangerously-skip-permissions" not in cmd_empty_policy  # Safe default: no bypass
 
     cmd_whitespace_policy = rt.build_agy_cmd("Test", sandbox_policy="   \t  ")
     assert "--sandbox" not in cmd_whitespace_policy
-    assert "--dangerously-skip-permissions" in cmd_whitespace_policy
+    assert "--dangerously-skip-permissions" not in cmd_whitespace_policy
 
     cmd_empty_agent = rt.build_agy_cmd("Test", agent="", model="", effort="")
     assert "--agent" not in cmd_empty_agent
@@ -396,7 +396,11 @@ def test_agy_sandbox_policy_env_var_handling(monkeypatch):
     # Explicit argument overrides env var
     cmd_arg_wins = rt.build_agy_cmd("Test write", sandbox_policy="workspace-write")
     assert "--sandbox" not in cmd_arg_wins
-    assert "--dangerously-skip-permissions" in cmd_arg_wins
+    assert "--dangerously-skip-permissions" not in cmd_arg_wins
+
+    cmd_arg_wins_bypass = rt.build_agy_cmd("Test write", sandbox_policy="workspace-write", dangerously_skip_permissions=True)
+    assert "--sandbox" not in cmd_arg_wins_bypass
+    assert "--dangerously-skip-permissions" in cmd_arg_wins_bypass
 
 
 # ==============================================================================
@@ -562,3 +566,237 @@ def test_export_failure_midway_rollback_restores_backup(tmp_path):
     # Post-failure verification: original file content is intact!
     assert target_file.exists()
     assert target_file.read_bytes() == orig_bytes
+
+
+# ==============================================================================
+# Area 10: Pre-existing Windows Exclusively Locked File Collision (Fail-Closed)
+# ==============================================================================
+
+def test_preexisting_windows_exclusive_locked_file_collision_fails_closed(tmp_path):
+    """Challenge R1: If an existing agent config is locked exclusively by another process (share_mode=0),
+
+    dispatch() immediately fails closed with PermissionError without writing or deleting any file.
+    """
+    if os.name != "nt":
+        pytest.skip("Windows exclusive file locking requires NT")
+
+    import ctypes
+    kernel32 = ctypes.windll.kernel32
+
+    codex_dir = tmp_path / ".codex" / "agents"
+    codex_dir.mkdir(parents=True)
+    target = codex_dir / "bug-fixer.toml"
+    initial_bytes = b'# LOCKED EXCLUSIVE PRE-EXISTING CONFIG\n'
+    target.write_bytes(initial_bytes)
+
+    # Open target exclusively with dwShareMode=0
+    # GENERIC_READ | GENERIC_WRITE = 0xC0000000, OPEN_EXISTING = 3, FILE_ATTRIBUTE_NORMAL = 0x80
+    handle = kernel32.CreateFileW(
+        str(target),
+        0xC0000000,
+        0,  # dwShareMode = 0 (exclusive lock)
+        None,
+        3,  # OPEN_EXISTING
+        0x80,
+        None,
+    )
+    assert handle != -1, "Failed to acquire exclusive lock handle"
+
+    dispatcher = NativeSubagentDispatcher(runtime=MagicMock())
+    try:
+        with pytest.raises((PermissionError, OSError), match="Cannot backup pre-existing"):
+            dispatcher.dispatch(
+                envelope={"task_type": "BUG"},
+                prompt="Locked collision test",
+                workspace=tmp_path,
+            )
+    finally:
+        kernel32.CloseHandle(handle)
+
+    # Verify fail-closed: target file is unmodified, zero ephemeral files created
+    assert target.exists()
+    assert target.read_bytes() == initial_bytes
+    remaining_files = list(codex_dir.glob("*.toml"))
+    assert remaining_files == [target], f"Unexpected files created: {remaining_files}"
+
+
+# ==============================================================================
+# Area 11: Complex Symlink & Directory Junction Escapes
+# ==============================================================================
+
+def test_dispatcher_blocks_parent_agents_directory_junction_escape(tmp_path):
+    """Challenge R2: If .agents is a Windows directory junction pointing outside workspace,
+
+    dispatch() detects the escape immediately and aborts without writing outside.
+    """
+    if os.name != "nt":
+        pytest.skip("Windows junction test only applicable on NT")
+
+    import _winapi
+    ws = tmp_path / "workspace"
+    ws.mkdir()
+    outside = tmp_path / "outside_agents_vault"
+    outside.mkdir()
+    sensitive_file = outside / "sensitive.key"
+    sensitive_file.write_text("SUPER_SECRET_KEY", encoding="utf-8")
+
+    junction_path = ws / ".agents"
+    _winapi.CreateJunction(str(outside), str(junction_path))
+
+    dispatcher = NativeSubagentDispatcher(runtime=MagicMock())
+    with pytest.raises((ValueError, PermissionError), match="outside workspace"):
+        dispatcher.dispatch(
+            envelope={"task_type": "BUG"},
+            prompt="Agents junction escape test",
+            workspace=ws,
+        )
+
+    # Verification: sensitive file untouched and zero files written to outside
+    assert list(outside.iterdir()) == [sensitive_file]
+    assert sensitive_file.read_text(encoding="utf-8") == "SUPER_SECRET_KEY"
+
+
+def test_dispatcher_blocks_relative_directory_symlink_escape(tmp_path):
+    """Challenge R2: If .codex/agents is a relative directory symlink pointing outside workspace,
+
+    dispatch() detects the escape and raises ValueError.
+    """
+    ws = tmp_path / "workspace"
+    ws.mkdir()
+    (ws / ".codex").mkdir()
+    outside = tmp_path / "outside_rel_vault"
+    outside.mkdir()
+    outside_marker = outside / "canary.txt"
+    outside_marker.write_text("CANARY", encoding="utf-8")
+
+    symlink_path = ws / ".codex" / "agents"
+    # Relative target pointing 2 levels up into outside_rel_vault
+    rel_target = os.path.join("..", "..", outside.name)
+    try:
+        os.symlink(rel_target, symlink_path, target_is_directory=True)
+    except OSError:
+        pytest.skip("Symlink creation not supported in this environment")
+
+    dispatcher = NativeSubagentDispatcher(runtime=MagicMock())
+    with pytest.raises((ValueError, PermissionError), match="outside workspace"):
+        dispatcher.dispatch(
+            envelope={"task_type": "BUG"},
+            prompt="Relative symlink escape test",
+            workspace=ws,
+        )
+
+    assert list(outside.iterdir()) == [outside_marker]
+    assert outside_marker.read_text(encoding="utf-8") == "CANARY"
+
+
+def test_cleanup_junction_preserves_external_directory_and_children(tmp_path):
+    """Challenge R2: Ephemeral cleanup on a junction unlinks junction only, preserving external dir & files."""
+    if os.name != "nt":
+        pytest.skip("Windows junction test only applicable on NT")
+
+    import _winapi
+    ws = tmp_path / "workspace"
+    ws.mkdir()
+    outside = tmp_path / "outside_preserved_dir"
+    outside.mkdir()
+    for i in range(5):
+        (outside / f"doc_{i}.txt").write_text(f"content {i}", encoding="utf-8")
+
+    junction_path = ws / "ephemeral_junction"
+    _winapi.CreateJunction(str(outside), str(junction_path))
+
+    NativeSubagentDispatcher.cleanup_workspace_agents(
+        written_files=[junction_path],
+        created_dirs=[],
+    )
+
+    assert not junction_path.exists()
+    assert outside.exists()
+    assert len(list(outside.iterdir())) == 5
+    for i in range(5):
+        assert (outside / f"doc_{i}.txt").read_text(encoding="utf-8") == f"content {i}"
+
+
+# ==============================================================================
+# Area 12: Exhaustive 441-Combination Permission Bypass Matrix & Warning Check
+# ==============================================================================
+
+def test_exhaustive_permission_bypass_cartesian_product_matrix(caplog):
+    """Challenge R3: Exhaustive Cartesian product of policies, arguments, and env vars (441 combinations).
+
+    Verifies --dangerously-skip-permissions is included if and only if explicitly enabled,
+    and logger.warning is emitted whenever bypass is enabled.
+    """
+    import logging
+    rt = CodexRuntime()
+
+    policies = [
+        None,
+        "",
+        "   ",
+        "workspace-write",
+        "workspace-sandbox",
+        "sandbox",
+        "restricted",
+        "read-only",
+        "custom-unrestricted",
+    ]
+    explicit_args = [
+        (None, None),
+        (False, None),
+        (True, None),
+        (None, False),
+        (None, True),
+        (False, True),
+        (True, False),
+    ]
+    env_vars = [
+        {},
+        {"MTM_AGY_DANGEROUSLY_SKIP_PERMISSIONS": "1"},
+        {"MTM_AGY_DANGEROUSLY_SKIP_PERMISSIONS": "0"},
+        {"MTM_AGY_SKIP_PERMISSIONS": "true"},
+        {"MTM_AGY_SKIP_PERMISSIONS": "false"},
+        {"MTM_AGY_DANGEROUSLY_SKIP_PERMISSIONS": "1", "MTM_AGY_SKIP_PERMISSIONS": "0"},
+        {"MTM_AGY_DANGEROUSLY_SKIP_PERMISSIONS": "0", "MTM_AGY_SKIP_PERMISSIONS": "1"},
+    ]
+
+    for pol in policies:
+        for dang, skip in explicit_args:
+            for env in env_vars:
+                # Setup environment
+                for k in ["MTM_AGY_DANGEROUSLY_SKIP_PERMISSIONS", "MTM_AGY_SKIP_PERMISSIONS"]:
+                    if k in os.environ:
+                        del os.environ[k]
+                for k, v in env.items():
+                    os.environ[k] = v
+
+                caplog.clear()
+                with caplog.at_level(logging.WARNING):
+                    cmd = rt.build_agy_cmd("Test prompt", sandbox_policy=pol, dangerously_skip_permissions=dang, skip_permissions=skip)
+
+                has_flag = "--dangerously-skip-permissions" in cmd
+
+                # Expected resolution
+                exp_arg = dang if dang is not None else skip
+                if exp_arg is not None:
+                    exp_bypass = exp_arg
+                else:
+                    env_val = env.get("MTM_AGY_DANGEROUSLY_SKIP_PERMISSIONS") or env.get("MTM_AGY_SKIP_PERMISSIONS")
+                    if env_val:
+                        exp_bypass = env_val.lower() in ("1", "true", "yes")
+                    else:
+                        exp_bypass = False
+
+                assert has_flag == exp_bypass, (
+                    f"Matrix mismatch: policy={pol}, dang={dang}, skip={skip}, env={env} -> has_flag={has_flag}, expected={exp_bypass}"
+                )
+                if exp_bypass:
+                    assert "permission bypass enabled" in caplog.text
+                else:
+                    assert "permission bypass enabled" not in caplog.text
+
+    # Cleanup environment
+    for k in ["MTM_AGY_DANGEROUSLY_SKIP_PERMISSIONS", "MTM_AGY_SKIP_PERMISSIONS"]:
+        if k in os.environ:
+            del os.environ[k]
+

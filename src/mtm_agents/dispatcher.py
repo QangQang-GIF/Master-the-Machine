@@ -13,6 +13,39 @@ from mtm_core.runtime import CodexRuntime, RuntimeResult
 from .profiles import AgentProfile, export_native_agents, resolve_profile
 
 
+def _verify_workspace_containment(path: Path | str, workspace_root: Path | str) -> Path:
+    """Verify that path does not escape workspace_root via symlinks, junctions, or relative traversal."""
+    ws = Path(workspace_root).resolve()
+    target = Path(path)
+    if not target.is_absolute():
+        target = ws / target
+    try:
+        resolved = target.resolve()
+    except (RuntimeError, OSError) as exc:
+        raise ValueError(f"Path resolution error for '{path}': {exc}") from exc
+
+    # Check 1: Symlink / junction escape check
+    is_link = target.is_symlink() or (hasattr(target, "is_junction") and target.is_junction())
+    if is_link and not resolved.is_relative_to(ws):
+        raise ValueError(
+            f"Agent configuration path '{target}' is an external symlink pointing outside workspace: '{resolved}'"
+        )
+
+    # Check 2: General workspace containment (covers junctions, traversal, non-existent children)
+    if not resolved.is_relative_to(ws):
+        raise ValueError(
+            f"Agent configuration path '{target}' resolves outside workspace root '{ws}': '{resolved}'"
+        )
+
+    # Disallow configuring the workspace root itself as an agent subfolder
+    if target.name in (".codex", "agents") and resolved == ws:
+        raise ValueError(
+            f"Agent configuration path '{target}' cannot resolve to workspace root '{ws}'"
+        )
+
+    return resolved
+
+
 @dataclass(frozen=True)
 class FileBackup:
     path: Path
@@ -47,6 +80,11 @@ class FileBackup:
             self.path.parent.mkdir(parents=True, exist_ok=True)
 
         self.path.write_bytes(self.content)
+        restored_hash = hashlib.sha256(self.path.read_bytes()).hexdigest()
+        if restored_hash != self.sha256:
+            raise ValueError(
+                f"Restored file {self.path} hash mismatch: expected {self.sha256}, got {restored_hash}"
+            )
         try:
             os.utime(self.path, ns=(self.atime_ns, self.mtime_ns))
         except OSError:
@@ -59,11 +97,6 @@ class FileBackup:
             os.utime(self.path, ns=(self.atime_ns, self.mtime_ns))
         except OSError:
             pass
-        restored_hash = hashlib.sha256(self.path.read_bytes()).hexdigest()
-        if restored_hash != self.sha256:
-            raise ValueError(
-                f"Restored file {self.path} hash mismatch: expected {self.sha256}, got {restored_hash}"
-            )
 
 
 class WrittenFiles(list):
@@ -128,9 +161,10 @@ class NativeSubagentDispatcher:
         ws = Path(workspace).resolve()
         created_dirs: list[Path] = []
         for rel_dir in (Path(".codex"), Path(".codex/agents"), Path(".agents"), Path(".agents/agents")):
-            target_dir = (ws / rel_dir).resolve()
-            if not target_dir.exists() and target_dir not in created_dirs:
-                created_dirs.append(target_dir)
+            target_dir = ws / rel_dir
+            resolved_dir = _verify_workspace_containment(target_dir, ws)
+            if not target_dir.exists() and resolved_dir not in created_dirs:
+                created_dirs.append(resolved_dir)
 
         source = (
             Path(self.profiles_dir).resolve()
@@ -142,10 +176,12 @@ class NativeSubagentDispatcher:
             for profile_file in sorted(source.glob("*.yaml")):
                 try:
                     profile = AgentProfile.load(profile_file)
-                    prospective_files.append((ws / ".codex" / "agents" / f"{profile.name}.toml").resolve())
-                    prospective_files.append((ws / ".agents" / "agents" / f"{profile.name}.md").resolve())
                 except Exception:
                     continue
+                p_codex = _verify_workspace_containment(ws / ".codex" / "agents" / f"{profile.name}.toml", ws)
+                p_agy = _verify_workspace_containment(ws / ".agents" / "agents" / f"{profile.name}.md", ws)
+                prospective_files.append(p_codex)
+                prospective_files.append(p_agy)
 
         backups: dict[Path, FileBackup] = {}
         ephemeral_files: list[Path] = []
@@ -153,18 +189,27 @@ class NativeSubagentDispatcher:
             if dest.exists() or dest.is_symlink():
                 try:
                     backups[dest] = FileBackup.capture(dest)
-                except OSError:
-                    pass
-                try:
-                    os.chmod(dest, stat.S_IWRITE | stat.S_IREAD)
-                except OSError:
-                    pass
+                except (PermissionError, OSError) as exc:
+                    raise PermissionError(
+                        f"Cannot backup pre-existing agent configuration {dest}: {exc}"
+                    ) from exc
+                except Exception as exc:
+                    raise OSError(
+                        f"Failed to backup pre-existing agent configuration {dest}: {exc}"
+                    ) from exc
             else:
                 ephemeral_files.append(dest)
 
+        # Ensure writable only AFTER all existing files are securely backed up
+        for dest in backups:
+            try:
+                os.chmod(dest, stat.S_IWRITE | stat.S_IREAD)
+            except OSError:
+                pass
+
         try:
             written = export_native_agents(ws, self.profiles_dir)
-            resolved_written = [p.resolve() for p in written]
+            resolved_written = [_verify_workspace_containment(p, ws) for p in written]
             for p in resolved_written:
                 if p not in backups and p not in ephemeral_files:
                     ephemeral_files.append(p)
@@ -218,11 +263,13 @@ class NativeSubagentDispatcher:
             ephemeral_files = list(written_files) if written_files else []
             dirs_to_clean = created_dirs if created_dirs is not None else []
 
-        # 1. Unlink ephemeral files only
+        # 1. Unlink ephemeral files only (without .resolve() so symlink file itself is removed, not external target)
         for f in ephemeral_files:
             try:
-                p = Path(f).resolve()
-                if p.exists() or p.is_symlink():
+                p = Path(f)
+                if p.is_symlink() or (hasattr(p, "is_junction") and p.is_junction()):
+                    p.unlink()
+                elif p.exists():
                     try:
                         os.chmod(p, stat.S_IWRITE | stat.S_IREAD)
                     except OSError:
@@ -242,8 +289,10 @@ class NativeSubagentDispatcher:
         # 3. Remove only empty created directories
         for d in sorted(dirs_to_clean, key=lambda p: len(p.parts), reverse=True):
             try:
-                p = Path(d).resolve()
-                if p.exists() and not any(p.iterdir()):
+                p = Path(d)
+                if p.is_symlink() or (hasattr(p, "is_junction") and p.is_junction()):
+                    p.unlink()
+                elif p.exists() and not any(p.iterdir()):
                     p.rmdir()
             except OSError:
                 pass

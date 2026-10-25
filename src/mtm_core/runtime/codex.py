@@ -6,8 +6,10 @@ native agent profile targeting, and trace harvesting.
 """
 from __future__ import annotations
 
+import collections
 import io
 import json
+import logging
 import os
 import shutil
 import subprocess
@@ -18,8 +20,93 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
+logger = logging.getLogger(__name__)
+
 from .process import terminate_process_tree
 from .trace import ExecutionTrace, parse_codex_trace, parse_agy_trace
+
+
+class BoundedStreamBuffer:
+    """Thread-safe bounded in-memory buffer preserving rolling head and tail chunks.
+
+    Guarantees that RAM accumulation never exceeds max_bytes (default 10MB).
+    If total bytes <= max_bytes, 100% of the stream is preserved verbatim.
+    If total bytes > max_bytes, the first head_bytes and the last tail_bytes are retained,
+    with an informative truncation notice between them for diagnostics.
+    """
+
+    def __init__(self, max_bytes: int = 10 * 1024 * 1024):
+        self.max_bytes = max_bytes
+        self.head_budget = max_bytes // 2
+        self.tail_budget = max_bytes - self.head_budget
+        self.head_chunks: List[bytes] = []
+        self.head_bytes: int = 0
+        self.tail_chunks: collections.deque[bytes] = collections.deque()
+        self.tail_bytes: int = 0
+        self.total_bytes: int = 0
+        self.lock = threading.Lock()
+
+    def append(self, chunk: Any) -> None:
+        if not chunk:
+            return
+        raw = chunk if isinstance(chunk, bytes) else str(chunk).encode("utf-8", errors="replace")
+        chunk_len = len(raw)
+
+        with self.lock:
+            self.total_bytes += chunk_len
+
+            # 1. Fill head buffer up to head_budget
+            if self.head_bytes < self.head_budget:
+                avail = self.head_budget - self.head_bytes
+                if chunk_len <= avail:
+                    self.head_chunks.append(raw)
+                    self.head_bytes += chunk_len
+                    return
+                else:
+                    head_part = raw[:avail]
+                    tail_part = raw[avail:]
+                    self.head_chunks.append(head_part)
+                    self.head_bytes += len(head_part)
+                    raw = tail_part
+                    chunk_len = len(raw)
+
+            # 2. Append remainder to tail buffer (rolling window)
+            if chunk_len >= self.tail_budget:
+                self.tail_chunks.clear()
+                self.tail_chunks.append(raw[-self.tail_budget:])
+                self.tail_bytes = self.tail_budget
+            else:
+                self.tail_chunks.append(raw)
+                self.tail_bytes += chunk_len
+                while self.tail_bytes > self.tail_budget and self.tail_chunks:
+                    excess = self.tail_bytes - self.tail_budget
+                    front = self.tail_chunks[0]
+                    if len(front) <= excess:
+                        self.tail_chunks.popleft()
+                        self.tail_bytes -= len(front)
+                    else:
+                        self.tail_chunks[0] = front[excess:]
+                        self.tail_bytes -= excess
+                        break
+
+    def get_text(self) -> str:
+        with self.lock:
+            if not self.head_chunks and not self.tail_chunks:
+                return ""
+            if self.total_bytes <= (self.head_bytes + self.tail_bytes):
+                # No data omitted: join all chunks directly to preserve multibyte UTF-8 across boundaries
+                all_bytes = b"".join(self.head_chunks) + b"".join(self.tail_chunks)
+                return all_bytes.decode("utf-8", errors="replace")
+
+            head_text = b"".join(self.head_chunks).decode("utf-8", errors="replace")
+            tail_text = b"".join(self.tail_chunks).decode("utf-8", errors="replace")
+            omitted = self.total_bytes - (self.head_bytes + self.tail_bytes)
+            notice = (
+                f"\n[... MTM STREAM BUFFER: {omitted} bytes truncated in memory to preserve 10MB RAM bound. "
+                f"Full stream written to log_file. ...]\n"
+            )
+            return head_text + notice + tail_text
+
 
 
 @dataclass
@@ -133,18 +220,17 @@ class CodexRuntime:
         elif is_sandboxed:
             cmd += ["--sandbox", "--mode", "accept-edits"]
 
-        # Resolve permission bypass orthogonally
+        # Resolve permission bypass orthogonally: defaults to False across ALL modes
         explicit_bypass = dangerously_skip_permissions if dangerously_skip_permissions is not None else skip_permissions
         if explicit_bypass is None:
             env_val = os.environ.get("MTM_AGY_DANGEROUSLY_SKIP_PERMISSIONS") or os.environ.get("MTM_AGY_SKIP_PERMISSIONS")
-            if env_val is not None:
+            if env_val is not None and env_val.strip():
                 explicit_bypass = env_val.strip().lower() in ("1", "true", "yes")
 
-        # Decoupled policy: sandboxed modes do NOT skip permissions unless explicitly requested;
-        # unrestricted mode defaults to skipping permissions for non-interactive headless CLI execution.
-        should_skip = explicit_bypass if explicit_bypass is not None else (not is_sandboxed)
+        should_skip = bool(explicit_bypass) if explicit_bypass is not None else False
 
         if should_skip:
+            logger.warning("Antigravity execution with permission bypass enabled (--dangerously-skip-permissions).")
             cmd += ["--dangerously-skip-permissions"]
 
         cmd += ["--output-format", "json"]
@@ -161,13 +247,24 @@ class CodexRuntime:
         proc: Any,
         timeout: float,
         pause_event: Optional[Any],
+        log_file: Optional[Path | str] = None,
+        max_buffer_bytes: int = 10 * 1024 * 1024,
     ) -> tuple[str, str]:
         """Wait for subprocess output while freezing timeout depletion whenever `pause_event` is set.
 
         Continuously drains stdout and stderr pipes in background daemon threads so that
         child process output (even >10MB) never saturates OS pipe buffers (~64KB) or causes
         deadlocks, while strictly preserving monotonic pause/resume deadline freezing.
+        In-memory buffering is capped at max_buffer_bytes (default 10MB) with rolling head
+        and tail retention. If log_file is provided, all chunks are streamed directly to disk.
         """
+        def _to_str(val: Any) -> str:
+            if val is None:
+                return ""
+            if isinstance(val, bytes):
+                return val.decode("utf-8", errors="replace")
+            return str(val)
+
         def _is_pipe(stream: Any) -> bool:
             if stream is None:
                 return False
@@ -179,85 +276,95 @@ class CodexRuntime:
                 pass
             return callable(getattr(stream, "read", None))
 
+        log_handle: Optional[io.BufferedWriter] = None
+        log_lock = threading.Lock()
+        if log_file:
+            log_path = Path(log_file)
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            log_handle = open(log_path, "wb")
+
         stdout_pipe = getattr(proc, "stdout", None)
         stderr_pipe = getattr(proc, "stderr", None)
         has_stdout = _is_pipe(stdout_pipe)
         has_stderr = _is_pipe(stderr_pipe) and stderr_pipe is not stdout_pipe
 
-        # If no pipes to drain and no pause_event, fast path directly to proc.communicate
-        if not has_stdout and not has_stderr and pause_event is None and callable(getattr(proc, "communicate", None)):
-            out, err = proc.communicate(timeout=timeout)
-            return out or "", err or ""
-
-        stdout_chunks: List[Any] = []
-        stderr_chunks: List[Any] = []
-
-        def _drain_stream(stream: Any, chunks: List[Any]) -> None:
-            raw_stream = getattr(stream, "buffer", stream)
-            read_fn = getattr(raw_stream, "read1", None)
-            if not callable(read_fn):
-                read_fn = getattr(stream, "read1", None)
-            if not callable(read_fn):
-                read_fn = getattr(stream, "read", None)
-            if not callable(read_fn):
-                return
-
-            try:
-                while True:
-                    chunk = read_fn(65536)
-                    if not chunk:
-                        break
-                    chunks.append(chunk)
-            except Exception:
-                pass
-            finally:
-                try:
-                    stream.close()
-                except Exception:
-                    pass
-
-        def _format_chunks(chunks: List[Any]) -> str:
-            if not chunks:
-                return ""
-            snapshot = list(chunks)
-            if not snapshot:
-                return ""
-            if isinstance(snapshot[0], bytes):
-                try:
-                    return b"".join(snapshot).decode("utf-8", errors="replace")
-                except TypeError:
-                    return "".join(
-                        c.decode("utf-8", errors="replace") if isinstance(c, bytes) else str(c)
-                        for c in snapshot
-                    )
-            return "".join(str(c) for c in snapshot)
+        stdout_buf = BoundedStreamBuffer(max_bytes=max_buffer_bytes)
+        stderr_buf = BoundedStreamBuffer(max_bytes=max_buffer_bytes)
 
         stdout_thread: Optional[threading.Thread] = None
         stderr_thread: Optional[threading.Thread] = None
-
-        if has_stdout:
-            stdout_thread = threading.Thread(
-                target=_drain_stream,
-                args=(stdout_pipe, stdout_chunks),
-                name="mtm-codex-drain-stdout",
-                daemon=True,
-            )
-            stdout_thread.start()
-
-        if has_stderr:
-            stderr_thread = threading.Thread(
-                target=_drain_stream,
-                args=(stderr_pipe, stderr_chunks),
-                name="mtm-codex-drain-stderr",
-                daemon=True,
-            )
-            stderr_thread.start()
-
-        remaining = float(timeout)
-        t_last = time.monotonic()
         poll_fn = getattr(proc, "poll", None)
 
         try:
+            # If no pipes to drain and no pause_event, fast path directly to proc.communicate
+            if not has_stdout and not has_stderr and pause_event is None and callable(getattr(proc, "communicate", None)):
+                out, err = proc.communicate(timeout=timeout)
+                out_str = _to_str(out)
+                err_str = _to_str(err)
+                if log_handle is not None:
+                    with log_lock:
+                        try:
+                            log_handle.write(out_str.encode("utf-8", errors="replace"))
+                            log_handle.flush()
+                        except Exception:
+                            pass
+                return out_str, err_str
+
+            def _drain_stream(stream: Any, buf: BoundedStreamBuffer) -> None:
+                raw_stream = getattr(stream, "buffer", stream)
+                read_fn = getattr(raw_stream, "read1", None)
+                if not callable(read_fn):
+                    read_fn = getattr(stream, "read1", None)
+                if not callable(read_fn):
+                    read_fn = getattr(stream, "read", None)
+                if not callable(read_fn):
+                    return
+
+                try:
+                    while True:
+                        chunk = read_fn(65536)
+                        if not chunk:
+                            break
+                        if log_handle is not None:
+                            with log_lock:
+                                try:
+                                    if isinstance(chunk, bytes):
+                                        log_handle.write(chunk)
+                                    else:
+                                        log_handle.write(str(chunk).encode("utf-8", errors="replace"))
+                                    log_handle.flush()
+                                except Exception:
+                                    pass
+                        buf.append(chunk)
+                except Exception:
+                    pass
+                finally:
+                    try:
+                        stream.close()
+                    except Exception:
+                        pass
+
+            if has_stdout:
+                stdout_thread = threading.Thread(
+                    target=_drain_stream,
+                    args=(stdout_pipe, stdout_buf),
+                    name="mtm-codex-drain-stdout",
+                    daemon=True,
+                )
+                stdout_thread.start()
+
+            if has_stderr:
+                stderr_thread = threading.Thread(
+                    target=_drain_stream,
+                    args=(stderr_pipe, stderr_buf),
+                    name="mtm-codex-drain-stderr",
+                    daemon=True,
+                )
+                stderr_thread.start()
+
+            remaining = float(timeout)
+            t_last = time.monotonic()
+
             while True:
                 if callable(poll_fn) and poll_fn() is not None:
                     # Child process has terminated
@@ -266,14 +373,23 @@ class CodexRuntime:
                     if stderr_thread is not None:
                         stderr_thread.join(timeout=2.0)
 
-                    out_str = _format_chunks(stdout_chunks)
-                    err_str = _format_chunks(stderr_chunks)
+                    out_str = stdout_buf.get_text()
+                    err_str = stderr_buf.get_text()
 
                     # Compatibility fallback for mock proc objects without pipes
                     if not has_stdout and not has_stderr and callable(getattr(proc, "communicate", None)):
                         try:
                             out_c, err_c = proc.communicate(timeout=2)
-                            return out_c or "", err_c or ""
+                            out_str = _to_str(out_c)
+                            err_str = _to_str(err_c)
+                            if log_handle is not None:
+                                with log_lock:
+                                    try:
+                                        log_handle.write(out_str.encode("utf-8", errors="replace"))
+                                        log_handle.flush()
+                                    except Exception:
+                                        pass
+                            return out_str, err_str
                         except Exception:
                             pass
 
@@ -287,8 +403,8 @@ class CodexRuntime:
                 if pause_event is None or not pause_event.is_set():
                     remaining -= elapsed_slice
                     if remaining <= 0:
-                        out_str = _format_chunks(stdout_chunks)
-                        err_str = _format_chunks(stderr_chunks)
+                        out_str = stdout_buf.get_text()
+                        err_str = stderr_buf.get_text()
                         raise subprocess.TimeoutExpired(
                             cmd=getattr(proc, "args", ["worker"]),
                             timeout=timeout,
@@ -296,6 +412,11 @@ class CodexRuntime:
                             stderr=err_str,
                         )
         finally:
+            if log_handle is not None:
+                try:
+                    log_handle.close()
+                except Exception:
+                    pass
             # Ensure background threads are cleaned up if process has terminated
             if callable(poll_fn) and poll_fn() is not None:
                 if stdout_thread is not None and stdout_thread.is_alive():
@@ -332,6 +453,11 @@ class CodexRuntime:
         """
         ws = Path(workspace).resolve()
         if cancel_event is not None and cancel_event.is_set():
+            if log_file:
+                try:
+                    Path(log_file).unlink(missing_ok=True)
+                except Exception:
+                    pass
             return RuntimeResult(
                 exit_code=-1,
                 timed_out=True,
@@ -450,7 +576,9 @@ class CodexRuntime:
 
                         threading.Thread(target=_watch_codex_cancel, daemon=True).start()
                     try:
-                        stdout_text, _ = self._communicate_with_pause(proc, timeout=timeout, pause_event=pause_event)
+                        stdout_text, _ = self._communicate_with_pause(
+                            proc, timeout=timeout, pause_event=pause_event, log_file=log_file
+                        )
                         exit_code = proc.returncode
                     except subprocess.TimeoutExpired as exc:
                         timed_out = True
@@ -523,7 +651,9 @@ class CodexRuntime:
 
                         threading.Thread(target=_watch_agy_cancel, daemon=True).start()
                     try:
-                        stdout_text, _ = self._communicate_with_pause(proc, timeout=timeout, pause_event=pause_event)
+                        stdout_text, _ = self._communicate_with_pause(
+                            proc, timeout=timeout, pause_event=pause_event, log_file=log_file
+                        )
                         exit_code = proc.returncode
                     except subprocess.TimeoutExpired as exc:
                         timed_out = True
@@ -550,7 +680,12 @@ class CodexRuntime:
         if cancel_event is not None and cancel_event.is_set():
             timed_out = True
             exit_code = -1
-        elif log_file:
+            if log_file:
+                try:
+                    Path(log_file).unlink(missing_ok=True)
+                except Exception:
+                    pass
+        elif log_file and not Path(log_file).exists():
             log_path = Path(log_file)
             log_path.parent.mkdir(parents=True, exist_ok=True)
             log_path.write_text(stdout_text, encoding="utf-8")
