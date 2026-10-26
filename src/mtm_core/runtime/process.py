@@ -67,6 +67,48 @@ def get_process_create_time(pid: int) -> Optional[float]:
                 import time as _time
 
                 return _time.time() - float(res.stdout.strip())
+
+            # Fallback for macOS / BSD ps which does not support 'etimes='
+            res_lstart = subprocess.run(
+                ["ps", "-p", str(int(pid)), "-o", "lstart="],
+                capture_output=True,
+                text=True,
+                timeout=2,
+            )
+            if res_lstart.returncode == 0 and res_lstart.stdout.strip():
+                try:
+                    import datetime
+
+                    dt = datetime.datetime.strptime(res_lstart.stdout.strip(), "%a %b %d %H:%M:%S %Y")
+                    return float(dt.timestamp())
+                except Exception:
+                    pass
+
+            res_etime = subprocess.run(
+                ["ps", "-p", str(int(pid)), "-o", "etime="],
+                capture_output=True,
+                text=True,
+                timeout=2,
+            )
+            if res_etime.returncode == 0 and res_etime.stdout.strip():
+                try:
+                    import time as _time
+
+                    s = res_etime.stdout.strip()
+                    days = 0
+                    if "-" in s:
+                        d_str, s = s.split("-", 1)
+                        days = int(d_str)
+                    parts = [int(p) for p in s.split(":")]
+                    if len(parts) == 2:
+                        elapsed = days * 86400 + parts[0] * 60 + parts[1]
+                    elif len(parts) == 3:
+                        elapsed = days * 86400 + parts[0] * 3600 + parts[1] * 60 + parts[2]
+                    else:
+                        elapsed = 0
+                    return _time.time() - float(elapsed)
+                except Exception:
+                    pass
         except Exception:
             return None
     return None
