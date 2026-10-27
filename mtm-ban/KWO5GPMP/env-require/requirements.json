@@ -1,0 +1,15 @@
+{
+  "schemaVersion": 1,
+  "platform": "windows-x64",
+  "applicationType": "web",
+  "node": ">=20",
+  "packageManager": "pnpm",
+  "requiredCommands": [
+    "git",
+    "node",
+    "pnpm"
+  ],
+  "requiredComponents": [
+    "postgresql>=15 (16 recommended), local, port 5433, prepared with db-setup.sql"
+  ]
+}

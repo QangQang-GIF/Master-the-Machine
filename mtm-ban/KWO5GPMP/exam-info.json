@@ -1,0 +1,8 @@
+{
+  "schemaVersion": 1,
+  "format": "MTM_EXAM_LOCK",
+  "immutable": true,
+  "examId": "MTM-26-EAC440",
+  "examVersion": "1.0.0",
+  "graderFingerprint": "sha256:feb0d287ef7cd24778e4d21feaec6ed9be25cfd0a3a549930b5b6b2096473be8"
+}

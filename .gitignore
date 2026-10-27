@@ -47,6 +47,4 @@ bench_results.json
 *.db-wal
 *.db-shm
 
-# Local workspace repos
-mtm-ban/
 

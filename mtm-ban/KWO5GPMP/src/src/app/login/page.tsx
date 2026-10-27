@@ -1,0 +1,37 @@
+import { redirect } from "next/navigation";
+
+import { auth } from "~/server/auth";
+
+import { LoginForm } from "./login-form";
+
+export const metadata = { title: "Sign in" };
+
+export default async function LoginPage() {
+  const session = await auth();
+  if (session?.user) redirect("/dashboard");
+
+  return (
+    <main
+      className="flex min-h-dvh items-center justify-center p-4"
+      style={{
+        background: 'url("/wallpapers-photos/ph-09.jpg") center / cover no-repeat fixed',
+      }}
+    >
+      <div className="glass-modal w-full max-w-sm p-8">
+        <div className="mb-6 text-center">
+          <span
+            aria-hidden
+            className="mx-auto mb-3 flex size-12 items-center justify-center rounded-lg bg-primary text-2xl font-bold text-ink-onbrand"
+          >
+            F
+          </span>
+          <h1 className="text-2xl font-semibold text-ink">Solova</h1>
+          <p className="mt-1 text-md text-ink-secondary">
+            Freelance Project Manager
+          </p>
+        </div>
+        <LoginForm />
+      </div>
+    </main>
+  );
+}
