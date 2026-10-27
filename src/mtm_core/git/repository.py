@@ -143,10 +143,11 @@ def verify_assigned_repository(
     if not assigned_folder_str:
         raise ValueError("Invariant 5 violated: Empty 'folder' in repository descriptor")
 
-    if assigned_folder_str in (".", "./", ".\\"):
+    norm_folder = assigned_folder_str.replace("\\", "/")
+    if norm_folder in (".", "./"):
         folder_path = root
     else:
-        folder_path = (root / assigned_folder_str).resolve()
+        folder_path = (root / norm_folder).resolve()
         try:
             folder_path.relative_to(root)
         except ValueError:
