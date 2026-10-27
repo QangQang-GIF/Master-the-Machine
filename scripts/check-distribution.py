@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
 check-distribution.py: Read-only distribution verification script.
-Verifies registrations/payload parity, identity/version, schema/manifest.
+Verifies registrations/payload parity, identity/version, schema/manifest,
+agent skills, package imports, and executes an active MCP Server smoke test.
 Outputs "READY" and exits 0 on success; non-zero on failure.
 """
 
@@ -9,7 +10,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
+import subprocess
 import sys
 from pathlib import Path
 
@@ -83,6 +86,7 @@ def verify_distribution(base_dir: Path) -> None:
             base_dir / "agents" / f"{prof.replace('_', '-')}.toml",
             base_dir / "profiles" / "agents" / f"{prof}.toml",
             base_dir / "profiles" / "agents" / f"{prof.replace('_', '-')}.toml",
+            base_dir / ".codex" / "agents" / f"{prof}.toml",
         ]
         found = next((p for p in candidates if p.exists()), None)
         if not found:
@@ -100,6 +104,89 @@ def verify_distribution(base_dir: Path) -> None:
             json.loads(schema_path.read_text(encoding="utf-8"))
         except Exception as exc:
             fail(f"Invalid schema JSON at {schema_path}: {exc}")
+
+    # 5. Root Skill Verification (team-orchestrator/SKILL.md)
+    skill_candidates = [
+        base_dir / "skills" / "team-orchestrator" / "SKILL.md",
+        base_dir / ".agents" / "skills" / "team-orchestrator" / "SKILL.md",
+        base_dir.parent / ".agents" / "skills" / "team-orchestrator" / "SKILL.md",
+        base_dir.parent / "skills" / "team-orchestrator" / "SKILL.md",
+    ]
+    skill_found = next((s for s in skill_candidates if s.exists() and s.stat().st_size > 50), None)
+    if not skill_found:
+        fail(f"Missing team-orchestrator/SKILL.md. Checked: {[str(s) for s in skill_candidates]}")
+
+    # 6. Runtime Package Import Verification (P0.3)
+    src_dir = base_dir / "src"
+    if not src_dir.exists():
+        src_dir = base_dir.parent / "src"
+    if src_dir.exists():
+        test_import_code = "import mtm_core; import mtm_competition; import mtm_knowledge; import runner.telemetry; print('OK')"
+        env = os.environ.copy()
+        env["PYTHONPATH"] = f"{src_dir}{os.pathsep}{base_dir}{os.pathsep}{env.get('PYTHONPATH', '')}"
+        res = subprocess.run([sys.executable, "-c", test_import_code], capture_output=True, text=True, env=env)
+        if res.returncode != 0:
+            fail(f"Runtime packages in src/ failed import test:\n{res.stderr}")
+
+    # 7. MCP Server Active Smoke Test (P1)
+    runner_script = base_dir / "runner" / "mcp_server.py"
+    if not runner_script.exists():
+        runner_script = base_dir.parent / "runner" / "mcp_server.py"
+
+    if runner_script.exists():
+        smoke_env = os.environ.copy()
+        if src_dir.exists():
+            smoke_env["PYTHONPATH"] = f"{src_dir}{os.pathsep}{base_dir}{os.pathsep}{smoke_env.get('PYTHONPATH', '')}"
+
+        proc = subprocess.Popen(
+            [sys.executable, str(runner_script)],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            env=smoke_env,
+            cwd=str(base_dir),
+        )
+
+        try:
+            # 7a. Send initialize
+            proc.stdin.write(json.dumps({"jsonrpc": "2.0", "id": 1, "method": "initialize"}) + "\n")
+            proc.stdin.flush()
+            init_res_line = proc.stdout.readline()
+            if not init_res_line:
+                err_out = proc.stderr.read()
+                fail(f"MCP Helper failed to respond to initialize request:\n{err_out}")
+            init_res = json.loads(init_res_line)
+            if init_res.get("result", {}).get("serverInfo", {}).get("name") != "mtm-minimal-helper":
+                fail(f"MCP serverInfo name mismatch: {init_res}")
+
+            # 7b. Send tools/list
+            proc.stdin.write(json.dumps({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}) + "\n")
+            proc.stdin.flush()
+            tools_res_line = proc.stdout.readline()
+            if not tools_res_line:
+                fail("MCP Helper failed to respond to tools/list request")
+            tools_res = json.loads(tools_res_line)
+            tool_names = {t.get("name") for t in tools_res.get("result", {}).get("tools", [])}
+            expected_tools = {
+                "configure_session",
+                "login_match",
+                "refresh_match",
+                "start_work",
+                "submit_work",
+                "report_progress",
+                "wait_for_update",
+            }
+            missing_tools = expected_tools - tool_names
+            if missing_tools:
+                fail(f"MCP Helper missing official tools: {missing_tools}")
+
+        finally:
+            proc.terminate()
+            try:
+                proc.wait(timeout=3)
+            except Exception:
+                proc.kill()
 
     print("Distribution check passed: ALL_VERIFIED")
     print("READY")

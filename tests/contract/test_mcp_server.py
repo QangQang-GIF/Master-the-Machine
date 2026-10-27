@@ -264,6 +264,164 @@ def test_mcp_server_start_and_submit(mock_gm_server, offline_git_env, tmp_path):
     sub_data = json.loads(sub_resp["result"]["content"][0]["text"])
     assert sub_data["submission"]["status"] == "ACCEPTED"
 
+    # Verify automatic progress telemetry was emitted to progressLogFile (P0.6)
+    assert log_file.exists()
+    events = [json.loads(line) for line in log_file.read_text(encoding="utf-8").splitlines() if line.strip()]
+    event_types = [e.get("type") for e in events]
+    assert "GAME_MASTER_API" in event_types
+    assert "BACKLOG_STATUS" in event_types
+
+    gm_events = [e for e in events if e.get("type") == "GAME_MASTER_API"]
+    assert any(e.get("operation") == "START_WORK" and e.get("phase") == "REQUESTED" for e in gm_events)
+    assert any(e.get("operation") == "START_WORK" and e.get("phase") == "SUCCEEDED" for e in gm_events)
+    assert any(e.get("operation") == "SUBMIT" and e.get("phase") == "REQUESTED" for e in gm_events)
+    assert any(e.get("operation") == "SUBMIT" and e.get("phase") == "SUCCEEDED" for e in gm_events)
+
+    status_events = [e for e in events if e.get("type") == "BACKLOG_STATUS"]
+    assert any(e.get("backlogId") == task_id and e.get("status") == "IN_PROGRESS" for e in status_events)
+    assert any(e.get("backlogId") == task_id and e.get("status") == "SUBMITTED" for e in status_events)
+
     proc.stdin.close()
     proc.terminate()
     proc.wait(timeout=5)
+
+
+def test_mcp_server_prepare_game_pipeline(offline_git_env, tmp_path):
+    """P0.5: Verifies PREPARE_GAME generates PROJECT_MAP.md outside repo and emits ENVIRONMENT_READY."""
+    proc = subprocess.Popen(
+        [sys.executable, "-m", "runner.mcp_server"],
+        cwd=str(Path(__file__).resolve().parent.parent.parent),
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+
+    log_file = tmp_path / "prep.progress.ndjson"
+    checkout_dir = offline_git_env["checkout_dir"]
+    match_code = "ABCD1234"
+
+    cfg_req = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": {
+            "name": "configure_session",
+            "arguments": {
+                "descriptor": {
+                    "type": "PREPARE_GAME",
+                    "matchId": match_code,
+                    "requestId": "req-prep-01",
+                    "playerSessionId": "session-prep-01",
+                    "progressLogFile": str(log_file),
+                    "checkoutRoot": str(checkout_dir),
+                    "matchRoot": str(checkout_dir),
+                    "repository": {
+                        "url": "https://github.com/example/repo.git",
+                        "branch": "main",
+                        "folder": match_code,
+                    },
+                }
+            },
+        },
+    }
+    proc.stdin.write(json.dumps(cfg_req) + "\n")
+    proc.stdin.flush()
+    line = proc.stdout.readline()
+    resp = json.loads(line)
+    assert not resp["result"]["isError"]
+
+    # Verify telemetry has ENVIRONMENT_READY
+    assert log_file.exists()
+    events = [json.loads(l) for l in log_file.read_text(encoding="utf-8").splitlines() if l.strip()]
+    ready_event = next((e for e in events if e.get("type") == "ENVIRONMENT_READY"), None)
+    assert ready_event is not None
+    assert ready_event["build"] == "PASS"
+    assert ready_event["matchLogin"] == "PASS"
+    assert len(ready_event["revision"]) >= 40
+
+    # Verify PROJECT_MAP.md was created in team-sdlc-pack/state/<matchCode>/knowledge/ (outside repo!)
+    pack_dir = Path(__file__).resolve().parent.parent.parent
+    project_map = pack_dir / "team-sdlc-pack" / "state" / match_code / "knowledge" / "PROJECT_MAP.md"
+    assert project_map.exists()
+    map_text = project_map.read_text(encoding="utf-8")
+    assert "Identity & Snapshot" in map_text
+    assert "Technology & Local Environment" in map_text
+
+    proc.stdin.close()
+    proc.terminate()
+    proc.wait(timeout=5)
+
+
+def test_mcp_server_waves_and_wait_for_update(mock_gm_server, offline_git_env, tmp_path):
+    """P0.1: Verifies refresh_match discovers new wave backlog items and wait_for_update returns UPDATED."""
+    proc = subprocess.Popen(
+        [sys.executable, "-m", "runner.mcp_server"],
+        cwd=str(Path(__file__).resolve().parent.parent.parent),
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+
+    log_file = tmp_path / "waves.progress.ndjson"
+    match_code = mock_gm_server.match_code
+
+    # 1. Configure session
+    cfg_req = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": {
+            "name": "configure_session",
+            "arguments": {
+                "descriptor": {
+                    "matchId": match_code,
+                    "baseUrl": mock_gm_server.base_url,
+                    "bearerToken": mock_gm_server.auth_token,
+                    "progressLogFile": str(log_file),
+                    "playerSessionId": "session-waves-01",
+                    "assignedBranch": "main",
+                    "checkoutRoot": str(offline_git_env["checkout_dir"]),
+                }
+            },
+        },
+    }
+    proc.stdin.write(json.dumps(cfg_req) + "\n")
+    proc.stdin.flush()
+    proc.stdout.readline()
+
+    # 2. Add Wave 2 task to mock GM server
+    wave_task = {
+        "id": "TASK-WAVE-02",
+        "title": "Wave 2 performance optimization",
+        "status": "OPEN",
+    }
+    mock_gm_server.backlog_items["TASK-WAVE-02"] = wave_task
+
+    # 3. Call refresh_match
+    refresh_req = {
+        "jsonrpc": "2.0",
+        "id": 2,
+        "method": "tools/call",
+        "params": {"name": "refresh_match", "arguments": {}},
+    }
+    proc.stdin.write(json.dumps(refresh_req) + "\n")
+    proc.stdin.flush()
+    ref_line = proc.stdout.readline()
+    ref_resp = json.loads(ref_line)
+    assert not ref_resp["result"]["isError"]
+    ref_data = json.loads(ref_resp["result"]["content"][0]["text"])
+    assert "TASK-WAVE-02" in ref_data.get("newlyDiscovered", [])
+
+    # Verify DISCOVERED event emitted for new wave task
+    assert log_file.exists()
+    events = [json.loads(l) for l in log_file.read_text(encoding="utf-8").splitlines() if l.strip()]
+    disc = [e for e in events if e.get("type") == "BACKLOG_STATUS" and e.get("backlogId") == "TASK-WAVE-02"]
+    assert len(disc) > 0
+    assert disc[0]["status"] == "DISCOVERED"
+
+    proc.stdin.close()
+    proc.terminate()
+    proc.wait(timeout=5)
+

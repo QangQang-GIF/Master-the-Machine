@@ -350,6 +350,42 @@ class OfficialGameMasterAdapter(GameMasterAdapter):
 
         raise last_error or GameMasterError(f"Request to {url} failed after {max_attempts} attempts")
 
+    def get_match_projection(self, match_id_or_code: Optional[str] = None) -> Dict[str, Any]:
+        """Fetch public match projection and open backlog items from Game Master.
+        
+        Queries /match/<matchId> as specified in Team Orchestrator Technical Guide Step 9.
+        Falls back to /api/v1/matches/<uuid> or /match/state.
+        """
+        ident = match_id_or_code or self.match_uuid
+        if not ident:
+            return self.get_match_state()
+
+        clean_ident = str(ident).strip()
+        # 1. Try public projection /match/<matchId>
+        try:
+            res = self._request("GET", f"/match/{clean_ident}")
+            if isinstance(res, dict):
+                return res
+        except Exception:
+            pass
+
+        # 2. Try official API /api/v1/matches/<matchUuid>
+        try:
+            res = self._request("GET", f"/api/v1/matches/{clean_ident}")
+            if isinstance(res, dict):
+                return res
+        except Exception:
+            pass
+
+        # 3. Fallback to /match/state
+        state = self.get_match_state()
+        try:
+            tasks = self.list_backlog()
+            state.setdefault("backlogItems", tasks)
+        except Exception:
+            state.setdefault("backlogItems", [])
+        return state
+
     def get_match_state(self) -> Dict[str, Any]:
         """Fetch current match state (duration, remaining time, status, clock)."""
         res = self._request("GET", "/match/state")

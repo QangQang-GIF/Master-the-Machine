@@ -12,6 +12,7 @@ import json
 import re
 import socket
 import threading
+import urllib.parse
 import uuid
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -71,6 +72,43 @@ class MockGameMasterHandler(BaseHTTPRequestHandler):
         if details is not None:
             body["error"]["details"] = details
         self._send_json(status_code, body, headers=headers)
+
+    def do_GET(self) -> None:
+        clean_path = urllib.parse.urlparse(self.path).path.rstrip("/")
+
+        with self.server.lock:
+            # 1. GET /match/state
+            if clean_path in ("/match/state", "/api/v1/match/state"):
+                self._send_json(200, {
+                    "status": self.server.match_state,
+                    "matchUuid": self.server.match_uuid,
+                    "matchCode": self.server.match_code,
+                    "server_epoch": 1729000000,
+                    "server_calibrated": True,
+                })
+                return
+
+            # 2. GET /match/<match_code_or_uuid> or /api/v1/matches/<uuid>
+            match_view = re.match(r"^/(?:api/v1/matches|match)/([^/]+)$", clean_path)
+            if match_view:
+                ident = match_view.group(1)
+                if ident.lower() in (self.server.match_code.lower(), self.server.match_uuid.lower()):
+                    self._send_json(200, {
+                        "status": self.server.match_state,
+                        "matchUuid": self.server.match_uuid,
+                        "matchCode": self.server.match_code,
+                        "backlogItems": list(self.server.backlog_items.values()),
+                    })
+                    return
+
+            # 3. GET /backlog
+            if clean_path in ("/backlog", "/api/v1/backlog"):
+                self._send_json(200, {
+                    "tasks": list(self.server.backlog_items.values()),
+                })
+                return
+
+        self._send_error_envelope(404, "NOT_FOUND", f"Endpoint {self.path} not found")
 
     def do_POST(self) -> None:
         # Check network timeout injection
@@ -322,6 +360,7 @@ class MockGameMasterHTTPServer(ThreadingHTTPServer):
         self.started_items: Dict[str, Dict[str, Any]] = {}
         self.accepted_items: set[str] = set()
         self.closed_items: set[str] = set()
+        self.backlog_items: Dict[str, Dict[str, Any]] = {}
         self.submissions: Dict[str, Dict[str, Any]] = {}
         self.idempotency_store: Dict[str, Tuple[str, Dict[str, Any], int]] = {}
         self.requests_log: List[Dict[str, Any]] = []
@@ -342,6 +381,7 @@ class MockGameMasterHTTPServer(ThreadingHTTPServer):
             self.started_items.clear()
             self.accepted_items.clear()
             self.closed_items.clear()
+            self.backlog_items.clear()
             self.submissions.clear()
             self.idempotency_store.clear()
             self.requests_log.clear()

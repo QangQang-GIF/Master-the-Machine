@@ -36,7 +36,7 @@ except ModuleNotFoundError:
         verify_remote_ref_sha,
     )
 from mtm_core.contracts import WorkerResult, WorkerStatus
-from mtm_competition.integration.git_guard import GitGuard, VerifiedRevision
+from mtm_competition.integration.git_guard import GitGuard, VerifiedRevision, is_cross_platform_absolute_path
 from mtm_competition.integration.integration_guard import IntegrationGuard, IntegrationResult
 from mtm_competition.integration.submission_guard import SubmissionGateError
 
@@ -90,7 +90,7 @@ def _check_pre_submission_contract(
 
     # 3. Evidence relative containment
     for ev in evidence_files:
-        if Path(ev).is_absolute() or ".." in Path(ev).parts:
+        if is_cross_platform_absolute_path(str(ev)) or Path(ev).is_absolute() or ".." in Path(ev).parts:
             raise SubmissionGateError(f"Illegal evidence path traversal: {ev}")
         ev_clean = ev.replace("\\", "/").strip("/")
         if not ev_clean.startswith("evidence/"):
@@ -229,6 +229,18 @@ def test_git_02_evidence_verification(offline_git_env: Dict[str, Any]):
             item_key=item_key,
             answer=answer_payload,
             evidence_files=["/tmp/test_run.log"],
+        )
+
+    # Subcase B2: Windows absolute path rejected (cross-platform)
+    with pytest.raises(SubmissionGateError):
+        _check_pre_submission_contract(
+            repo_path=checkout_dir,
+            commit_sha=commit_sha,
+            remote_name="origin",
+            branch=branch,
+            item_key=item_key,
+            answer=answer_payload,
+            evidence_files=["C:\\evidence\\log.txt"],
         )
 
     # Subcase C: Path traversal rejected

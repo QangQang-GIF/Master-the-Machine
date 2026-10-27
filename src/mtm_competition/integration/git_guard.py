@@ -4,8 +4,25 @@ from __future__ import annotations
 import json
 import os
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any, Dict, List, Optional
+
+
+def is_cross_platform_absolute_path(path_str: str) -> bool:
+    """Check if a path is absolute on either POSIX or Windows (drive letter, UNC, or leading slash)."""
+    if not path_str:
+        return False
+    s = str(path_str).strip()
+    if s.startswith(("/", "\\")):
+        return True
+    if len(s) >= 2 and s[0].isalpha() and s[1] == ":":
+        return True
+    try:
+        if PureWindowsPath(s).is_absolute() or PurePosixPath(s).is_absolute():
+            return True
+    except Exception:
+        pass
+    return False
 
 from mtm_core.git import get_head_sha, is_repo_clean, run_git
 from mtm_competition.integration.integration_guard import is_forbidden_path
@@ -265,8 +282,8 @@ class PreSubmissionGitGuard:
 
             for ev in all_evidence:
                 ev_str = str(ev)
-                # Check absolute path
-                if os.path.isabs(ev_str) or Path(ev_str).is_absolute() or ev_str.startswith(("/", "\\")):
+                # Check absolute path (cross-platform check for POSIX and Windows drives/UNC)
+                if is_cross_platform_absolute_path(ev_str):
                     msg = f"Illegal absolute evidence path rejected: '{ev_str}'"
                     if raise_on_error:
                         raise SubmissionGateError(msg)

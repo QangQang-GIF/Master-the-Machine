@@ -2,8 +2,9 @@
 scripts/install.py: Installer script for MTM Player pack.
 Installs the team pack into the target TeamWorkspace:
 - Resolves paths and validates containment
-- Copies/syncs runtime pack files (manifest, profiles, schemas, runner, etc.)
-- Configures .codex/config.toml with absolute python path to runner/mcp_server.py
+- Copies/syncs runtime pack files (manifest, profiles, schemas, runner, src, skills, etc.)
+- Sets up .agents/skills and .codex/agents registrations
+- Configures .codex/config.toml with absolute python path and PYTHONPATH
 - Runs check-distribution.py
 - Exits 0 on READY
 """
@@ -31,7 +32,7 @@ def install_pack(source_dir: Path, workspace_dir: Path) -> None:
 
     print(f"Installing team pack from {source_dir} to {target_pack_dir}...")
 
-    # Copy key pack artifacts
+    # 1. Copy key pack manifests
     files_to_copy = [
         "team-runtime.json",
         "team-pack-info.json",
@@ -41,13 +42,16 @@ def install_pack(source_dir: Path, workspace_dir: Path) -> None:
         if src_f.exists():
             shutil.copy2(src_f, target_pack_dir / f)
 
+    # 2. Copy directories including src/ (CRITICAL: P0.3 runtime packages)
     dirs_to_copy = [
+        "src",
         "profiles",
         "agents",
         "schemas",
         "runner",
         "scripts",
         "docs",
+        "skills",
     ]
     for d in dirs_to_copy:
         src_d = source_dir / d
@@ -55,25 +59,72 @@ def install_pack(source_dir: Path, workspace_dir: Path) -> None:
             dst_d = target_pack_dir / d
             shutil.copytree(src_d, dst_d, dirs_exist_ok=True)
 
-    # Configure .codex/config.toml
+    # 3. Setup skills layout: .agents/skills/team-orchestrator/SKILL.md
+    ws_agents_skills = ws / ".agents" / "skills"
+    pack_agents_skills = target_pack_dir / ".agents" / "skills"
+    ws_agents_skills.mkdir(parents=True, exist_ok=True)
+    pack_agents_skills.mkdir(parents=True, exist_ok=True)
+
+    src_agents_skills = source_dir / ".agents" / "skills"
+    if src_agents_skills.exists():
+        shutil.copytree(src_agents_skills, ws_agents_skills, dirs_exist_ok=True)
+        shutil.copytree(src_agents_skills, pack_agents_skills, dirs_exist_ok=True)
+
+    src_skills = source_dir / "skills"
+    if src_skills.exists():
+        for skill_dir in src_skills.iterdir():
+            if skill_dir.is_dir():
+                shutil.copytree(skill_dir, ws_agents_skills / skill_dir.name, dirs_exist_ok=True)
+                shutil.copytree(skill_dir, pack_agents_skills / skill_dir.name, dirs_exist_ok=True)
+
+    # 4. Setup agent profiles layout: .codex/agents/*.toml
+    ws_codex_agents = ws / ".codex" / "agents"
+    pack_codex_agents = target_pack_dir / ".codex" / "agents"
+    ws_codex_agents.mkdir(parents=True, exist_ok=True)
+    pack_codex_agents.mkdir(parents=True, exist_ok=True)
+
+    agents_source = source_dir / "agents"
+    if agents_source.exists():
+        for toml_f in agents_source.glob("*.toml"):
+            shutil.copy2(toml_f, ws_codex_agents / toml_f.name)
+            shutil.copy2(toml_f, pack_codex_agents / toml_f.name)
+
+    # 5. Create required state, log, and .mtm storage directories
+    (ws / ".mtm").mkdir(parents=True, exist_ok=True)
+    (ws / "logs").mkdir(parents=True, exist_ok=True)
+    (target_pack_dir / "logs").mkdir(parents=True, exist_ok=True)
+    (target_pack_dir / "state").mkdir(parents=True, exist_ok=True)
+
+    # 6. Configure .codex/config.toml with PYTHONPATH
     codex_dir = ws / ".codex"
     codex_dir.mkdir(parents=True, exist_ok=True)
-    mcp_server_script = (target_pack_dir / "runner" / "mcp_server.py").as_posix()
     python_exe = sys.executable.replace("\\", "/")
+    target_posix = target_pack_dir.as_posix()
+    src_posix = (target_pack_dir / "src").as_posix()
+    sep = ";" if sys.platform.startswith("win") else ":"
 
     codex_toml = f"""[mcp_servers.mtm_minimal]
 command = "{python_exe}"
 args = ["-m", "runner.mcp_server"]
-cwd = "{target_pack_dir.as_posix()}"
+cwd = "{target_posix}"
 startup_timeout_sec = 15
 tool_timeout_sec = 120
+
+[mcp_servers.mtm_minimal.env]
+PYTHONPATH = "{src_posix}{sep}{target_posix}"
 """
     (codex_dir / "config.toml").write_text(codex_toml, encoding="utf-8")
+    (target_pack_dir / ".codex").mkdir(parents=True, exist_ok=True)
+    (target_pack_dir / ".codex" / "config.toml").write_text(codex_toml, encoding="utf-8")
 
-    # Run distribution check
+    # 7. Run distribution check
     check_script = target_pack_dir / "scripts" / "check-distribution.py"
     if check_script.exists():
-        res = subprocess.run([sys.executable, str(check_script), "--team-workspace", str(target_pack_dir)], capture_output=True, text=True)
+        res = subprocess.run(
+            [sys.executable, str(check_script), "--team-workspace", str(target_pack_dir)],
+            capture_output=True,
+            text=True,
+        )
         if res.returncode != 0:
             sys.stderr.write(f"Post-installation verification failed:\n{res.stderr}\n")
             sys.exit(1)

@@ -7,7 +7,7 @@ import os
 import subprocess
 import tempfile
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any, Dict, List, Optional
 
 from mtm_core.contracts import WorkerResult
@@ -34,6 +34,23 @@ FORBIDDEN_DIR_PREFIXES = [
     ".agents",
     "team-sdlc-pack/state",
 ]
+
+
+def is_cross_platform_absolute_path(path_str: str) -> bool:
+    """Check if a path is absolute on either POSIX or Windows (drive letter, UNC, or leading slash)."""
+    if not path_str:
+        return False
+    s = str(path_str).strip()
+    if s.startswith(("/", "\\")):
+        return True
+    if len(s) >= 2 and s[0].isalpha() and s[1] == ":":
+        return True
+    try:
+        if PureWindowsPath(s).is_absolute() or PurePosixPath(s).is_absolute():
+            return True
+    except Exception:
+        pass
+    return False
 
 
 def is_forbidden_path(rel_path: Path | str) -> tuple[bool, str]:
@@ -186,8 +203,9 @@ class IntegrationGuard:
         if evidence_files:
             ev_dir.mkdir(parents=True, exist_ok=True)
             for ev_name, ev_content in evidence_files.items():
+                ev_str = str(ev_name)
                 ev_path = Path(ev_name)
-                if ev_path.is_absolute() or ".." in ev_path.parts:
+                if is_cross_platform_absolute_path(ev_str) or ".." in ev_path.parts:
                     raise ValueError(f"Evidence path must be relative: {ev_name}")
                 dest_ev = ev_dir / ev_path.name
                 if isinstance(ev_content, bytes):
@@ -238,7 +256,8 @@ class IntegrationGuard:
 
             # 1. Path traversal check (GIT-05)
             if (
-                rel_path.is_absolute()
+                is_cross_platform_absolute_path(rel_str)
+                or rel_path.is_absolute()
                 or ".." in rel_path.parts
                 or ".." in rel_str
                 or "%2e" in rel_str.lower()

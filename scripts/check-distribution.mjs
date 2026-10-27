@@ -104,6 +104,18 @@ function verifyDistribution(baseDir) {
     }
   }
 
+  // 5. Root Skill Verification (team-orchestrator/SKILL.md)
+  const skillCandidates = [
+    path.join(baseDir, 'skills', 'team-orchestrator', 'SKILL.md'),
+    path.join(baseDir, '.agents', 'skills', 'team-orchestrator', 'SKILL.md'),
+    path.join(path.dirname(baseDir), '.agents', 'skills', 'team-orchestrator', 'SKILL.md'),
+    path.join(path.dirname(baseDir), 'skills', 'team-orchestrator', 'SKILL.md'),
+  ];
+  const skillFound = skillCandidates.find(p => fs.existsSync(p) && fs.statSync(p).size > 50);
+  if (!skillFound) {
+    fail(`Missing team-orchestrator/SKILL.md. Checked:\n  ${skillCandidates.join('\n  ')}`);
+  }
+
   console.log('Distribution check passed: ALL_VERIFIED');
   console.log('READY');
 }
