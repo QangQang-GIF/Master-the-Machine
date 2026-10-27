@@ -483,18 +483,19 @@ class TestChallengerR2GitInvariantsEdgeCases:
     def test_r2_subfolder_internal_dotdot_resolves_within_root(
         self, offline_git_env: Dict[str, Any]
     ):
-        """Invariant 5 behavior: Internal '..' that resolves within checkout_root is accepted by relative_to()."""
+        """Invariant 5 behavior: Reject folder aliases containing '..' path components even if resolving within root."""
         checkout_dir = offline_git_env["checkout_dir"]
         remote_url = offline_git_env["remote_url"]
 
-        # 'repo/..' resolves to checkout_dir itself
+        # 'repo/..' must be rejected because it contains '..' as a path component
         descriptor = {
             "url": remote_url,
             "branch": "main",
             "folder": "repo/..",
         }
-        res = verify_assigned_repository(checkout_dir, descriptor)
-        assert res["match_folder"] == checkout_dir
+        with pytest.raises(ValueError) as exc_info:
+            verify_assigned_repository(checkout_dir, descriptor)
+        assert "path component" in str(exc_info.value)
 
     def test_r2_missing_subfolder_and_file_as_subfolder_fail_closed(
         self, offline_git_env: Dict[str, Any]

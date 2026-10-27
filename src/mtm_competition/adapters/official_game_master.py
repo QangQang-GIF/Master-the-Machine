@@ -117,6 +117,33 @@ class MVSLockedError(GameMasterAPIError):
     pass
 
 
+def build_match_page_url(match_page_url: str, match_id: str) -> str:
+    """Constructs specific match page URL <origin>/match/<matchId> if not already present."""
+    if not match_page_url:
+        return f"/match/{match_id}" if match_id else "/match"
+    if not match_id:
+        return match_page_url
+
+    parsed = urllib.parse.urlparse(match_page_url)
+    origin = f"{parsed.scheme}://{parsed.netloc}" if parsed.scheme and parsed.netloc else ""
+    path = parsed.path.rstrip("/")
+
+    segments = [s for s in path.split("/") if s]
+    # Check if match_id is already present in path segments
+    if any(s.upper() == match_id.upper() for s in segments):
+        return match_page_url
+
+    if path == "/match" or path.endswith("/match"):
+        specific_path = f"{path}/{match_id}"
+    elif not path or path == "/":
+        specific_path = f"/match/{match_id}"
+    else:
+        specific_path = f"{path}/match/{match_id}"
+
+    query_part = f"?{parsed.query}" if parsed.query else ""
+    return f"{origin}{specific_path}{query_part}" if origin else f"{specific_path}{query_part}"
+
+
 class OfficialGameMasterAdapter(GameMasterAdapter):
     """Production HTTP REST connector for the official BTC tournament platform.
 
@@ -310,7 +337,7 @@ class OfficialGameMasterAdapter(GameMasterAdapter):
 
                                 parsed = {
                                     "matchUuid": match_obj.get("matchUuid") or match_obj.get("id") or page_props.get("matchUuid") or page_props.get("id"),
-                                    "matchCode": match_obj.get("matchCode") or page_props.get("matchCode"),
+                                    "matchCode": match_obj.get("matchCode") or page_props.get("matchCode") or next_data.get("query", {}).get("matchId") or next_data.get("query", {}).get("matchCode"),
                                     "status": match_obj.get("status") or page_props.get("status") or "IN_PROGRESS",
                                     "backlogItems": items if isinstance(items, list) else [],
                                     "waveTimestamps": wave_timestamps,
@@ -489,6 +516,7 @@ class OfficialGameMasterAdapter(GameMasterAdapter):
         password: str,
         match_page_url: str,
         allowed_origins: Optional[List[str]] = None,
+        match_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Authenticate genuine browser/cookie session for PREPARE_GAME.
 
@@ -496,7 +524,8 @@ class OfficialGameMasterAdapter(GameMasterAdapter):
         2. Authenticates against /login or /api/v1/auth/login with username/password, capturing cookies.
         3. Fetches match page /match/<matchId> using session cookies.
         4. Validates match projection schema (matchUuid, matchCode, backlogItems).
-        5. Fails closed: raises GameMasterError/RuntimeError if authentication fails.
+        5. Validates projection matches requested matchCode/matchId.
+        6. Fails closed: raises GameMasterError/RuntimeError if authentication fails.
 
         Returns:
             Dict containing {"status": "AUTHENTICATED", "session_token": str, "projection": Dict[str, Any], "cookies": Dict[str, str]}
@@ -508,8 +537,14 @@ class OfficialGameMasterAdapter(GameMasterAdapter):
         if not match_page_url or not isinstance(match_page_url, str) or not match_page_url.strip():
             raise GameMasterValidationError(422, "match_page_url is required for session login")
 
-        # 1. SEC-01 & allowed_origins validation
+        # 1. Target URL construction & SEC-01 / allowed_origins validation
+        target_url = match_page_url
+        if match_id:
+            target_url = build_match_page_url(match_page_url, match_id)
+
         self._validate_url_security(match_page_url)
+        if target_url != match_page_url:
+            self._validate_url_security(target_url)
         parsed_page = urllib.parse.urlparse(match_page_url)
         page_origin = f"{parsed_page.scheme}://{parsed_page.netloc}".rstrip("/")
 
@@ -597,19 +632,38 @@ class OfficialGameMasterAdapter(GameMasterAdapter):
         # 3. Fetch match page using session cookies
         projection_raw = None
         try:
-            projection_raw = self._request("GET", match_page_url, retries=1)
+            projection_raw = self._request("GET", target_url, retries=1)
         except Exception as e:
-            # Fallback: extract match identifier from match_page_url and call get_match_projection
-            match_id = parsed_page.path.split("/match/")[-1].strip("/") if "/match/" in parsed_page.path else ""
-            if match_id:
-                projection_raw = self.get_match_projection(match_id)
+            # Fallback: extract match identifier and call get_match_projection
+            eff_match_id = match_id
+            if not eff_match_id:
+                parsed_target = urllib.parse.urlparse(target_url)
+                if "/match/" in parsed_target.path:
+                    eff_match_id = parsed_target.path.split("/match/")[-1].strip("/")
+                elif "/match/" in parsed_page.path:
+                    eff_match_id = parsed_page.path.split("/match/")[-1].strip("/")
+            if eff_match_id:
+                projection_raw = self.get_match_projection(eff_match_id)
             else:
                 if isinstance(e, GameMasterError):
                     raise
-                raise GameMasterError(f"Failed to fetch match page at {match_page_url}: {e}") from e
+                raise GameMasterError(f"Failed to fetch match page at {target_url}: {e}") from e
 
         # 4. Strictly validate match projection schema
         validated_projection = validate_match_projection_schema(projection_raw)
+
+        # 5. Confirm matchCode / matchId assignment
+        if match_id:
+            proj_code = validated_projection.get("matchCode")
+            proj_uuid = validated_projection.get("matchUuid") or validated_projection.get("id")
+            code_match = bool(proj_code and str(proj_code).upper() == str(match_id).upper())
+            uuid_match = bool(proj_uuid and str(proj_uuid).lower() == str(match_id).lower())
+            if not (code_match or uuid_match):
+                raise GameMasterValidationError(
+                    422,
+                    f"Match assignment verification failed: projection returned matchCode='{proj_code}' "
+                    f"(uuid='{proj_uuid}'), expected '{match_id}'."
+                )
 
         return {
             "status": "AUTHENTICATED",

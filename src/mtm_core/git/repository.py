@@ -147,6 +147,11 @@ def verify_assigned_repository(
     if norm_folder in (".", "./"):
         folder_path = root
     else:
+        parts = [p for p in norm_folder.split("/") if p]
+        if ".." in parts:
+            raise ValueError(
+                f"Invariant 5 violated: Assigned folder '{assigned_folder}' traverses outside checkout root or contains invalid '..' path component"
+            )
         folder_path = (root / norm_folder).resolve()
         try:
             folder_path.relative_to(root)

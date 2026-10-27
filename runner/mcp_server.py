@@ -34,7 +34,10 @@ for _p in [str(_pack_root), str(_src_dir)]:
         sys.path.insert(0, _p)
 
 from mtm_competition.adapters.base import validate_match_projection_schema
-from mtm_competition.adapters.official_game_master import OfficialGameMasterAdapter
+from mtm_competition.adapters.official_game_master import (
+    OfficialGameMasterAdapter,
+    build_match_page_url,
+)
 from mtm_competition.integration.git_guard import PreSubmissionGitGuard
 from mtm_competition.tasks.journal import SubmissionJournal
 from mtm_knowledge.bootstrap import KnowledgeBootstrap, detect_tech_stack
@@ -47,7 +50,10 @@ from runner.telemetry import (
 
 class MCPHelperServer:
     def __init__(self, workspace_root: Optional[Path | str] = None):
-        self.workspace_root = Path(workspace_root or ".").resolve()
+        raw_root = Path(workspace_root).resolve() if workspace_root is not None else Path.cwd().resolve()
+        if raw_root.name.lower() == "team-sdlc-pack":
+            raw_root = raw_root.parent
+        self.workspace_root = raw_root
         self.descriptor: Dict[str, Any] = {}
         self.match_uuid: Optional[str] = None
         self.match_code: Optional[str] = None
@@ -57,6 +63,7 @@ class MCPHelperServer:
         self.bearer_token: str = ""
         self.api_url: str = ""
         self.adapter: Optional[OfficialGameMasterAdapter] = None
+        self.session_cookies: Dict[str, str] = {}
         self.journal: Optional[SubmissionJournal] = None
         self.git_guard: Optional[PreSubmissionGitGuard] = None
         self.telemetry: Optional[TelemetryLogger] = None
@@ -79,25 +86,38 @@ class MCPHelperServer:
 
     def configure_session(self, descriptor: Dict[str, Any]) -> Dict[str, Any]:
         """Configure trusted session from MTM Player descriptor."""
-        self.descriptor = descriptor
-        self.match_code = descriptor.get("matchId") or descriptor.get("matchCode") or descriptor.get("match_code")
-        self.match_uuid = descriptor.get("matchUuid") or descriptor.get("match_uuid") or descriptor.get("matchIdUuid")
+        merged = dict(self.descriptor)
+        merged.update(descriptor)
+        self.descriptor = merged
+
+        new_code = descriptor.get("matchId") or descriptor.get("matchCode") or descriptor.get("match_code")
+        if new_code:
+            self.match_code = str(new_code).strip()
+
+        new_uuid = descriptor.get("matchUuid") or descriptor.get("match_uuid") or descriptor.get("matchIdUuid")
+        if new_uuid:
+            self.match_uuid = str(new_uuid).strip()
 
         session_id = descriptor.get("playerSessionId") or descriptor.get("sessionId")
         if session_id:
             self.player_session_id = str(session_id)
 
-        # Store session credentials and match page URL from descriptor
-        self.username = descriptor.get("username")
-        self.password = descriptor.get("password")
-        self.match_page_url = descriptor.get("matchPageUrl") or descriptor.get("match_page_url")
-        self.allowed_match_origins = descriptor.get("allowedMatchOrigins") or descriptor.get("allowed_origins") or descriptor.get("allowedOrigins")
+        # Store session credentials and match page URL from descriptor (retaining prior if omitted)
+        if descriptor.get("username"):
+            self.username = descriptor.get("username")
+        if descriptor.get("password"):
+            self.password = descriptor.get("password")
+        if descriptor.get("matchPageUrl") or descriptor.get("match_page_url"):
+            self.match_page_url = descriptor.get("matchPageUrl") or descriptor.get("match_page_url")
+        if descriptor.get("allowedMatchOrigins") or descriptor.get("allowed_origins") or descriptor.get("allowedOrigins"):
+            self.allowed_match_origins = descriptor.get("allowedMatchOrigins") or descriptor.get("allowed_origins") or descriptor.get("allowedOrigins")
 
-        # Repository descriptor
-        repo_info = descriptor.get("repository") or {}
-        self.repo_descriptor = repo_info
+        # Repository descriptor: retain from prior PREPARE_GAME if START_GAME omits repository
+        if descriptor.get("repository"):
+            self.repo_descriptor = descriptor["repository"]
+        repo_info = self.repo_descriptor
 
-        # Assigned branch resolution: require repository.branch, fail closed on missing branch
+        # Assigned branch resolution: require repository.branch, retain verified branch if omitted
         assigned_branch = (
             repo_info.get("branch")
             or descriptor.get("assignedBranch")
@@ -105,8 +125,20 @@ class MCPHelperServer:
         )
         if assigned_branch:
             self.assigned_branch = str(assigned_branch).strip()
-        else:
+        elif not self.assigned_branch:
             self.assigned_branch = "main" if descriptor.get("type") == "PREPARE_GAME" else None
+
+        # Workspace root from descriptor: update from teamWorkspace or teamSdlcPackWorkspace
+        team_ws_str = descriptor.get("teamWorkspace") or descriptor.get("team_workspace")
+        if team_ws_str:
+            ws_path = Path(team_ws_str).resolve()
+            if ws_path.name.lower() == "team-sdlc-pack":
+                ws_path = ws_path.parent
+            self.workspace_root = ws_path
+        elif descriptor.get("teamSdlcPackWorkspace"):
+            pack_ws = Path(descriptor["teamSdlcPackWorkspace"]).resolve()
+            if pack_ws.name.lower() == "team-sdlc-pack":
+                self.workspace_root = pack_ws.parent
 
         # Paths
         checkout_str = descriptor.get("checkoutRoot")
@@ -125,7 +157,7 @@ class MCPHelperServer:
         log_file_str = descriptor.get("progressLogFile")
         if log_file_str:
             self.progress_log_file = Path(log_file_str).resolve()
-        else:
+        elif not self.progress_log_file:
             log_dir = self.workspace_root / "logs"
             log_dir.mkdir(parents=True, exist_ok=True)
             self.progress_log_file = log_dir / f"{self.match_code or 'active'}.progress.ndjson"
@@ -136,17 +168,17 @@ class MCPHelperServer:
             player_session_id=self.player_session_id,
         )
 
-        # Adapter
-        # Separate browser/cookie authentication (PREPARE_GAME) from bearer key API authentication (START_GAME)
+        # Adapter & Bearer Token Management
         is_prepare = (descriptor.get("type") == "PREPARE_GAME")
-        if not is_prepare:
-            self.bearer_token = (
-                descriptor.get("apiKeySecret")
-                or descriptor.get("bearerToken")
-                or descriptor.get("runtimeTeamKey")
-                or ""
-            )
-        else:
+        new_token = (
+            descriptor.get("apiKeySecret")
+            or descriptor.get("bearerToken")
+            or descriptor.get("runtimeTeamKey")
+            or ""
+        )
+        if not is_prepare and new_token:
+            self.bearer_token = new_token
+        elif is_prepare and not self.bearer_token:
             self.bearer_token = ""
 
         base_from_page = ""
@@ -155,21 +187,38 @@ class MCPHelperServer:
             if parsed_u.scheme and parsed_u.netloc:
                 base_from_page = f"{parsed_u.scheme}://{parsed_u.netloc}"
 
-        self.api_url = (
+        new_api_url = (
             descriptor.get("gameMasterApiUrl")
             or descriptor.get("gameMasterUrl")
             or descriptor.get("baseUrl")
             or base_from_page
             or descriptor.get("origin")
-            or "https://ai-fest-five.vercel.app"
+            or ""
         ).rstrip("/")
+        if new_api_url:
+            self.api_url = new_api_url
+        elif not self.api_url:
+            self.api_url = "https://ai-fest-five.vercel.app"
 
-        self.adapter = OfficialGameMasterAdapter(
-            base_url=self.api_url,
-            auth_token=self.bearer_token,
-            match_uuid=self.match_uuid,
-            max_retries=3,
-        )
+        # Update existing adapter instance WITHOUT replacing it (preserving cookies)
+        if self.adapter is not None:
+            if self.bearer_token:
+                self.adapter.auth_token = self.bearer_token
+                self.adapter.api_key = self.bearer_token
+            if self.api_url:
+                self.adapter.base_url = self.api_url
+                self.adapter.api_base_url = self.api_url
+            if self.match_uuid:
+                self.adapter.match_uuid = self.match_uuid
+        else:
+            self.adapter = OfficialGameMasterAdapter(
+                base_url=self.api_url,
+                auth_token=self.bearer_token,
+                match_uuid=self.match_uuid,
+                max_retries=3,
+            )
+            if self.session_cookies:
+                self.adapter.session_cookies.update(self.session_cookies)
 
         # Attempt to resolve match UUID from public projection if missing
         if not self.match_uuid and self.match_code and self.adapter:
@@ -184,7 +233,14 @@ class MCPHelperServer:
 
         # Journal & Git Guard
         db_path = descriptor.get("journalDbPath") or (self.workspace_root / ".mtm" / "submissions.db")
-        self.journal = SubmissionJournal(db_path=db_path)
+        Path(db_path).parent.mkdir(parents=True, exist_ok=True)
+        if self.journal is None or str(getattr(self.journal, "db_path", "")) != str(db_path):
+            if self.journal is not None:
+                try:
+                    self.journal.close()
+                except Exception:
+                    pass
+            self.journal = SubmissionJournal(db_path=db_path)
         self.git_guard = PreSubmissionGitGuard(repo_path=self.checkout_root)
 
         # Record initial items from descriptor
@@ -376,15 +432,31 @@ class MCPHelperServer:
                     raise RuntimeError(f"PREPARE_GAME failed: Missing required authentication fields: {', '.join(missing)}")
 
                 try:
+                    target_match_url = build_match_page_url(match_page_url, self.match_code) if self.match_code else match_page_url
                     auth_res = self.adapter.login_session(
                         username=username,
                         password=password,
-                        match_page_url=match_page_url,
+                        match_page_url=target_match_url,
                         allowed_origins=allowed_origins,
+                        match_id=self.match_code,
                     )
                     if auth_res.get("status") != "AUTHENTICATED":
                         raise RuntimeError(f"login_session returned non-authenticated status: {auth_res.get('status')}")
+
+                    cookies_returned = auth_res.get("cookies") or {}
+                    self.session_cookies.update(cookies_returned)
+
                     proj = auth_res.get("projection") or {}
+                    if self.match_code:
+                        proj_code = proj.get("matchCode")
+                        proj_uuid = proj.get("matchUuid") or proj.get("id")
+                        code_match = bool(proj_code and str(proj_code).upper() == str(self.match_code).upper())
+                        uuid_match = bool(proj_uuid and str(proj_uuid).lower() == str(self.match_code).lower())
+                        if not (code_match or uuid_match):
+                            raise RuntimeError(
+                                f"Match assignment mismatch: expected {self.match_code}, got {proj_code or proj_uuid}"
+                            )
+
                     if proj.get("matchUuid"):
                         self.match_uuid = str(proj["matchUuid"])
                         self.adapter.match_uuid = self.match_uuid
@@ -397,9 +469,16 @@ class MCPHelperServer:
                 self.telemetry.emit_preparation_status("MATCH_LOGIN", "COMPLETED", "Match credentials verified.")
 
             # 5. Emit ENVIRONMENT_READY only when all 3 gates have genuinely passed!
+            repo_url_val = repo_info.get("url", "")
+            if repo_url_val and not repo_url_val.startswith("https://"):
+                clean_name = Path(repo_url_val).name
+                if not clean_name.endswith(".git"):
+                    clean_name = f"{clean_name}.git"
+                repo_url_val = f"https://git.mtm.local/{clean_name}"
+
             self.telemetry.emit_environment_ready(
                 request_id=descriptor.get("requestId", f"prepare-{self.match_code or '1'}"),
-                repo_url=repo_info.get("url", ""),
+                repo_url=repo_url_val,
                 branch=self.assigned_branch,
                 folder=repo_info.get("folder", self.match_code or ""),
                 revision=head_sha,

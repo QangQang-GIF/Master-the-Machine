@@ -12,6 +12,7 @@ Verifies:
 import json
 import subprocess
 import sys
+import uuid
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 import pytest
@@ -517,3 +518,363 @@ def test_submit_work_network_timeout_retains_in_flight(base_server, offline_git_
         entry = j.get_entry("match-uuid-timeout", "TASK-TIMEOUT")
         assert entry is not None
         assert entry["state"] == "IN_FLIGHT"
+
+
+# ==============================================================================
+# 7. Mandatory PREPARE -> START -> SUBMIT Lifecycle Integration Test
+# ==============================================================================
+
+def test_prepare_start_submit_lifecycle(base_server, mock_gm_server, offline_git_env, tmp_path):
+    """
+    Mandatory Gen 8 Integration Test: Full PREPARE -> START -> SUBMIT Lifecycle.
+    Verifies across all four operational stages within the same MCPHelperServer instance:
+    1. PREPARE_GAME:
+       - Configures repository, branch, folder, username, password, matchPageUrl.
+       - Validates Git invariants, executes environment doctor, and completes session login.
+       - Emits ORCHESTRATOR_STARTED, PREPARATION_STATUS, and ENVIRONMENT_READY.
+       - Captures session cookies and verifies branch/UUID.
+    2. START_GAME:
+       - Called without repository, username, password, or matchUuid.
+       - Supplies apiKeySecret, gameMasterApiUrl, teamWorkspace.
+       - Verifies assigned_branch, repo_descriptor, session cookies, and match_uuid are retained.
+       - Verifies adapter is updated with bearer token without being replaced.
+       - Verifies workspace_root is updated to teamWorkspace.
+    3. start_work + commit + push + submit_work:
+       - Discovers backlog item via refresh_match().
+       - Calls start_work() returning submitTemplate and MVS.
+       - Implements change, populates answers/<id>/submit.json and evidence.
+       - Commits and pushes to origin/main.
+       - Calls submit_work() verifying receipt and journal state ACCEPTED (HTTP 201).
+    4. NDJSON Telemetry Assertions:
+       - Validates entire progress log against schemas/progress-event.schema.json.
+       - Asserts playerSessionId is uniform throughout the log.
+       - Asserts presence and order of all required lifecycle events.
+    """
+    try:
+        from tests.fixtures.telemetry_validator import validate_progress_file
+    except ModuleNotFoundError:
+        from fixtures.telemetry_validator import validate_progress_file
+
+    checkout_dir = offline_git_env["checkout_dir"]
+    match_code = mock_gm_server.match_code
+    repo_url = offline_git_env["remote_url"]
+    offline_git_env["set_remote_url"](repo_url)
+
+    # Subfolder for match under checkout root
+    match_folder = checkout_dir / match_code
+    match_folder.mkdir(parents=True, exist_ok=True)
+    (match_folder / "app.py").write_text("print('game source')\n", encoding="utf-8")
+
+    # Doctor script inside env-require
+    env_req = match_folder / "env-require"
+    env_req.mkdir(parents=True, exist_ok=True)
+    if sys.platform.startswith("win"):
+        (env_req / "doctor.ps1").write_text(
+            'Write-Output "Environment status: READY"\nexit 0\n',
+            encoding="utf-8",
+        )
+    else:
+        doc_sh = env_req / "doctor.sh"
+        doc_sh.write_text(
+            '#!/bin/sh\necho "Environment status: READY"\nexit 0\n',
+            encoding="utf-8",
+        )
+        try:
+            doc_sh.chmod(0o755)
+        except Exception:
+            pass
+
+    # Commit initial repository structure with doctor and match folder
+    run_git(checkout_dir, ["add", "-A"])
+    run_git(checkout_dir, ["commit", "-m", "setup match repository and doctor"])
+    run_git(checkout_dir, ["push", "origin", "main"])
+    prep_head_sha = run_git(checkout_dir, ["rev-parse", "HEAD"]).stdout.strip()
+
+    team_workspace = tmp_path / "team_ws"
+    team_workspace.mkdir(parents=True, exist_ok=True)
+    log_file = team_workspace / "team-sdlc-pack" / "logs" / f"{match_code}.progress.ndjson"
+    log_file.parent.mkdir(parents=True, exist_ok=True)
+    journal_db = team_workspace / ".mtm" / "submissions.db"
+
+    session_id = "session-lifecycle-gen8-test"
+
+    # -------------------------------------------------------------------------
+    # STAGE 1: PREPARE_GAME
+    # -------------------------------------------------------------------------
+    prepare_descriptor = {
+        "type": "PREPARE_GAME",
+        "matchId": match_code,
+        "requestId": "req-prep-001",
+        "playerSessionId": session_id,
+        "progressLogFile": str(log_file),
+        "checkoutRoot": str(checkout_dir),
+        "matchRoot": str(match_folder),
+        "username": "example-account",
+        "password": "fake-password-for-example",
+        "matchPageUrl": f"{mock_gm_server.base_url}/match",  # Base listing page to test R2
+        "allowedMatchOrigins": [mock_gm_server.base_url],
+        "repository": {
+            "url": repo_url,
+            "branch": "main",
+            "folder": match_code,
+        },
+    }
+
+    prep_result = base_server.configure_session(prepare_descriptor)
+    assert prep_result["status"] == "CONFIGURED"
+    assert base_server.assigned_branch == "main"
+    assert base_server.repo_descriptor.get("branch") == "main"
+    assert base_server.match_uuid == mock_gm_server.match_uuid
+    assert base_server.adapter is not None
+    assert len(base_server.adapter.session_cookies) > 0, "PREPARE must establish and save session cookies"
+
+    orig_adapter_instance = base_server.adapter
+    saved_cookies = dict(base_server.adapter.session_cookies)
+
+    # -------------------------------------------------------------------------
+    # STAGE 2: START_GAME (State Continuity)
+    # -------------------------------------------------------------------------
+    start_descriptor = {
+        "type": "START_GAME",
+        "matchId": match_code,
+        "requestId": "req-start-001",
+        "playerSessionId": session_id,
+        "teamUuid": "22222222-2222-4222-8222-222222222222",
+        "gameMasterApiUrl": mock_gm_server.base_url,
+        "apiKeySecret": mock_gm_server.auth_token,
+        "teamWorkspace": str(team_workspace),
+        "teamSdlcPackWorkspace": str(team_workspace / "team-sdlc-pack"),
+        "progressLogFile": str(log_file),
+        "checkoutRoot": str(checkout_dir),
+        "matchRoot": str(match_folder),
+        "matchPageUrl": f"{mock_gm_server.base_url}/match",
+        "allowedApiOrigins": [mock_gm_server.base_url],
+        "journalDbPath": str(journal_db),
+    }
+
+    start_result = base_server.configure_session(start_descriptor)
+    assert start_result["status"] == "CONFIGURED"
+
+    # Invariants verification: PREPARE state must survive into START
+    assert base_server.assigned_branch == "main", "assigned_branch must be retained from PREPARE"
+    assert base_server.repo_descriptor.get("branch") == "main", "repo_descriptor must be retained from PREPARE"
+    assert base_server.match_uuid == mock_gm_server.match_uuid, "match_uuid must be retained from PREPARE"
+    assert base_server.adapter is orig_adapter_instance, "Adapter instance must be reused, not replaced"
+    assert base_server.adapter.api_key == mock_gm_server.auth_token, "Bearer token must be updated on adapter"
+    assert base_server.adapter.session_cookies == saved_cookies, "Session cookies must survive into START"
+    assert base_server.workspace_root == team_workspace.resolve(), "workspace_root must update to teamWorkspace"
+
+    # -------------------------------------------------------------------------
+    # STAGE 3: start_work + commit + push + submit_work
+    # -------------------------------------------------------------------------
+    # Add a backlog task on Mock GM server
+    task_key = "TASK-LIFECYCLE-01"
+    mock_gm_server.backlog_items[task_key] = {
+        "id": task_key,
+        "key": task_key,
+        "name": "Lifecycle Integration Task",
+        "title": "Implement full lifecycle",
+        "status": "OPEN",
+        "wave": 1,
+        "points": 100,
+    }
+
+    # 3a. Refresh match & discover task
+    refresh_res = base_server.refresh_match()
+    assert refresh_res["status"] in ("IN_PROGRESS", "RUNNING")
+    assert task_key in refresh_res["newlyDiscovered"]
+
+    # 3b. Start work on task
+    start_work_res = base_server.start_work(task_key)
+    assert start_work_res["backlogId"] == task_key
+    assert "submitTemplate" in start_work_res
+
+    # Verify template was written to matchRoot/answers/<task_key>/submit.json
+    answer_file = match_folder / "answers" / task_key / "submit.json"
+    assert answer_file.exists(), "Template submit.json must be generated by start_work"
+
+    # 3c. Modify code, prepare evidence, commit and push
+    evidence_dir = match_folder / "answers" / task_key / "evidence"
+    evidence_dir.mkdir(parents=True, exist_ok=True)
+    evidence_file = evidence_dir / "test_run.log"
+    evidence_file.write_text("All unit tests passed successfully.\nExit: 0\n", encoding="utf-8")
+
+    answer_payload = {
+        "solution": "Working Gen8 Lifecycle Solution",
+        "evidence": ["evidence/test_run.log"],
+    }
+    answer_file.write_text(json.dumps(answer_payload, indent=2), encoding="utf-8")
+
+    (match_folder / "app.py").write_text("print('lifecycle completed')\n", encoding="utf-8")
+
+    run_git(checkout_dir, ["add", "-A"])
+    run_git(checkout_dir, ["commit", "-m", f"Solve {task_key} with evidence"])
+    run_git(checkout_dir, ["push", "origin", "main"])
+    sub_head_sha = run_git(checkout_dir, ["rev-parse", "HEAD"]).stdout.strip()
+    assert sub_head_sha != prep_head_sha
+
+    # 3d. Submit work
+    client_sub_id = str(uuid.uuid4())
+    sub_res = base_server.submit_work(
+        client_submission_id=client_sub_id,
+        backlog_item_key=task_key,
+        git_revision=sub_head_sha,
+        answer=answer_payload,
+    )
+    assert "receiptId" in sub_res or ("submission" in sub_res and "id" in sub_res["submission"])
+
+    # 3e. Verify journal DB state
+    with SubmissionJournal(db_path=journal_db) as j:
+        entry = j.get_entry(mock_gm_server.match_uuid, task_key)
+        assert entry is not None
+        assert entry["state"] == "ACCEPTED"
+        assert entry["last_http_code"] == 201
+
+    # -------------------------------------------------------------------------
+    # STAGE 4: NDJSON Telemetry Verification
+    # -------------------------------------------------------------------------
+    events = validate_progress_file(log_file, expected_session_id=session_id)
+    assert len(events) >= 8
+
+    types = [e["type"] for e in events]
+    assert "ORCHESTRATOR_STARTED" in types
+    assert "PREPARATION_STATUS" in types
+    assert "ENVIRONMENT_READY" in types
+    assert "BACKLOG_STATUS" in types
+    assert "GAME_MASTER_API" in types
+
+    # Check ENVIRONMENT_READY event
+    env_ready = next(e for e in events if e.get("type") == "ENVIRONMENT_READY")
+    assert env_ready["build"] == "PASS"
+    assert env_ready["matchLogin"] == "PASS"
+    assert env_ready["revision"] == prep_head_sha
+
+    # Check DISCOVERED, IN_PROGRESS, SUBMITTED backlog transitions
+    backlog_events = [e for e in events if e.get("type") == "BACKLOG_STATUS" and e.get("backlogId") == task_key]
+    statuses = [e["status"] for e in backlog_events]
+    assert "DISCOVERED" in statuses
+    assert "IN_PROGRESS" in statuses
+    assert "SUBMITTED" in statuses
+
+    submitted_event = next(e for e in backlog_events if e["status"] == "SUBMITTED")
+    assert submitted_event["revision"] == sub_head_sha
+    assert submitted_event["receiptId"] is not None
+
+
+# ==============================================================================
+# 8. Generation 8 Unit Tests: Workspace Resolution, Match Targeting & Folder Aliases
+# ==============================================================================
+
+def test_workspace_root_resolves_parent_when_named_team_sdlc_pack(tmp_path):
+    """R3: MCPHelperServer.__init__ resolves workspace_root to parent if cwd or argument ends with 'team-sdlc-pack'."""
+    pack_dir = tmp_path / "team-sdlc-pack"
+    pack_dir.mkdir()
+
+    server = MCPHelperServer(workspace_root=pack_dir)
+    assert server.workspace_root == tmp_path.resolve()
+
+    # When not ending with team-sdlc-pack, it should stay as-is
+    other_dir = tmp_path / "other"
+    other_dir.mkdir()
+    server2 = MCPHelperServer(workspace_root=other_dir)
+    assert server2.workspace_root == other_dir.resolve()
+
+
+def test_configure_session_team_workspace_updates_workspace_root(tmp_path):
+    """R3: configure_session updates workspace_root from descriptor.teamWorkspace."""
+    init_dir = tmp_path / "init"
+    init_dir.mkdir()
+    target_ws = tmp_path / "target_ws"
+    target_ws.mkdir()
+
+    server = MCPHelperServer(workspace_root=init_dir)
+    assert server.workspace_root == init_dir.resolve()
+
+    server.configure_session({
+        "type": "START_GAME",
+        "matchId": "MATCH01",
+        "teamWorkspace": str(target_ws),
+    })
+    assert server.workspace_root == target_ws.resolve()
+
+
+def test_build_match_page_url_targeting():
+    """R2: build_match_page_url targets <origin>/match/<matchId> without duplication."""
+    from runner.mcp_server import build_match_page_url
+
+    # Base listing path
+    res1 = build_match_page_url("https://ai-fest-five.vercel.app/match", "ABCD1234")
+    assert res1 == "https://ai-fest-five.vercel.app/match/ABCD1234"
+
+    res2 = build_match_page_url("https://ai-fest-five.vercel.app/match/", "ABCD1234")
+    assert res2 == "https://ai-fest-five.vercel.app/match/ABCD1234"
+
+    # Already containing matchId
+    res3 = build_match_page_url("https://ai-fest-five.vercel.app/match/ABCD1234", "ABCD1234")
+    assert res3 == "https://ai-fest-five.vercel.app/match/ABCD1234"
+
+    # Base origin without path
+    res4 = build_match_page_url("https://ai-fest-five.vercel.app", "ABCD1234")
+    assert res4 == "https://ai-fest-five.vercel.app/match/ABCD1234"
+
+
+def test_login_session_rejects_mismatched_match_assignment(mock_gm_server, monkeypatch):
+    """R2: login_session validates projection matchCode/matchId and fails closed on mismatch."""
+    from mtm_competition.adapters.official_game_master import (
+        OfficialGameMasterAdapter,
+        GameMasterValidationError,
+    )
+
+    adapter = OfficialGameMasterAdapter(
+        base_url=mock_gm_server.base_url,
+    )
+
+    real_request = adapter._request
+
+    def mock_request(method, url, *args, **kwargs):
+        if method == "GET":
+            return {
+                "matchCode": "DIFFERENT_CODE",
+                "matchUuid": "99999999-9999-4999-8999-999999999999",
+                "status": "IN_PROGRESS",
+                "backlogItems": [],
+            }
+        return real_request(method, url, *args, **kwargs)
+
+    monkeypatch.setattr(adapter, "_request", mock_request)
+
+    with pytest.raises(GameMasterValidationError) as exc_info:
+        adapter.login_session(
+            username="example-account",
+            password="fake-password-for-example",
+            match_page_url=f"{mock_gm_server.base_url}/match",
+            allowed_origins=[mock_gm_server.base_url],
+            match_id="MY_ASSIGNED_MATCH",
+        )
+    assert "Match assignment verification failed" in str(exc_info.value)
+
+
+def test_verify_assigned_repository_folder_alias_dotdot_rejection(offline_git_env):
+    """R4: verify_assigned_repository rejects '..' path components while allowing explicit root '.' and './'."""
+    from mtm_core.git.repository import verify_assigned_repository
+
+    checkout_dir = offline_git_env["checkout_dir"]
+    remote_url = offline_git_env["remote_url"]
+
+    # Reject repo/..
+    with pytest.raises(ValueError) as exc1:
+        verify_assigned_repository(checkout_dir, {"url": remote_url, "branch": "main", "folder": "repo/.."})
+    assert "path component" in str(exc1.value)
+
+    # Reject a/b/../../..
+    with pytest.raises(ValueError) as exc2:
+        verify_assigned_repository(checkout_dir, {"url": remote_url, "branch": "main", "folder": "a/b/../../.."})
+    assert "path component" in str(exc2.value)
+
+    # Allow literal '.' and './'
+    res_dot = verify_assigned_repository(checkout_dir, {"url": remote_url, "branch": "main", "folder": "."})
+    assert res_dot["match_folder"] == checkout_dir
+
+    res_dot_slash = verify_assigned_repository(checkout_dir, {"url": remote_url, "branch": "main", "folder": "./"})
+    assert res_dot_slash["match_folder"] == checkout_dir
+
