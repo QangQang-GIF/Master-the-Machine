@@ -1,0 +1,21 @@
+{
+  "name": "team-sdlc-pack",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "files": [
+    "agents/",
+    "bin/",
+    "config/",
+    "contracts/",
+    "docs/",
+    "install.ps1",
+    "scripts/check-distribution.mjs",
+    "scripts/install.mjs",
+    "skills/",
+    "src/",
+    "README.md",
+    "team-pack-info.json",
+    "team-runtime.json"
+  ]
+}

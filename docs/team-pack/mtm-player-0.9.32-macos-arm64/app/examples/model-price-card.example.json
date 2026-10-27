@@ -1,0 +1,13 @@
+{
+  "schemaVersion": 1,
+  "id": "replace-with-organizer-price-card-version",
+  "currency": "USD",
+  "unitTokens": 1000000,
+  "models": {
+    "example-model": {
+      "input": 0,
+      "cachedInput": 0,
+      "output": 0
+    }
+  }
+}

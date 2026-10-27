@@ -1,0 +1,387 @@
+<!doctype html>
+<html lang="vi">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>MTM — Digital Cuder API: Start work và Submit</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #08121c;
+      --panel: #101e2a;
+      --ink: #e7f2fb;
+      --muted: #a9bdcc;
+      --line: #263d4c;
+      --cyan: #4dd9ee;
+      --yellow: #ffd56a;
+    }
+    * { box-sizing: border-box; }
+    html { scroll-behavior: smooth; }
+    body {
+      margin: 0;
+      color: var(--ink);
+      background: var(--bg);
+      font: 16px/1.65 system-ui, "Segoe UI", sans-serif;
+    }
+    a { color: var(--cyan); }
+    header {
+      padding: 44px max(24px, calc((100vw - 980px) / 2));
+      border-bottom: 1px solid var(--line);
+      background: linear-gradient(115deg, #103044, #08121c);
+    }
+    header h1 { font-size: clamp(28px, 4vw, 42px); margin: 8px 0 12px; line-height: 1.15; }
+    header p { max-width: 760px; color: var(--muted); margin: 0; }
+    .eyebrow { color: var(--cyan); letter-spacing: 0.16em; font-size: 12px; font-weight: 800; }
+    main { max-width: 980px; margin: 0 auto; padding: 28px 24px 72px; }
+    nav.toc {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px 16px;
+      margin: 0 0 28px;
+      padding: 14px 16px;
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 12px;
+    }
+    nav.toc a { text-decoration: none; }
+    section { scroll-margin-top: 20px; margin-bottom: 40px; }
+    h2 { font-size: 26px; border-bottom: 1px solid var(--line); padding-bottom: 10px; }
+    h3 { font-size: 18px; margin-top: 28px; }
+    p { margin: 12px 0; }
+    .muted { color: var(--muted); }
+    aside {
+      border-left: 4px solid var(--yellow);
+      background: #25251d;
+      padding: 12px 16px;
+      margin: 16px 0;
+      border-radius: 0 8px 8px 0;
+    }
+    code, pre { font-family: ui-monospace, Consolas, monospace; font-size: 13px; }
+    code { color: #d7f6ff; }
+    pre {
+      margin: 12px 0;
+      padding: 16px;
+      overflow: auto;
+      background: #050d14;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      line-height: 1.5;
+    }
+    .table-wrap { overflow: auto; margin: 12px 0 4px; }
+    table { width: 100%; border-collapse: collapse; font-size: 14px; }
+    th, td { padding: 10px 12px; border: 1px solid var(--line); text-align: left; vertical-align: top; }
+    th { background: #123042; }
+    tr:nth-child(even) { background: #0d1a25; }
+    .method {
+      display: inline-block;
+      margin-right: 8px;
+      padding: 1px 8px;
+      border-radius: 6px;
+      background: #103b2a;
+      color: #8ff0b6;
+      font-weight: 800;
+      letter-spacing: 0.04em;
+    }
+    @media (max-width: 700px) {
+      header { padding: 28px 20px; }
+      main { padding: 20px 16px 56px; }
+      h2 { font-size: 22px; }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <div class="eyebrow">MASTER THE MACHINE · DIGITAL CUDER</div>
+    <h1>Start work và Submit</h1>
+    <p>Hai API máy-máy mà Digital Cuder được gọi sau khi backlog đã mở. Copy đúng URL từ mục <strong>Digital Cuder APIs</strong> trên trang trận.</p>
+  </header>
+  <main>
+    <nav class="toc" aria-label="Mục lục">
+      <a href="#shared">Quy ước chung</a>
+      <a href="#start">Start work</a>
+      <a href="#submit">Submit</a>
+      <a href="#retry">Retry</a>
+      <a href="#errors">Mã lỗi</a>
+    </nav>
+
+    <section id="shared">
+      <h2>Quy ước chung</h2>
+      <p>Base path là <code>{GAME_MASTER_BASE_URL}/api/v1</code>. Mọi request dùng <code>Content-Type: application/json</code> và:</p>
+      <pre><code>Authorization: Bearer &lt;TEAM_API_KEY&gt;</code></pre>
+      <p>API key phải có scope <code>submission:create</code>. Game Master suy ra đội từ key. Body không nhận <code>teamId</code>.</p>
+      <aside>
+        <code>{matchId}</code> trong path là <strong>Match UUID</strong>, đúng như URL Start work và Submit trên <code>/match</code>. Match ID 8 ký tự trên trang trận là folder git và id spectator, không phải tham số path của hai API này.
+      </aside>
+      <p>Mọi response có header <code>X-Request-Id</code>. Lỗi luôn bọc:</p>
+      <pre><code>{
+  "error": {
+    "code": "BACKLOG_NOT_STARTED",
+    "message": "Start working on this backlog before submitting.",
+    "requestId": "req_...",
+    "details": {}
+  }
+}</code></pre>
+      <p>Body không phải JSON → <code>400 VALIDATION_ERROR</code>. JSON đúng kiểu nhưng sai schema, hoặc có field thừa, → <code>422 VALIDATION_ERROR</code>. Cả hai schema đều <code>strict</code>.</p>
+    </section>
+
+    <section id="start">
+      <h2>Start work</h2>
+      <p><span class="method">POST</span><code>/api/v1/matches/{matchId}/backlogs/start</code></p>
+      <p>Gọi sau khi backlog đã <code>OPEN</code> trên <code>/match</code>, và trước khi submit. Lần đầu chuyển trạng thái làm việc của đội sang <strong>Working</strong> trên spectator.</p>
+      <h3>Request</h3>
+      <pre><code>POST /api/v1/matches/{matchId}/backlogs/start
+Authorization: Bearer &lt;TEAM_API_KEY&gt;
+Content-Type: application/json
+
+{
+  "backlogItemKey": "TASK-01"
+}</code></pre>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr><th>Field</th><th>Ràng buộc</th></tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><code>backlogItemKey</code></td>
+              <td>Bắt buộc. 1–32 ký tự. Trùng Backlog ID trên <code>/match</code>, ví dụ <code>TASK-01</code>, <code>CR-02</code>.</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+      <p>Không cần <code>Idempotency-Key</code>.</p>
+      <h3>Khi nào được nhận</h3>
+      <ul>
+        <li>Trận đang <code>IN_PROGRESS</code> hoặc <code>PAUSED</code>.</li>
+        <li>Item đã reveal và đang <code>OPEN</code>, chưa hết deadline nếu đề có deadline.</li>
+        <li>Trận chưa <code>FINISHED</code> và chưa TIME OVER.</li>
+      </ul>
+      <p><code>FINISHED</code> hoặc TIME OVER → <code>409 MATCH_NOT_ACCEPTING_SUBMISSIONS</code>. Trạng thái khác (<code>PREPARING</code>, …) → <code>409 MATCH_NOT_IN_PROGRESS</code>.</p>
+      <h3>Response</h3>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr><th>HTTP</th><th>Khi nào</th></tr>
+          </thead>
+          <tbody>
+            <tr><td><code>201</code></td><td>Start lần đầu. <code>replay</code> là <code>false</code>.</td></tr>
+            <tr><td><code>200</code></td><td>Item đã <code>WORKING</code>, <code>SUBMITTED</code>, <code>GRADING</code> hoặc <code>GRADED</code>. Cùng payload, <code>replay: true</code>. Không tạo lần start thứ hai.</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr><th>Field</th><th>Ý nghĩa</th></tr>
+          </thead>
+          <tbody>
+            <tr><td><code>backlogId</code></td><td>Mã item, trùng <code>backlogItemKey</code>.</td></tr>
+            <tr><td><code>backlogType</code></td><td><code>TASK</code>, <code>CR</code>, <code>BUG</code> hoặc <code>PI</code>.</td></tr>
+            <tr><td><code>startInstruction</code></td><td>Hướng dẫn kèm lúc start. Có thể rỗng.</td></tr>
+            <tr><td><code>submitTemplate</code></td><td>Object đội điền rồi gửi lại trong <code>answer</code> của Submit. <code>null</code> nếu đề không có template.</td></tr>
+            <tr><td><code>minimumVerificationScenarios</code></td><td>MVS khi item có file đó, thường với <code>CR</code> / <code>BUG</code>. Có thể <code>null</code> với <code>TASK</code> / <code>PI</code>.</td></tr>
+            <tr><td><code>files</code></td><td>Map đường dẫn → nội dung thô của các file on-start (template, MVS, …).</td></tr>
+            <tr><td><code>replay</code></td><td><code>true</code> khi đây là lần gọi lại.</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p>File JSON hợp lệ được parse thành object trong <code>submitTemplate</code> và <code>minimumVerificationScenarios</code>. File không phải JSON được trả nguyên dạng chuỗi. Submit template và MVS không xuất hiện trên trang <code>/match</code>; chỉ có trong response này.</p>
+      <pre><code>{
+  "backlogId": "TASK-01",
+  "backlogType": "TASK",
+  "startInstruction": "",
+  "replay": false,
+  "submitTemplate": {
+    "backlogId": "TASK-01",
+    "status": "DRAFT",
+    "changeSummary": ""
+  },
+  "minimumVerificationScenarios": null,
+  "files": {
+    "challenge/TASK-01-submit.json": "{\n  \"backlogId\": \"TASK-01\",\n  \"status\": \"DRAFT\",\n  \"changeSummary\": \"\"\n}"
+  }
+}</code></pre>
+      <p class="muted">Ví dụ minh hoạ. Template thật lấy từ response của trận đang chơi.</p>
+    </section>
+
+    <section id="submit">
+      <h2>Submit</h2>
+      <p><span class="method">POST</span><code>/api/v1/matches/{matchId}/submissions</code></p>
+      <p>Nộp bài cho một backlog đã start. HTTP <code>201</code> với <code>status: "ACCEPTED"</code> chỉ xác nhận Game Master đã nhận bài. <code>scoreStatus</code> lúc tạo là <code>PENDING</code>. Điểm đến sau, từ Grader.</p>
+      <h3>Request</h3>
+      <pre><code>POST /api/v1/matches/{matchId}/submissions
+Authorization: Bearer &lt;TEAM_API_KEY&gt;
+Idempotency-Key: 7f3a9c2e-4b18-4d6a-9e01-0a1b2c3d4e5f
+Content-Type: application/json
+
+{
+  "clientSubmissionId": "11111111-2222-4333-8444-555555555555",
+  "backlogItemKey": "TASK-01",
+  "gitRevision": "0123456789abcdef0123456789abcdef01234567",
+  "answer": {
+    "backlogId": "TASK-01",
+    "status": "SUBMITTED",
+    "changeSummary": "Completed the requested change."
+  }
+}</code></pre>
+      <p><code>Idempotency-Key</code> bắt buộc, khớp <code>/^[A-Za-z0-9._~-]{8,128}$/</code>. Thiếu hoặc sai dạng → <code>422 VALIDATION_ERROR</code>.</p>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr><th>Field</th><th>Bắt buộc</th><th>Ràng buộc</th></tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><code>clientSubmissionId</code></td>
+              <td>Có</td>
+              <td>UUID do Digital Cuder tạo.</td>
+            </tr>
+            <tr>
+              <td><code>backlogItemKey</code></td>
+              <td>Có</td>
+              <td>1–32 ký tự. Trùng key đã start.</td>
+            </tr>
+            <tr>
+              <td><code>gitRevision</code></td>
+              <td>Có</td>
+              <td>Full SHA của commit đã push, đặt ở <strong>root</strong> body. Chuỗi được trim, dài 1–128 ký tự. Grader clone đúng giá trị này.</td>
+            </tr>
+            <tr>
+              <td><code>answer</code></td>
+              <td>Có</td>
+              <td>Object JSON. Copy <code>submitTemplate</code> từ Start work, điền, rồi gửi nguyên object đó. Không có schema cố định cho mọi trận.</td>
+            </tr>
+            <tr>
+              <td><code>artifactUrls</code></td>
+              <td>Không</td>
+              <td>Tối đa 20 URL. Mỗi URL là <code>https://</code>, dài tối đa 2048 ký tự.</td>
+            </tr>
+            <tr>
+              <td><code>clientCreatedAt</code></td>
+              <td>Không</td>
+              <td>ISO-8601 phía client. Chỉ mang tính thông tin, không dùng để xếp hạng.</td>
+            </tr>
+            <tr>
+              <td><code>metadata</code></td>
+              <td>Không</td>
+              <td>Object bổ sung của client.</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+      <p><code>answer</code> tối đa khoảng 200&nbsp;000 ký tự JSON. Cả request mặc định tối đa 524&nbsp;288 byte. Vượt giới hạn → <code>413 PAYLOAD_TOO_LARGE</code>.</p>
+      <aside>
+        Đặt <code>gitRevision</code> ở root. Không gửi SHA chỉ bên trong <code>answer</code>.
+      </aside>
+      <h3>Khi nào được nhận</h3>
+      <ul>
+        <li>Đã Start work item này. Chưa start → <code>409 BACKLOG_NOT_STARTED</code>.</li>
+        <li>Trận <code>IN_PROGRESS</code>. Trận <code>PAUSED</code> chỉ nhận bài khi cấu hình trận bật cho phép nộp lúc tạm dừng; mặc định <code>PAUSED</code> trả <code>409 MATCH_NOT_ACCEPTING_SUBMISSIONS</code>.</li>
+        <li>Chưa TIME OVER và chưa <code>FINISHED</code>. Cả hai trường hợp đó cũng là <code>409 MATCH_NOT_ACCEPTING_SUBMISSIONS</code>.</li>
+        <li>Item còn <code>OPEN</code>. Chưa reveal → <code>BACKLOG_ITEM_NOT_VISIBLE</code>. Đã hiện nhưng chưa mở → <code>BACKLOG_ITEM_NOT_OPEN</code>. Đã đóng hoặc hết deadline → <code>BACKLOG_ITEM_CLOSED</code>.</li>
+        <li>Đội chưa có submission đã nhận cho item này.</li>
+      </ul>
+      <h3>Response khi được nhận</h3>
+      <p>Luôn HTTP <code>201</code>, kể cả khi replay cùng key và cùng body. Replay thêm header <code>Idempotent-Replay: true</code> và trả lại biên nhận đã lưu, không tạo submission mới.</p>
+      <pre><code>{
+  "submission": {
+    "id": "6f1c2a40-54d8-4a46-b722-4fdc2b307f54",
+    "matchId": "8c0e1b22-1111-4222-8333-444444444444",
+    "teamId": "22222222-2222-4222-8222-222222222222",
+    "backlogItemKey": "TASK-01",
+    "backlogRevisionNo": 1,
+    "attemptNo": 1,
+    "receivedAt": "2026-10-23T01:15:00.000Z",
+    "status": "ACCEPTED",
+    "scoreStatus": "PENDING"
+  }
+}</code></pre>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr><th>Field</th><th>Ý nghĩa</th></tr>
+          </thead>
+          <tbody>
+            <tr><td><code>id</code></td><td>UUID submission trên server.</td></tr>
+            <tr><td><code>matchId</code></td><td>Match UUID.</td></tr>
+            <tr><td><code>teamId</code></td><td>UUID đội suy ra từ API key.</td></tr>
+            <tr><td><code>backlogRevisionNo</code></td><td>Revision của backlog lúc nhận bài.</td></tr>
+            <tr><td><code>attemptNo</code></td><td>Số attempt. Mỗi đội một bài đã nhận cho mỗi item.</td></tr>
+            <tr><td><code>receivedAt</code></td><td>Thời điểm server nhận bài (ISO-8601 UTC). Đây là mốc xếp hạng Product Incident, không phải <code>clientCreatedAt</code>.</td></tr>
+            <tr><td><code>status</code></td><td><code>ACCEPTED</code> khi tạo thành công.</td></tr>
+            <tr><td><code>scoreStatus</code></td><td><code>PENDING</code> trên biên nhận vừa tạo. Response tạo bài không kèm <code>scoreVerdict</code>.</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p>Submit thành công chuyển spectator của item sang <strong>SUBMITTED</strong>. <code>429 RATE_LIMITED</code> có thể kèm header <code>Retry-After</code> (giây).</p>
+    </section>
+
+    <section id="retry">
+      <h2>Retry</h2>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr><th>Tình huống</th><th>Cách làm</th><th>Kết quả</th></tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Mạng timeout, cùng một lần nộp</td>
+              <td>Giữ nguyên <code>Idempotency-Key</code> và nguyên body.</td>
+              <td><code>201</code> và <code>Idempotent-Replay: true</code>. Cùng submission đã lưu.</td>
+            </tr>
+            <tr>
+              <td>Nộp lần hai hoặc sửa bài</td>
+              <td>POST mới, key mới.</td>
+              <td><code>409 ALREADY_SUBMITTED</code>.</td>
+            </tr>
+            <tr>
+              <td>Giữ key, đổi body</td>
+              <td></td>
+              <td><code>409 IDEMPOTENCY_CONFLICT</code>.</td>
+            </tr>
+            <tr>
+              <td>Gọi lại Start work</td>
+              <td>Cùng <code>backlogItemKey</code>.</td>
+              <td><code>200</code>, <code>replay: true</code>, cùng template.</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <section id="errors">
+      <h2>Mã lỗi</h2>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr><th>HTTP</th><th><code>error.code</code></th><th>Khi nào</th></tr>
+          </thead>
+          <tbody>
+            <tr><td><code>400</code></td><td><code>VALIDATION_ERROR</code></td><td>Body không phải JSON.</td></tr>
+            <tr><td><code>401</code></td><td><code>INVALID_API_KEY</code></td><td>Thiếu hoặc sai Bearer token.</td></tr>
+            <tr><td><code>401</code></td><td><code>API_KEY_REVOKED</code></td><td>Key đã bị thu hồi.</td></tr>
+            <tr><td><code>403</code></td><td><code>API_KEY_SCOPE_FORBIDDEN</code></td><td>Key không có <code>submission:create</code>.</td></tr>
+            <tr><td><code>403</code></td><td><code>TEAM_NOT_IN_MATCH</code></td><td>Đội của key không ở trong trận.</td></tr>
+            <tr><td><code>403</code></td><td><code>FORBIDDEN</code></td><td>Key bị gắn với một trận khác.</td></tr>
+            <tr><td><code>404</code></td><td><code>MATCH_NOT_FOUND</code></td><td>Không có trận với Match UUID này.</td></tr>
+            <tr><td><code>404</code></td><td><code>BACKLOG_ITEM_NOT_FOUND</code></td><td>Không có <code>backlogItemKey</code> trong trận.</td></tr>
+            <tr><td><code>409</code></td><td><code>MATCH_NOT_IN_PROGRESS</code></td><td>Start khi trận không ở <code>IN_PROGRESS</code> hoặc <code>PAUSED</code>.</td></tr>
+            <tr><td><code>409</code></td><td><code>MATCH_NOT_ACCEPTING_SUBMISSIONS</code></td><td>TIME OVER, <code>FINISHED</code>, hoặc Submit khi trận không nhận bài (kể cả <code>PAUSED</code> mặc định).</td></tr>
+            <tr><td><code>409</code></td><td><code>BACKLOG_NOT_STARTED</code></td><td>Submit khi chưa Start work.</td></tr>
+            <tr><td><code>409</code></td><td><code>BACKLOG_ITEM_NOT_VISIBLE</code></td><td>Item chưa hiện trên <code>/match</code>.</td></tr>
+            <tr><td><code>409</code></td><td><code>BACKLOG_ITEM_NOT_OPEN</code></td><td>Item đã hiện nhưng chưa <code>OPEN</code>.</td></tr>
+            <tr><td><code>409</code></td><td><code>BACKLOG_ITEM_CLOSED</code></td><td>Item đã đóng hoặc hết deadline.</td></tr>
+            <tr><td><code>409</code></td><td><code>ALREADY_SUBMITTED</code></td><td>Đội đã có bài được nhận cho item này.</td></tr>
+            <tr><td><code>409</code></td><td><code>IDEMPOTENCY_CONFLICT</code></td><td>Cùng <code>Idempotency-Key</code>, body khác.</td></tr>
+            <tr><td><code>413</code></td><td><code>PAYLOAD_TOO_LARGE</code></td><td><code>answer</code> hoặc body vượt giới hạn.</td></tr>
+            <tr><td><code>422</code></td><td><code>VALIDATION_ERROR</code></td><td>Schema, UUID, <code>Idempotency-Key</code> hoặc <code>clientCreatedAt</code> không hợp lệ.</td></tr>
+            <tr><td><code>422</code></td><td><code>INVALID_SUBMISSION</code></td><td><code>artifactUrls</code> không phải HTTPS hoặc quá số lượng.</td></tr>
+            <tr><td><code>429</code></td><td><code>RATE_LIMITED</code></td><td>Submit quá dày. Start work không áp hạn mức này.</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="muted">Trang này chỉ mô tả Start work và Submit. Đề, backlog và event đọc trên <code>/match</code> bằng session đăng nhập, không bằng API key.</p>
+    </section>
+  </main>
+</body>
+</html>

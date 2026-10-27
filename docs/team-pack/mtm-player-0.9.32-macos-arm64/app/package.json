@@ -1,0 +1,35 @@
+{
+  "name": "mtm-player",
+  "version": "0.9.32",
+  "private": true,
+  "type": "module",
+  "description": "Standalone contestant match bootstrap and protocol runtime",
+  "engines": {
+    "node": ">=20"
+  },
+  "bin": {
+    "mtm-player": "scripts/player.mjs"
+  },
+  "files": [
+    "src/",
+    "scripts/",
+    "examples/",
+    "docs/protocol.md",
+    "docs/local-application.md",
+    "docs/installation.md",
+    "docs/host-control-plane.md",
+    "README.md",
+    "assets/"
+  ],
+  "scripts": {
+    "package:app": "node dev/build-player-app.mjs",
+    "package:macos": "node dev/build-player-macos.mjs",
+    "test": "node --test --test-isolation=none tests/*.test.mjs",
+    "demo": "node scripts/player.mjs demo",
+    "package:trial": "node dev/build-trial-release.mjs",
+    "package:team-release": "node dev/build-team-release.mjs",
+    "check:distribution": "node scripts/check-distribution.mjs",
+    "prepack": "node scripts/check-distribution.mjs",
+    "package:teams": "node dev/build-teams-release.mjs"
+  }
+}
