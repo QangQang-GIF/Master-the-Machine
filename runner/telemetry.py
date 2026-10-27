@@ -216,14 +216,26 @@ class TelemetryLogger:
         revision: Optional[str] = None,
         receipt_id: Optional[str] = None,
     ) -> Dict[str, Any]:
+        clean_receipt = None
+        if receipt_id:
+            s_rec = str(receipt_id).strip()
+            if re.match(r"^[A-Za-z0-9][A-Za-z0-9_.:-]*$", s_rec):
+                clean_receipt = s_rec[:128]
+
+        clean_rev = None
+        if revision:
+            s_rev = str(revision).strip().lower()
+            if re.match(r"^[a-f0-9]{40,64}$", s_rev):
+                clean_rev = s_rev
+
         return self.log_event({
             "type": "BACKLOG_STATUS",
             "backlogId": backlog_id,
             "title": title[:160],
             "status": status,
             "summary": clean_summary(summary),
-            "revision": revision,
-            "receiptId": receipt_id,
+            "revision": clean_rev,
+            "receiptId": clean_receipt,
         })
 
     def emit_backlog_tests(
@@ -261,16 +273,33 @@ class TelemetryLogger:
         http_status: Optional[int] = None,
         request_id: Optional[str] = None,
     ) -> Dict[str, Any]:
+        # Validate origin against schema pattern ^https://[^/?#]+$ or null
+        clean_origin = None
+        if origin:
+            s_orig = str(origin).strip().rstrip("/")
+            if s_orig.startswith("https://") and not re.search(r"[/?#]", s_orig[8:]):
+                clean_origin = s_orig[:256]
+
+        # Validate request_id against schema id pattern or null
+        clean_request_id = None
+        if request_id:
+            s_req = str(request_id).strip()
+            if re.match(r"^[A-Za-z0-9][A-Za-z0-9_.:-]*$", s_req):
+                clean_request_id = s_req[:128]
+
+        # Validate http_status
+        clean_status = int(http_status) if (http_status is not None and 100 <= int(http_status) <= 599) else None
+
         return self.log_event({
             "type": "GAME_MASTER_API",
             "operation": operation,
             "backlogId": backlog_id,
             "method": method,
-            "origin": origin,
+            "origin": clean_origin,
             "path": path,
             "phase": phase,
-            "httpStatus": http_status,
-            "requestId": request_id,
+            "httpStatus": clean_status,
+            "requestId": clean_request_id,
             "summary": clean_summary(summary),
         })
 

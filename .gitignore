@@ -48,5 +48,6 @@ bench_results.json
 *.db
 *.db-wal
 *.db-shm
+team-sdlc-pack/
 
 
