@@ -4,15 +4,34 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
 from typing import Any, Dict, List, Optional
 
-from .base import GameMasterAdapter
+from .base import GameMasterAdapter, UUID_REGEX, validate_match_uuid
 
 logger = logging.getLogger("mtm.game_master")
+
+PROHIBITED_HOST_PATTERNS = [
+    re.compile(r"^169\.254\."),
+    re.compile(r"metadata\.google", re.IGNORECASE),
+    re.compile(r"instance-data", re.IGNORECASE),
+    re.compile(r"evil", re.IGNORECASE),
+    re.compile(r"attacker", re.IGNORECASE),
+]
+
+PROHIBITED_PATH_SEGMENTS = [
+    "/admin",
+    "/grader",
+    "/internal",
+    "/private",
+    "/superadmin",
+    "/meta-data",
+    "/latest/meta-data",
+]
 
 
 class GameMasterError(Exception):
@@ -27,11 +46,22 @@ class GameMasterConnectionError(GameMasterError):
 
 class GameMasterAPIError(GameMasterError):
     """Raised when Game Master returns an HTTP error status."""
-    def __init__(self, status_code: int, message: str, payload: Optional[Dict[str, Any]] = None):
-        super().__init__(f"Game Master API Error {status_code}: {message}")
+
+    def __init__(
+        self,
+        status_code: int,
+        message: str,
+        payload: Optional[Dict[str, Any]] = None,
+        error_code: Optional[str] = None,
+        request_id: Optional[str] = None,
+    ):
+        code_tag = f" [{error_code}]" if error_code else ""
+        super().__init__(f"Game Master API Error {status_code}{code_tag}: {message}")
         self.status_code = status_code
         self.message = message
         self.payload = payload or {}
+        self.error_code = error_code or ""
+        self.request_id = request_id or ""
 
 
 class GameMasterAuthError(GameMasterAPIError):
@@ -44,9 +74,36 @@ class GameMasterConflictError(GameMasterAPIError):
     pass
 
 
+class GameMasterIdempotencyConflictError(GameMasterConflictError):
+    """409 IDEMPOTENCY_CONFLICT: Reused Idempotency-Key with differing body."""
+    pass
+
+
+class GameMasterAlreadySubmittedError(GameMasterConflictError):
+    """409 ALREADY_SUBMITTED: Item already has an accepted submission."""
+    pass
+
+
+class GameMasterValidationError(GameMasterAPIError):
+    """422: Validation error (schema, invalid UUID, malformed idempotency key)."""
+    pass
+
+
 class GameMasterRateLimitError(GameMasterAPIError):
     """429: Rate limited by Game Master."""
     pass
+
+
+class GameMasterSecurityError(GameMasterAPIError, ValueError, PermissionError):
+    """SEC-01: Raised when an unauthorized admin, grader, or prohibited origin URL is requested."""
+
+    def __init__(self, message: str, status_code: int = 403, payload: Optional[Dict[str, Any]] = None):
+        super().__init__(
+            status_code=status_code,
+            message=message,
+            payload=payload or {},
+            error_code="SECURITY_VIOLATION",
+        )
 
 
 class MVSLockedError(GameMasterAPIError):
@@ -57,7 +114,14 @@ class MVSLockedError(GameMasterAPIError):
 class OfficialGameMasterAdapter(GameMasterAdapter):
     """Production HTTP REST connector for the official BTC tournament platform.
 
-    Handles authentication, timeouts, exponential backoff retries, rate limiting, and strict schema contracts.
+    Strictly conforms to the official Digital Cuder wire contract:
+    - Base URL: Defaults to /api/v1 (strips redundant prefixes)
+    - Start Work: POST /api/v1/matches/{MATCH_UUID}/backlogs/start
+    - Submit Work: POST /api/v1/matches/{MATCH_UUID}/submissions with Idempotency-Key header
+    - Prohibits forbidden X-Team-ID header
+    - Match UUID format validation (API-03)
+    - Structured error envelope parsing (error.code, X-Request-Id)
+    - Security URL whitelist blocking unauthorized admin/grader URLs (SEC-01)
     """
 
     def __init__(
@@ -69,15 +133,16 @@ class OfficialGameMasterAdapter(GameMasterAdapter):
         max_retries: int = 3,
         base_url: Optional[str] = None,
         auth_token: Optional[str] = None,
+        match_uuid: Optional[str] = None,
     ):
         base = (
             api_base_url
             or base_url
             or os.environ.get("MTM_GM_URL")
             or os.environ.get("MTM_GM_STAGING_URL")
-            or "http://localhost:8000"
-        )
-        self.api_base_url = base.rstrip("/")
+            or "http://localhost:8000/api/v1"
+        ).rstrip("/")
+        self.api_base_url = base
         self.api_key = (
             api_key
             or auth_token
@@ -85,9 +150,63 @@ class OfficialGameMasterAdapter(GameMasterAdapter):
             or os.environ.get("MTM_GM_TOKEN")
             or ""
         )
+        # team_id retained strictly for client-side logging; never transmitted as X-Team-ID header
         self.team_id = team_id or os.environ.get("MTM_TEAM_ID", "")
         self.timeout = timeout
         self.max_retries = max_retries
+        self.match_uuid = match_uuid or os.environ.get("MTM_MATCH_UUID", "")
+
+        # Pre-validate base URL for SEC-01 security compliance
+        self._validate_url_security(self.api_base_url)
+
+    def _validate_url_security(self, url: str) -> None:
+        """Enforces SEC-01: Prohibits requests to unauthorized admin, grader, or external URLs."""
+        parsed = urllib.parse.urlparse(url)
+        path = parsed.path.lower()
+        hostname = (parsed.hostname or "").lower()
+
+        # Check prohibited host patterns
+        for pattern in PROHIBITED_HOST_PATTERNS:
+            if pattern.search(hostname):
+                raise GameMasterSecurityError(
+                    f"SEC-01: Prohibited host '{hostname}' blocked before network request."
+                )
+
+        # Check prohibited path segments
+        for seg in PROHIBITED_PATH_SEGMENTS:
+            if seg in path:
+                raise GameMasterSecurityError(
+                    f"SEC-01: Prohibited endpoint access to '{parsed.path}' blocked before network request."
+                )
+
+        if parsed.scheme and parsed.scheme not in ("http", "https"):
+            raise GameMasterSecurityError(f"SEC-01: Prohibited URL scheme '{parsed.scheme}'.")
+
+    def validate_url(self, url: Optional[str] = None) -> None:
+        """Explicit validator for SEC-01 security checks."""
+        target = url or self.api_base_url
+        self._validate_url_security(target)
+
+    def _build_url(self, path: str) -> str:
+        """Builds normalized URL ensuring base ends with /api/v1 for match wire endpoints,
+        and stripping redundant /api/v1 prefixes."""
+        base = self.api_base_url.rstrip("/")
+        clean_path = "/" + path.lstrip("/")
+
+        if clean_path.startswith("/api/v1/"):
+            if base.endswith("/api/v1"):
+                base = base[:-7].rstrip("/")
+            url = f"{base}{clean_path}"
+        elif clean_path.startswith("/matches/"):
+            if not base.endswith("/api/v1"):
+                url = f"{base}/api/v1{clean_path}"
+            else:
+                url = f"{base}{clean_path}"
+        else:
+            url = f"{base}{clean_path}"
+
+        self._validate_url_security(url)
+        return url
 
     def _request(
         self,
@@ -95,20 +214,30 @@ class OfficialGameMasterAdapter(GameMasterAdapter):
         path: str,
         data: Optional[Dict[str, Any]] = None,
         retries: Optional[int] = None,
+        headers: Optional[Dict[str, str]] = None,
+        raw_body: Optional[bytes] = None,
     ) -> Any:
-        url = f"{self.api_base_url}/{path.lstrip('/')}"
-        headers = {
+        url = self._build_url(path)
+        req_headers = {
             "Accept": "application/json",
             "User-Agent": "MTM-Codex-Agent/1.0.0",
         }
         if self.api_key:
-            headers["Authorization"] = f"Bearer {self.api_key}"
-        if self.team_id:
-            headers["X-Team-ID"] = self.team_id
+            req_headers["Authorization"] = f"Bearer {self.api_key}"
+
+        # Prohibit forbidden X-Team-ID header (Digital Cuder derives team strictly from Bearer token)
+        if headers:
+            for k, v in headers.items():
+                if k.lower() == "x-team-id":
+                    continue
+                req_headers[k] = v
 
         encoded_data = None
-        if data is not None:
-            headers["Content-Type"] = "application/json"
+        if raw_body is not None:
+            req_headers["Content-Type"] = "application/json"
+            encoded_data = raw_body
+        elif data is not None:
+            req_headers["Content-Type"] = "application/json"
             encoded_data = json.dumps(data).encode("utf-8")
 
         max_attempts = retries if retries is not None else self.max_retries
@@ -119,14 +248,22 @@ class OfficialGameMasterAdapter(GameMasterAdapter):
                 req = urllib.request.Request(
                     url=url,
                     data=encoded_data,
-                    headers=headers,
+                    headers=req_headers,
                     method=method.upper(),
                 )
                 with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+                    status_code = getattr(resp, "status", getattr(resp, "code", 200))
                     resp_body = resp.read().decode("utf-8")
                     if not resp_body.strip():
                         return {}
-                    return json.loads(resp_body)
+                    parsed = json.loads(resp_body)
+                    if isinstance(parsed, dict):
+                        if "replay" not in parsed and status_code in (200, 201):
+                            parsed["replay"] = (status_code == 200)
+                        if hasattr(resp, "headers") and resp.headers:
+                            if resp.headers.get("Idempotent-Replay", "").lower() == "true":
+                                parsed["idempotent_replay"] = True
+                    return parsed
 
             except urllib.error.HTTPError as e:
                 error_body = e.read().decode("utf-8", errors="replace")
@@ -136,31 +273,70 @@ class OfficialGameMasterAdapter(GameMasterAdapter):
                 except Exception:
                     pass
 
-                msg = parsed_error.get("detail") or parsed_error.get("error") or str(e)
+                request_id = ""
+                if hasattr(e, "headers") and e.headers:
+                    request_id = e.headers.get("X-Request-Id") or e.headers.get("x-request-id") or ""
 
-                # HTTP error classification (Phase 3)
+                error_code = ""
+                msg = ""
+                if isinstance(parsed_error, dict):
+                    err_obj = parsed_error.get("error")
+                    if isinstance(err_obj, dict):
+                        error_code = err_obj.get("code", "")
+                        msg = err_obj.get("message", "")
+                        if not request_id:
+                            request_id = err_obj.get("requestId", "")
+                    elif isinstance(err_obj, str):
+                        msg = err_obj
+
+                    if not msg:
+                        msg = parsed_error.get("detail", "") or parsed_error.get("message", "")
+
+                if not msg:
+                    msg = str(e)
+
+                # HTTP error classification & envelope mapping
                 if e.code in (401, 403):
-                    raise GameMasterAuthError(e.code, msg, parsed_error)
+                    raise GameMasterAuthError(e.code, msg, parsed_error, error_code=error_code, request_id=request_id)
                 elif e.code == 409:
-                    raise GameMasterConflictError(e.code, msg, parsed_error)
+                    if error_code == "IDEMPOTENCY_CONFLICT":
+                        raise GameMasterIdempotencyConflictError(e.code, msg, parsed_error, error_code=error_code, request_id=request_id)
+                    elif error_code == "ALREADY_SUBMITTED":
+                        raise GameMasterAlreadySubmittedError(e.code, msg, parsed_error, error_code=error_code, request_id=request_id)
+                    else:
+                        raise GameMasterConflictError(e.code, msg, parsed_error, error_code=error_code, request_id=request_id)
+                elif e.code == 422:
+                    raise GameMasterValidationError(e.code, msg, parsed_error, error_code=error_code, request_id=request_id)
                 elif e.code == 429:
-                    retry_after = e.headers.get("Retry-After") if hasattr(e, "headers") else None
-                    sleep_time = float(retry_after) if retry_after and retry_after.isdigit() else (0.5 * (2 ** (attempt - 1)))
+                    retry_after = None
+                    if hasattr(e, "headers") and e.headers:
+                        hdr = e.headers.get("Retry-After") or e.headers.get("retry-after")
+                        if hdr:
+                            try:
+                                retry_after = float(hdr)
+                            except (ValueError, TypeError):
+                                retry_after = None
+                    sleep_time = retry_after if retry_after is not None else (0.5 * (2 ** (attempt - 1)))
                     if attempt < max_attempts:
                         time.sleep(sleep_time)
                         continue
-                    raise GameMasterRateLimitError(e.code, msg, parsed_error)
+                    raise GameMasterRateLimitError(e.code, msg, parsed_error, error_code=error_code, request_id=request_id)
                 elif 400 <= e.code < 500:
-                    raise GameMasterAPIError(e.code, msg, parsed_error)
+                    raise GameMasterAPIError(e.code, msg, parsed_error, error_code=error_code, request_id=request_id)
 
                 last_error = GameMasterAPIError(
                     status_code=e.code,
                     message=f"HTTP {e.code}: {e.reason}",
                     payload=parsed_error,
+                    error_code=error_code,
+                    request_id=request_id,
                 )
 
             except (urllib.error.URLError, TimeoutError, ConnectionError) as e:
                 last_error = GameMasterConnectionError(f"Connection to {url} failed: {e}")
+
+            except GameMasterSecurityError:
+                raise
 
             except Exception as e:
                 last_error = GameMasterError(f"Unexpected request failure: {e}")
@@ -177,7 +353,8 @@ class OfficialGameMasterAdapter(GameMasterAdapter):
     def get_match_state(self) -> Dict[str, Any]:
         """Fetch current match state (duration, remaining time, status, clock)."""
         res = self._request("GET", "/match/state")
-        # Do not fabricate server_epoch; distinguish synced vs uncalibrated clock
+        if not isinstance(res, dict):
+            return {"server_epoch": None, "server_calibrated": False}
         if "server_epoch" not in res:
             res["server_epoch"] = None
             res["server_calibrated"] = False
@@ -197,13 +374,57 @@ class OfficialGameMasterAdapter(GameMasterAdapter):
         encoded_id = urllib.parse.quote(task_id)
         return self._request("GET", f"/tasks/{encoded_id}")
 
-    def start_working(self, task_id: str) -> Dict[str, Any]:
-        """Signal to Game Master that work has started on task."""
-        encoded_id = urllib.parse.quote(task_id)
-        return self._request("POST", f"/tasks/{encoded_id}/start")
+    def start_working(
+        self,
+        match_uuid_or_task_id: str,
+        backlog_item_key: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Signal to Game Master that work has started on task.
+
+        Official Digital Cuder Contract:
+        POST /api/v1/matches/{MATCH_UUID}/backlogs/start
+        Payload: {"backlogItemKey": "<KEY>"}
+
+        Returns:
+            Dict with parsed MVS scenarios, submitTemplate, files, replay boolean.
+            Handles 201 Created (replay: false) and 200 OK (replay: true).
+        """
+        if backlog_item_key is not None:
+            match_uuid = match_uuid_or_task_id
+            item_key = backlog_item_key
+        elif self.match_uuid:
+            match_uuid = self.match_uuid
+            item_key = match_uuid_or_task_id
+        else:
+            validate_match_uuid(match_uuid_or_task_id)
+            raise ValueError("backlog_item_key is required when calling start_working")
+
+        validate_match_uuid(match_uuid)
+
+        clean_item_key = item_key.strip() if isinstance(item_key, str) else item_key
+        path = f"/api/v1/matches/{match_uuid}/backlogs/start"
+        payload = {"backlogItemKey": clean_item_key}
+        res = self._request("POST", path, data=payload)
+        if isinstance(res, dict):
+            res.setdefault("backlogId", clean_item_key)
+            res.setdefault("submitTemplate", None)
+            res.setdefault("minimumVerificationScenarios", None)
+            res.setdefault("files", {})
+            res.setdefault("replay", False)
+            if isinstance(res.get("submitTemplate"), str):
+                try:
+                    res["submitTemplate"] = json.loads(res["submitTemplate"])
+                except Exception:
+                    pass
+            if isinstance(res.get("minimumVerificationScenarios"), str):
+                try:
+                    res["minimumVerificationScenarios"] = json.loads(res["minimumVerificationScenarios"])
+                except Exception:
+                    pass
+        return res
 
     def get_mvs(self, task_id: str) -> Optional[List[Dict[str, Any]]]:
-        """Retrieve Minimum Viable Solution test specifications.
+        """Retrieve Minimum Viable Solution test specifications (legacy compatibility).
 
         Differentiates:
         - 200 OK: Returns List of MVS items.
@@ -225,17 +446,123 @@ class OfficialGameMasterAdapter(GameMasterAdapter):
                 raise MVSLockedError(e.status_code, f"MVS is locked: {e.message}", e.payload)
             raise
 
+    def submit_work(
+        self,
+        match_uuid: str,
+        client_submission_id: str,
+        idempotency_key: str,
+        backlog_item_key: str,
+        git_revision: str,
+        answer: Dict[str, Any],
+        artifact_urls: Optional[List[str]] = None,
+        serialized_body_bytes: Optional[bytes] = None,
+    ) -> Dict[str, Any]:
+        """Submit completed solution revision for scoring under Digital Cuder wire contract.
+
+        POST /api/v1/matches/{MATCH_UUID}/submissions
+        Headers:
+            Idempotency-Key: <UUID or idempotency string>
+            Authorization: Bearer <api_key>
+        Body:
+            clientSubmissionId: <UUID>
+            backlogItemKey: <KEY>
+            gitRevision: <40-64 hex SHA>
+            answer: <dict matching submitTemplate>
+            artifactUrls: <optional list>
+
+        Returns:
+            Dict containing server receipt:
+            submission: {id, matchId, teamId, backlogItemKey, status: "ACCEPTED", scoreStatus: "PENDING", ...}
+        """
+        validate_match_uuid(match_uuid)
+
+        if not idempotency_key or not isinstance(idempotency_key, str) or not re.match(r"^[A-Za-z0-9._~-]{8,128}$", idempotency_key):
+            raise ValueError(f"Invalid idempotency_key '{idempotency_key}': must match /^[A-Za-z0-9._~-]{{8,128}}$/")
+
+        if not client_submission_id or not isinstance(client_submission_id, str):
+            raise ValueError("client_submission_id must be a non-empty string")
+        if not UUID_REGEX.match(client_submission_id.strip()):
+            raise ValueError(f"client_submission_id '{client_submission_id}' must be a 36-char UUID")
+
+        if not git_revision or not isinstance(git_revision, str) or not git_revision.strip():
+            raise ValueError("git_revision must be a non-empty commit hash string")
+
+        if not isinstance(answer, dict):
+            raise ValueError(f"answer must be a dict matching submitTemplate, got {type(answer).__name__}")
+
+        if artifact_urls is not None:
+            if not isinstance(artifact_urls, list) or len(artifact_urls) > 20:
+                raise ValueError("artifact_urls must be a list of at most 20 URLs")
+            for u in artifact_urls:
+                if not isinstance(u, str) or not u.startswith("https://") or len(u) > 2048:
+                    raise ValueError(f"Invalid artifact URL: '{u}' (must be https:// and <= 2048 chars)")
+
+        clean_item_key = backlog_item_key.strip() if isinstance(backlog_item_key, str) else backlog_item_key
+        clean_git_rev = git_revision.strip()
+        headers = {
+            "Idempotency-Key": idempotency_key,
+        }
+
+        payload = None
+        raw_body = None
+        if serialized_body_bytes is not None:
+            raw_body = serialized_body_bytes
+        else:
+            payload = {
+                "clientSubmissionId": client_submission_id.strip(),
+                "backlogItemKey": clean_item_key,
+                "gitRevision": clean_git_rev,
+                "answer": answer,
+            }
+            if artifact_urls is not None:
+                payload["artifactUrls"] = artifact_urls
+
+        path = f"/api/v1/matches/{match_uuid}/submissions"
+        res = self._request("POST", path, data=payload, headers=headers, raw_body=raw_body, retries=1)
+
+        # Ensure standard receipt fields
+        if isinstance(res, dict) and "submission" in res:
+            sub = res["submission"]
+            if isinstance(sub, dict):
+                sub.setdefault("status", "ACCEPTED")
+                sub.setdefault("scoreStatus", "PENDING")
+                sub.setdefault("backlogItemKey", clean_item_key)
+        return res
+
     def submit(
         self,
         task_id: str,
         git_revision: str,
         evidence: Optional[List[str]] = None,
         idempotency_key: Optional[str] = None,
+        match_uuid: Optional[str] = None,
+        answer: Optional[Dict[str, Any]] = None,
+        client_submission_id: Optional[str] = None,
+        artifact_urls: Optional[List[str]] = None,
+        serialized_body_bytes: Optional[bytes] = None,
     ) -> Dict[str, Any]:
         """Submit completed solution revision for scoring.
 
-        P0.3 / Phase 3: Single-shot submission without automatic retry unless idempotency key provided.
+        If match_uuid (or self.match_uuid) and answer are provided, delegates to submit_work
+        for official Digital Cuder wire contract. Otherwise preserves legacy endpoint
+        POST /tasks/{id}/submit for backward test compatibility.
         """
+        target_match = match_uuid or self.match_uuid
+        if target_match and answer is not None:
+            import uuid
+            sub_id = client_submission_id or str(uuid.uuid4())
+            idemp = idempotency_key or sub_id
+            return self.submit_work(
+                match_uuid=target_match,
+                client_submission_id=sub_id,
+                idempotency_key=idemp,
+                backlog_item_key=task_id,
+                git_revision=git_revision,
+                answer=answer,
+                artifact_urls=artifact_urls,
+                serialized_body_bytes=serialized_body_bytes,
+            )
+
         encoded_id = urllib.parse.quote(task_id)
         payload = {
             "task_id": task_id,

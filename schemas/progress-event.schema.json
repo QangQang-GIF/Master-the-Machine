@@ -1,0 +1,774 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://mtm.local/contracts/progress-event.schema.json",
+  "title": "MTM team-reported progress event",
+  "oneOf": [
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schemaVersion",
+        "playerSessionId",
+        "type",
+        "summary"
+      ],
+      "properties": {
+        "schemaVersion": {
+          "const": 1
+        },
+        "playerSessionId": {
+          "$ref": "#/$defs/id"
+        },
+        "type": {
+          "const": "ORCHESTRATOR_STARTED"
+        },
+        "summary": {
+          "$ref": "#/$defs/summary"
+        }
+      }
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schemaVersion",
+        "playerSessionId",
+        "type",
+        "attempt",
+        "phase",
+        "reason",
+        "summary"
+      ],
+      "properties": {
+        "schemaVersion": {
+          "const": 1
+        },
+        "playerSessionId": {
+          "$ref": "#/$defs/id"
+        },
+        "type": {
+          "const": "ORCHESTRATOR_RESTARTED"
+        },
+        "attempt": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 10000
+        },
+        "phase": {
+          "enum": [
+            "PREPARATION",
+            "GAME"
+          ]
+        },
+        "reason": {
+          "$ref": "#/$defs/id"
+        },
+        "summary": {
+          "$ref": "#/$defs/summary"
+        }
+      }
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schemaVersion",
+        "playerSessionId",
+        "type",
+        "stage",
+        "status",
+        "summary"
+      ],
+      "properties": {
+        "schemaVersion": {
+          "const": 1
+        },
+        "playerSessionId": {
+          "$ref": "#/$defs/id"
+        },
+        "type": {
+          "const": "PREPARATION_STATUS"
+        },
+        "stage": {
+          "enum": [
+            "GIT_AUTH",
+            "REPOSITORY",
+            "ENVIRONMENT",
+            "BUILD",
+            "MATCH_LOGIN",
+            "PREPARE_COMPLETE"
+          ]
+        },
+        "status": {
+          "enum": [
+            "IN_PROGRESS",
+            "COMPLETED",
+            "BLOCKED",
+            "FAILED"
+          ]
+        },
+        "summary": {
+          "$ref": "#/$defs/summary"
+        }
+      }
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schemaVersion",
+        "playerSessionId",
+        "type",
+        "requestId",
+        "repository",
+        "revision",
+        "build",
+        "matchLogin"
+      ],
+      "properties": {
+        "schemaVersion": {
+          "const": 1
+        },
+        "playerSessionId": {
+          "$ref": "#/$defs/id"
+        },
+        "type": {
+          "const": "ENVIRONMENT_READY"
+        },
+        "requestId": {
+          "$ref": "#/$defs/id"
+        },
+        "repository": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "url",
+            "branch",
+            "folder"
+          ],
+          "properties": {
+            "url": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 4096,
+              "pattern": "^https://[^@]+$"
+            },
+            "branch": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 255
+            },
+            "folder": {
+              "type": "string",
+              "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+            }
+          }
+        },
+        "revision": {
+          "type": "string",
+          "pattern": "^[a-f0-9]{40,64}$"
+        },
+        "build": {
+          "const": "PASS"
+        },
+        "matchLogin": {
+          "const": "PASS"
+        }
+      }
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schemaVersion",
+        "playerSessionId",
+        "type",
+        "stage",
+        "status",
+        "summary"
+      ],
+      "properties": {
+        "schemaVersion": {
+          "const": 1
+        },
+        "playerSessionId": {
+          "$ref": "#/$defs/id"
+        },
+        "type": {
+          "const": "GAME_START_STATUS"
+        },
+        "stage": {
+          "enum": [
+            "BACKLOG_SYNC"
+          ]
+        },
+        "status": {
+          "enum": [
+            "IN_PROGRESS",
+            "COMPLETED",
+            "BLOCKED",
+            "FAILED"
+          ]
+        },
+        "summary": {
+          "$ref": "#/$defs/summary"
+        }
+      }
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schemaVersion",
+        "playerSessionId",
+        "type",
+        "backlogId",
+        "title",
+        "status",
+        "summary",
+        "revision",
+        "receiptId"
+      ],
+      "properties": {
+        "schemaVersion": {
+          "const": 1
+        },
+        "playerSessionId": {
+          "$ref": "#/$defs/id"
+        },
+        "type": {
+          "const": "BACKLOG_STATUS"
+        },
+        "backlogId": {
+          "$ref": "#/$defs/id"
+        },
+        "title": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 160
+        },
+        "status": {
+          "enum": [
+            "DISCOVERED",
+            "IN_PROGRESS",
+            "COMPLETED",
+            "SUBMITTED",
+            "BLOCKED",
+            "FAILED"
+          ]
+        },
+        "summary": {
+          "$ref": "#/$defs/summary"
+        },
+        "revision": {
+          "oneOf": [
+            {
+              "type": "null"
+            },
+            {
+              "type": "string",
+              "pattern": "^[a-f0-9]{40,64}$"
+            }
+          ]
+        },
+        "receiptId": {
+          "oneOf": [
+            {
+              "type": "null"
+            },
+            {
+              "$ref": "#/$defs/id"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schemaVersion",
+        "playerSessionId",
+        "type",
+        "backlogId",
+        "status",
+        "required",
+        "executed",
+        "passed",
+        "failed",
+        "skipped",
+        "summary"
+      ],
+      "properties": {
+        "schemaVersion": {
+          "const": 1
+        },
+        "playerSessionId": {
+          "$ref": "#/$defs/id"
+        },
+        "type": {
+          "const": "BACKLOG_TESTS"
+        },
+        "backlogId": {
+          "$ref": "#/$defs/id"
+        },
+        "status": {
+          "enum": [
+            "NOT_RUN",
+            "RUNNING",
+            "PASSED",
+            "FAILED"
+          ]
+        },
+        "required": {
+          "$ref": "#/$defs/count"
+        },
+        "executed": {
+          "$ref": "#/$defs/count"
+        },
+        "passed": {
+          "$ref": "#/$defs/count"
+        },
+        "failed": {
+          "$ref": "#/$defs/count"
+        },
+        "skipped": {
+          "$ref": "#/$defs/count"
+        },
+        "summary": {
+          "$ref": "#/$defs/summary"
+        }
+      }
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schemaVersion",
+        "playerSessionId",
+        "type",
+        "operation",
+        "backlogId",
+        "method",
+        "origin",
+        "path",
+        "phase",
+        "httpStatus",
+        "requestId",
+        "summary"
+      ],
+      "properties": {
+        "schemaVersion": {
+          "const": 1
+        },
+        "playerSessionId": {
+          "$ref": "#/$defs/id"
+        },
+        "type": {
+          "const": "GAME_MASTER_API"
+        },
+        "operation": {
+          "$ref": "#/$defs/id"
+        },
+        "backlogId": {
+          "oneOf": [
+            {
+              "type": "null"
+            },
+            {
+              "$ref": "#/$defs/id"
+            }
+          ]
+        },
+        "method": {
+          "oneOf": [
+            {
+              "type": "null"
+            },
+            {
+              "$ref": "#/$defs/method"
+            }
+          ]
+        },
+        "origin": {
+          "oneOf": [
+            {
+              "type": "null"
+            },
+            {
+              "$ref": "#/$defs/origin"
+            }
+          ]
+        },
+        "path": {
+          "oneOf": [
+            {
+              "type": "null"
+            },
+            {
+              "$ref": "#/$defs/path"
+            }
+          ]
+        },
+        "phase": {
+          "enum": [
+            "REQUESTED",
+            "SUCCEEDED",
+            "FAILED"
+          ]
+        },
+        "httpStatus": {
+          "oneOf": [
+            {
+              "type": "null"
+            },
+            {
+              "type": "integer",
+              "minimum": 100,
+              "maximum": 599
+            }
+          ]
+        },
+        "requestId": {
+          "oneOf": [
+            {
+              "type": "null"
+            },
+            {
+              "$ref": "#/$defs/id"
+            }
+          ]
+        },
+        "summary": {
+          "$ref": "#/$defs/summary"
+        }
+      }
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schemaVersion",
+        "playerSessionId",
+        "type",
+        "model",
+        "inputTokens",
+        "cachedInputTokens",
+        "outputTokens",
+        "reasoningTokens",
+        "summary"
+      ],
+      "properties": {
+        "schemaVersion": {
+          "const": 1
+        },
+        "playerSessionId": {
+          "$ref": "#/$defs/id"
+        },
+        "type": {
+          "const": "MODEL_USAGE"
+        },
+        "model": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "inputTokens": {
+          "$ref": "#/$defs/usageCount"
+        },
+        "cachedInputTokens": {
+          "$ref": "#/$defs/usageCount"
+        },
+        "outputTokens": {
+          "$ref": "#/$defs/usageCount"
+        },
+        "reasoningTokens": {
+          "$ref": "#/$defs/usageCount"
+        },
+        "summary": {
+          "$ref": "#/$defs/summary"
+        }
+      }
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schemaVersion",
+        "playerSessionId",
+        "type",
+        "toolName",
+        "operation",
+        "backlogId",
+        "phase",
+        "summary"
+      ],
+      "properties": {
+        "schemaVersion": {
+          "const": 1
+        },
+        "playerSessionId": {
+          "$ref": "#/$defs/id"
+        },
+        "type": {
+          "const": "TOOL_ACTIVITY"
+        },
+        "toolName": {
+          "$ref": "#/$defs/id"
+        },
+        "operation": {
+          "$ref": "#/$defs/id"
+        },
+        "backlogId": {
+          "oneOf": [
+            {
+              "type": "null"
+            },
+            {
+              "$ref": "#/$defs/id"
+            }
+          ]
+        },
+        "phase": {
+          "enum": [
+            "REQUESTED",
+            "SUCCEEDED",
+            "FAILED"
+          ]
+        },
+        "summary": {
+          "$ref": "#/$defs/summary"
+        }
+      }
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schemaVersion",
+        "playerSessionId",
+        "type",
+        "operation",
+        "backlogId",
+        "method",
+        "origin",
+        "path",
+        "phase",
+        "httpStatus",
+        "requestId",
+        "summary"
+      ],
+      "properties": {
+        "schemaVersion": {
+          "const": 1
+        },
+        "playerSessionId": {
+          "$ref": "#/$defs/id"
+        },
+        "type": {
+          "const": "NETWORK_ACTIVITY"
+        },
+        "operation": {
+          "$ref": "#/$defs/id"
+        },
+        "backlogId": {
+          "oneOf": [
+            {
+              "type": "null"
+            },
+            {
+              "$ref": "#/$defs/id"
+            }
+          ]
+        },
+        "method": {
+          "$ref": "#/$defs/method"
+        },
+        "origin": {
+          "$ref": "#/$defs/origin"
+        },
+        "path": {
+          "$ref": "#/$defs/path"
+        },
+        "phase": {
+          "enum": [
+            "REQUESTED",
+            "SUCCEEDED",
+            "FAILED"
+          ]
+        },
+        "httpStatus": {
+          "oneOf": [
+            {
+              "type": "null"
+            },
+            {
+              "type": "integer",
+              "minimum": 100,
+              "maximum": 599
+            }
+          ]
+        },
+        "requestId": {
+          "oneOf": [
+            {
+              "type": "null"
+            },
+            {
+              "$ref": "#/$defs/id"
+            }
+          ]
+        },
+        "summary": {
+          "$ref": "#/$defs/summary"
+        }
+      }
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schemaVersion",
+        "playerSessionId",
+        "type",
+        "blockerId",
+        "backlogId",
+        "summary"
+      ],
+      "properties": {
+        "schemaVersion": {
+          "const": 1
+        },
+        "playerSessionId": {
+          "$ref": "#/$defs/id"
+        },
+        "type": {
+          "const": "BLOCKER_OPENED"
+        },
+        "blockerId": {
+          "$ref": "#/$defs/id"
+        },
+        "backlogId": {
+          "oneOf": [
+            {
+              "type": "null"
+            },
+            {
+              "$ref": "#/$defs/id"
+            }
+          ]
+        },
+        "summary": {
+          "$ref": "#/$defs/summary"
+        }
+      }
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schemaVersion",
+        "playerSessionId",
+        "type",
+        "blockerId",
+        "summary"
+      ],
+      "properties": {
+        "schemaVersion": {
+          "const": 1
+        },
+        "playerSessionId": {
+          "$ref": "#/$defs/id"
+        },
+        "type": {
+          "const": "BLOCKER_RESOLVED"
+        },
+        "blockerId": {
+          "$ref": "#/$defs/id"
+        },
+        "summary": {
+          "$ref": "#/$defs/summary"
+        }
+      }
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schemaVersion",
+        "playerSessionId",
+        "type",
+        "status",
+        "summary"
+      ],
+      "properties": {
+        "schemaVersion": {
+          "const": 1
+        },
+        "playerSessionId": {
+          "$ref": "#/$defs/id"
+        },
+        "type": {
+          "const": "ORCHESTRATOR_ENDED"
+        },
+        "status": {
+          "enum": [
+            "COMPLETED",
+            "BLOCKED",
+            "FAILED"
+          ]
+        },
+        "summary": {
+          "$ref": "#/$defs/summary"
+        }
+      }
+    }
+  ],
+  "$defs": {
+    "id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]*$"
+    },
+    "count": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 100000
+    },
+    "usageCount": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 1000000000000
+    },
+    "method": {
+      "enum": [
+        "GET",
+        "POST",
+        "PUT",
+        "PATCH",
+        "DELETE",
+        "HEAD",
+        "OPTIONS"
+      ]
+    },
+    "origin": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 256,
+      "pattern": "^https://[^/?#]+$"
+    },
+    "path": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 512,
+      "pattern": "^/[^?#\\\\]*$"
+    },
+    "summary": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 240,
+      "pattern": "^[^\\r\\n\\u0000]+$"
+    }
+  }
+}

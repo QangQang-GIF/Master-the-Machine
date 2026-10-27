@@ -20,6 +20,7 @@ from mtm_core.runtime.process import (
     is_pid_alive,
 )
 from mtm_competition.tasks.state_machine import TaskStateMachine
+from mtm_competition.tasks.journal import SubmissionJournal
 
 
 def _terminate_pid_tree(pid: int) -> None:
@@ -68,10 +69,13 @@ class TaskStore:
             except sqlite3.DatabaseError:
                 pass
         self._init_tables()
+        self.journal = SubmissionJournal(conn=self.conn, db_path=self.db_path)
 
     def close(self) -> None:
         """Close the underlying SQLite connection (releases the DB file handle; required on Windows)."""
         try:
+            if hasattr(self, "journal") and self.journal:
+                self.journal.close()
             self.conn.close()
         except Exception:
             pass
@@ -138,6 +142,7 @@ class TaskStore:
                 score INTEGER DEFAULT 0,
                 provisional_points INTEGER DEFAULT 0,
                 confirmed_points INTEGER DEFAULT 0,
+                score_status TEXT DEFAULT 'PENDING',
                 git_revision TEXT,
                 submission_id TEXT,
                 response_json TEXT,
@@ -163,6 +168,7 @@ class TaskStore:
                 ("updated_at", "REAL"),
                 ("provisional_points", "INTEGER DEFAULT 0"),
                 ("confirmed_points", "INTEGER DEFAULT 0"),
+                ("score_status", "TEXT DEFAULT 'PENDING'"),
             ]:
                 try:
                     self.conn.execute(f"ALTER TABLE submissions ADD COLUMN {col} {col_type}")
@@ -578,7 +584,12 @@ class TaskStore:
         cursor = self.conn.cursor()
         cursor.execute("SELECT * FROM submissions WHERE task_id = ?", (task_id,))
         row = cursor.fetchone()
-        return dict(row) if row else None
+        if not row:
+            return None
+        d = dict(row)
+        if "score_status" in d:
+            d["scoreStatus"] = d["score_status"]
+        return d
 
     def reconcile_in_flight_submissions(self, status_check_fn: Any) -> List[Dict[str, Any]]:
         """Scan and reconcile any unresolved SUBMIT_IN_FLIGHT submissions against Game Master."""
@@ -649,36 +660,46 @@ class TaskStore:
         response_json: Optional[Dict[str, Any]] = None,
         git_revision: Optional[str] = None,
         submission_id: Optional[str] = None,
+        score_status: Optional[str] = None,
     ) -> bool:
-        """Record a submission. Enforces once-only submission invariant and scoring separation."""
+        """Record a submission. Enforces once-only submission invariant and scoring separation.
+
+        Decouples HTTP 201 receipt from task completion:
+        receiving status ACCEPTED sets confirmed_points = 0, scoreStatus = PENDING, and task status SUBMITTED.
+        Confirmed points are awarded only when subsequent match projection confirms PASSED (LIFE-03).
+        """
         sub = self.get_submission(task_id)
         if sub and sub["status"] in ("ACCEPTED", "PASSED", "FAILED") and status not in ("PASSED", "FAILED"):
             return False  # Block duplicate submission
 
         now = time.time()
-        # Separate provisional from confirmed points (P0.4)
+        # Separate provisional from confirmed points (P0.4, LIFE-03)
         if status == "PASSED":
             confirmed = int(score)
             provisional = int(score)
+            resolved_score_status = score_status or (response_json or {}).get("scoreStatus") or "CONFIRMED"
         elif status in ("ACCEPTED", "SUBMITTED", "GRADING"):
             confirmed = 0
             provisional = int(score)
+            resolved_score_status = score_status or (response_json or {}).get("scoreStatus") or "PENDING"
         else:  # FAILED, REJECTED
             confirmed = 0
             provisional = 0
+            resolved_score_status = score_status or (response_json or {}).get("scoreStatus") or "FAILED"
 
         with self.conn:
             self.conn.execute("""
             INSERT OR REPLACE INTO submissions (
-                task_id, status, score, provisional_points, confirmed_points,
+                task_id, status, score, provisional_points, confirmed_points, score_status,
                 git_revision, submission_id, response_json, submitted_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 task_id,
                 status,
                 score,
                 provisional,
                 confirmed,
+                resolved_score_status,
                 git_revision,
                 submission_id,
                 json.dumps(response_json or {}),
@@ -699,7 +720,11 @@ class TaskStore:
                 "UPDATE tasks SET status = ?, awarded_points = ?, active_pid = NULL, updated_at = ? WHERE task_id = ?",
                 (final_task_state, float(confirmed), now, task_id),
             )
-            self.record_event(task_id, "SUBMISSION_RECORDED", None, status, {"score": score})
+            self.record_event(task_id, "SUBMISSION_RECORDED", None, status, {
+                "score": score,
+                "confirmed_points": confirmed,
+                "scoreStatus": resolved_score_status,
+            })
         return True
 
     def update_submission_status(
@@ -708,6 +733,7 @@ class TaskStore:
         status: str,
         score: Optional[int] = None,
         response_json: Optional[Dict[str, Any]] = None,
+        score_status: Optional[str] = None,
     ) -> None:
         """Update grading status of an existing submission (e.g. GRADING -> PASSED/FAILED)."""
         sub = self.get_submission(task_id)
@@ -718,18 +744,21 @@ class TaskStore:
         if status == "PASSED":
             confirmed = final_score
             provisional = final_score
+            resolved_score_status = score_status or (response_json or {}).get("scoreStatus") or "CONFIRMED"
         elif status == "FAILED":
             confirmed = 0
             provisional = 0
+            resolved_score_status = score_status or (response_json or {}).get("scoreStatus") or "FAILED"
         else:  # GRADING, ACCEPTED
             confirmed = 0
             provisional = final_score
+            resolved_score_status = score_status or (response_json or {}).get("scoreStatus") or "PENDING"
 
         with self.conn:
             self.conn.execute("""
-            UPDATE submissions SET status = ?, score = ?, provisional_points = ?, confirmed_points = ?, response_json = ?, updated_at = ?
+            UPDATE submissions SET status = ?, score = ?, provisional_points = ?, confirmed_points = ?, score_status = ?, response_json = ?, updated_at = ?
             WHERE task_id = ?
-            """, (status, final_score, provisional, confirmed, json.dumps(response_json or {}), now, task_id))
+            """, (status, final_score, provisional, confirmed, resolved_score_status, json.dumps(response_json or {}), now, task_id))
 
             if status == "PASSED":
                 task_state = TaskState.PASSED.value
@@ -742,7 +771,11 @@ class TaskStore:
                 "UPDATE tasks SET status = ?, awarded_points = ?, active_pid = NULL, updated_at = ? WHERE task_id = ?",
                 (task_state, float(confirmed), now, task_id),
             )
-            self.record_event(task_id, "GRADING_STATUS_UPDATED", sub["status"], status, {"score": final_score})
+            self.record_event(task_id, "GRADING_STATUS_UPDATED", sub["status"], status, {
+                "score": final_score,
+                "confirmed_points": confirmed,
+                "scoreStatus": resolved_score_status,
+            })
 
     def get_total_confirmed_points(self) -> int:
         """Return sum of confirmed points awarded by Grader (PASSED submissions only)."""
@@ -833,3 +866,17 @@ class TaskStore:
         else:
             cursor.execute("SELECT * FROM events ORDER BY timestamp ASC")
         return [dict(r) for r in cursor.fetchall()]
+
+    def get_current_match_id(self) -> Optional[str]:
+        """Return match_id of current match or first non-default task, if any."""
+        cursor = self.conn.cursor()
+        cursor.execute("SELECT id FROM matches ORDER BY started_at DESC LIMIT 1")
+        row = cursor.fetchone()
+        if row and row["id"]:
+            return str(row["id"])
+        cursor.execute("SELECT match_id FROM tasks WHERE match_id IS NOT NULL AND match_id != 'default_match' LIMIT 1")
+        row = cursor.fetchone()
+        if row and row["match_id"]:
+            return str(row["match_id"])
+        return None
+

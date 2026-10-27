@@ -231,3 +231,32 @@ def test_process_helpers(tmp_path):
     assert rc == 0
     assert "hello" in stdout
     assert not timed_out
+
+
+def test_worker_launcher_production_mode_blocks_nested_codex_cli(tmp_path):
+    """RUNTIME-01: Verify WorkerLauncher rejects nested codex exec subprocess in production path."""
+    launcher = WorkerLauncher(
+        scratch_dir=tmp_path / "scratch",
+        backend="codex",
+        production_mode=True,
+    )
+
+    envelope = {
+        "task_id": "PROD-TASK-01",
+        "task_type": "TASK",
+        "title": "Production task",
+        "description": "Must not spawn nested codex exec",
+        "repository_path": str(tmp_path),
+        "base_revision": "HEAD",
+        "deadline_epoch": None,
+        "points": 100,
+        "mvs": [],
+        "evidence_required": [],
+        "model": "gpt-6.1-sol",
+        "reasoning_effort": "low",
+        "time_budget_seconds": 60,
+    }
+
+    with pytest.raises(RuntimeError, match="RUNTIME-01 Invariant"):
+        launcher.launch(envelope)
+

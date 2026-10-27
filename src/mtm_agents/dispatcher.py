@@ -630,6 +630,11 @@ class NativeSubagentDispatcher:
         pause_event: Optional[Any] = None,
     ) -> RuntimeResult:
         """Export native agent profiles into `workspace`, invoke CLI with `--agent` / `-c agent=...`, and clean up."""
+        if os.environ.get("MTM_ENV") == "production" or os.environ.get("MTM_PRODUCTION") == "1":
+            raise RuntimeError(
+                "Dynamic profile injection is forbidden in production mode. "
+                "MTM Player registers frozen native profiles via team-runtime.json."
+            )
         ws = Path(workspace).resolve()
         profile = self.resolve_task_profile(str(envelope.get("task_type", "TASK")))
         prep = self.prepare_workspace_agents(ws)

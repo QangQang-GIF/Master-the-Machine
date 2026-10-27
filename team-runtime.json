@@ -1,0 +1,11 @@
+{
+  "schemaVersion": 1,
+  "kind": "mtm-team-runtime",
+  "name": "team-sdlc-pack",
+  "version": "1.0.0",
+  "protocolVersion": 4,
+  "provider": "codex",
+  "entrypoint": {
+    "rootAgentType": "team_orchestrator"
+  }
+}

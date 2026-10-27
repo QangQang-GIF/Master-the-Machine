@@ -41,9 +41,11 @@ AI-Arena/arena/data/catalog.jsonl
 
 .superpowers/
 .agents/teamwork/
+.mtm/
 
 # runtime/benchmark artifacts
 bench_results.json
+*.db
 *.db-wal
 *.db-shm
 

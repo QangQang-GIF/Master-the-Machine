@@ -61,11 +61,17 @@ class WorkerLauncher:
         backend: str = "codex",
         strict_backend: bool = True,
         allow_fallback: bool = False,
+        production_mode: Optional[bool] = None,
     ):
         self.workspace_mgr = WorkspaceManager(scratch_dir)
         self.backend = backend
         self.strict_backend = strict_backend
         self.allow_fallback = allow_fallback
+        self.production_mode = (
+            production_mode
+            if production_mode is not None
+            else (os.environ.get("MTM_ENV") == "production" or os.environ.get("MTM_PRODUCTION") == "1")
+        )
         self.runtime = runtime or CodexRuntime(
             prefer_codex=(backend != "antigravity"),
             allow_agy_fallback=allow_fallback,
@@ -180,6 +186,13 @@ class WorkerLauncher:
                 pause_event=pause_event,
             )
         else:
+            if self.production_mode and routing.backend == "codex" and not os.environ.get("MTM_TEST_MOCK_RUNTIME"):
+                # RUNTIME-01: Prohibit secondary 'codex exec' spawns in production execution path
+                raise RuntimeError(
+                    "RUNTIME-01 Invariant: Prohibited secondary 'codex exec' subprocess in production execution path. "
+                    "The MTM Player owns the single root Codex session (team_orchestrator)."
+                )
+
             run_kwargs: Dict[str, Any] = {
                 "workspace": ws_path,
                 "prompt": kickoff,

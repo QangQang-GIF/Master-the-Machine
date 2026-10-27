@@ -1,6 +1,8 @@
 """IntegrationGuard: Integrates validated worker patches into the canonical submission repository with 3-way conflict detection."""
 from __future__ import annotations
 
+import fnmatch
+import json
 import os
 import subprocess
 import tempfile
@@ -11,6 +13,67 @@ from typing import Any, Dict, List, Optional
 from mtm_core.contracts import WorkerResult
 from mtm_core.git import git_diff, git_status, run_git, get_head_sha
 from mtm_competition.verification.command_safety import run_verification_command
+
+
+FORBIDDEN_FILE_PATTERNS = [
+    # Immutable practice challenge file
+    "exam-info.json",
+    # Environment secrets
+    ".env",
+    ".env.*",
+    "*.env",
+    "*secret*",
+    "*token*",
+    # Runtime knowledge cache files
+    "project_map.md",
+    "index-meta.json",
+]
+
+FORBIDDEN_DIR_PREFIXES = [
+    ".codex",
+    ".agents",
+    "team-sdlc-pack/state",
+]
+
+
+def is_forbidden_path(rel_path: Path | str) -> tuple[bool, str]:
+    """Check if a path matches forbidden file exclusions (GIT-04).
+    
+    Strictly blocks:
+    - exam-info.json (immutable practice challenge file)
+    - Environment secrets: .env, .env.*, *.env, *secret*, *token*
+    - Runtime knowledge cache files: PROJECT_MAP.md, index-meta.json, team-sdlc-pack/state/, .codex/, .agents/
+    """
+    p = Path(rel_path)
+    posix_path = p.as_posix()
+    posix_lower = posix_path.lower()
+    name_lower = p.name.lower()
+
+    # 1. Exact or glob match on filename
+    for pat in FORBIDDEN_FILE_PATTERNS:
+        if fnmatch.fnmatch(name_lower, pat.lower()):
+            return True, f"Forbidden file pattern '{pat}' matched by '{rel_path}'"
+
+    # 2. Check forbidden directory prefixes / components
+    for prefix in FORBIDDEN_DIR_PREFIXES:
+        pref_lower = prefix.lower()
+        if (
+            posix_lower == pref_lower
+            or posix_lower.startswith(pref_lower + "/")
+            or f"/{pref_lower}/" in posix_lower
+            or posix_lower.endswith("/" + pref_lower)
+        ):
+            return True, f"Forbidden directory '{prefix}' matched by '{rel_path}'"
+
+    # 3. Check any directory part for secret/token or agent caches
+    for part in p.parts:
+        part_lower = part.lower()
+        if part_lower in (".codex", ".agents"):
+            return True, f"Forbidden internal agent cache directory '{part}' in '{rel_path}'"
+        if fnmatch.fnmatch(part_lower, "*secret*") or fnmatch.fnmatch(part_lower, "*token*"):
+            return True, f"Forbidden secret/token directory '{part}' in '{rel_path}'"
+
+    return False, ""
 
 
 @dataclass
@@ -75,12 +138,18 @@ class IntegrationGuard:
         remote_name: str = "origin",
         verify_post_integration: bool = True,
         require_remote: bool = False,
+        match_root: Optional[Path | str] = None,
+        checkout_root: Optional[Path | str] = None,
     ):
         self.target_repo = Path(target_repo_path).resolve()
         self.push_to_remote = push_to_remote
         self.remote_name = remote_name
         self.verify_post_integration = verify_post_integration
         self.require_remote = require_remote
+        self.match_root = Path(match_root).resolve() if match_root else self.target_repo
+        self.checkout_root = Path(checkout_root).resolve() if checkout_root else (
+            self.target_repo.parent if (self.target_repo.parent / ".git").exists() else self.target_repo
+        )
 
     def has_remote(self, remote: Optional[str] = None) -> bool:
         """Check if remote is configured."""
@@ -98,6 +167,37 @@ class IntegrationGuard:
                 return False
         remote_sha = ls_res.stdout.split()[0].strip()
         return remote_sha.startswith(expected_sha) or expected_sha.startswith(remote_sha)
+
+    def stage_answer_and_evidence(
+        self,
+        task_id: str,
+        answer_data: Dict[str, Any],
+        evidence_files: Optional[Dict[str, bytes | str]] = None,
+    ) -> List[str]:
+        """Write and stage answers/<task_id>/submit.json and relative evidence files."""
+        ans_dir = self.target_repo / "answers" / task_id
+        ev_dir = ans_dir / "evidence"
+        ans_dir.mkdir(parents=True, exist_ok=True)
+
+        submit_file = ans_dir / "submit.json"
+        submit_file.write_text(json.dumps(answer_data, indent=2), encoding="utf-8")
+        staged_files = [f"answers/{task_id}/submit.json"]
+
+        if evidence_files:
+            ev_dir.mkdir(parents=True, exist_ok=True)
+            for ev_name, ev_content in evidence_files.items():
+                ev_path = Path(ev_name)
+                if ev_path.is_absolute() or ".." in ev_path.parts:
+                    raise ValueError(f"Evidence path must be relative: {ev_name}")
+                dest_ev = ev_dir / ev_path.name
+                if isinstance(ev_content, bytes):
+                    dest_ev.write_bytes(ev_content)
+                else:
+                    dest_ev.write_text(str(ev_content), encoding="utf-8")
+                staged_files.append(f"answers/{task_id}/evidence/{ev_path.name}")
+
+        run_git(self.target_repo, ["add", "--"] + staged_files)
+        return staged_files
 
     def integrate(
         self,
@@ -131,6 +231,65 @@ class IntegrationGuard:
 
         ws_has_head = _has_git_head(ws)
 
+        # Pre-scan ALL changed files: check path traversal, workspace containment, and forbidden paths (GIT-04, GIT-05)
+        for rel_file in worker_result.changed_files:
+            rel_path = Path(rel_file)
+            rel_str = str(rel_file)
+
+            # 1. Path traversal check (GIT-05)
+            if (
+                rel_path.is_absolute()
+                or ".." in rel_path.parts
+                or ".." in rel_str
+                or "%2e" in rel_str.lower()
+                or "%2f" in rel_str.lower()
+                or rel_str.startswith(("/", "\\"))
+            ):
+                return IntegrationResult(
+                    success=False,
+                    error_message=f"Invalid path traversal in worker result: {rel_file}",
+                )
+
+            # 2. Strict Staging Guard & Forbidden File check (GIT-04)
+            forbidden, reason = is_forbidden_path(rel_file)
+            if forbidden:
+                # Rollback workspace changes to preserve original files
+                if ws_has_head:
+                    run_git(ws, ["checkout", "HEAD", "--", rel_file])
+                    run_git(ws, ["clean", "-f", rel_file])
+                return IntegrationResult(
+                    success=False,
+                    error_message=f"Forbidden path blocked ({reason}): {rel_file}",
+                )
+
+            # 3. Workspace containment check (GIT-05)
+            dest_file = (self.target_repo / rel_file).resolve()
+            try:
+                dest_file.relative_to(self.target_repo)
+            except (ValueError, RuntimeError):
+                return IntegrationResult(
+                    success=False,
+                    error_message=f"Path escape detected: {rel_file} is outside canonical repository",
+                )
+
+            if self.match_root:
+                try:
+                    dest_file.relative_to(self.match_root)
+                except (ValueError, RuntimeError):
+                    return IntegrationResult(
+                        success=False,
+                        error_message=f"Path escape detected: {rel_file} is outside match root {self.match_root}",
+                    )
+
+            if self.checkout_root:
+                try:
+                    dest_file.relative_to(self.checkout_root)
+                except (ValueError, RuntimeError):
+                    return IntegrationResult(
+                        success=False,
+                        error_message=f"Path escape detected: {rel_file} is outside checkout root {self.checkout_root}",
+                    )
+
         # Validate and apply patch files safely (with 3-way conflict resolution when ws has a base HEAD)
         applied_files: List[str] = []
         newly_created_files: List[Path] = []
@@ -138,39 +297,17 @@ class IntegrationGuard:
 
         for rel_file in worker_result.changed_files:
             rel_path = Path(rel_file)
-            if rel_path.is_absolute() or ".." in rel_path.parts:
-                self._rollback_applied_files(applied_files, pre_existing_files, newly_created_files)
-                return IntegrationResult(
-                    success=False,
-                    error_message=f"Invalid path traversal in worker result: {rel_file}",
-                )
-
             rel_posix = rel_path.as_posix()
-            if rel_posix.startswith((".codex/agents/", ".agents/agents/")):
-                self._rollback_applied_files(applied_files, pre_existing_files, newly_created_files)
-                return IntegrationResult(
-                    success=False,
-                    error_message=f"Native agent profile paths cannot be integrated into customer repo: {rel_file}",
-                )
 
             src_file = ws / rel_file
             if src_file.is_symlink():
-                self._rollback_applied_files(applied_files, pre_existing_files, newly_created_files)
+                self._rollback_applied_files(applied_files, pre_existing_files, newly_created_files, ws, worker_result.changed_files)
                 return IntegrationResult(
                     success=False,
                     error_message=f"Symlinks are disallowed in worker patches: {rel_file}",
                 )
 
             dest_file = (self.target_repo / rel_file).resolve()
-            try:
-                dest_file.relative_to(self.target_repo)
-            except (ValueError, RuntimeError):
-                self._rollback_applied_files(applied_files, pre_existing_files, newly_created_files)
-                return IntegrationResult(
-                    success=False,
-                    error_message=f"Path escape detected: {rel_file} is outside canonical repository",
-                )
-
             if dest_file.exists():
                 pre_existing_files[rel_file] = dest_file.read_bytes()
 
@@ -185,7 +322,7 @@ class IntegrationGuard:
                     if current_target_bytes != ws_base_bytes:
                         merged = _three_way_merge_bytes(current_target_bytes, ws_base_bytes, worker_bytes)
                         if merged is None:
-                            self._rollback_applied_files(applied_files, pre_existing_files, newly_created_files)
+                            self._rollback_applied_files(applied_files, pre_existing_files, newly_created_files, ws, worker_result.changed_files)
                             return IntegrationResult(
                                 success=False,
                                 error_message=f"Three-way merge conflict on {rel_file}: canonical repo has conflicting concurrent edits",
@@ -199,7 +336,7 @@ class IntegrationGuard:
                     newly_created_files.append(dest_file)
             elif not src_file.exists() and dest_file.exists():
                 if ws_has_head and ws_base_bytes is not None and pre_existing_files[rel_file] != ws_base_bytes:
-                    self._rollback_applied_files(applied_files, pre_existing_files, newly_created_files)
+                    self._rollback_applied_files(applied_files, pre_existing_files, newly_created_files, ws, worker_result.changed_files)
                     return IntegrationResult(
                         success=False,
                         error_message=f"Three-way merge conflict (modify/delete) on {rel_file}",
@@ -218,11 +355,27 @@ class IntegrationGuard:
         stage_res = run_git(self.target_repo, ["add", "--"] + applied_files)
         if stage_res.returncode != 0:
             # Unstage and rollback
-            self._rollback_applied_files(applied_files, pre_existing_files, newly_created_files)
+            self._rollback_applied_files(applied_files, pre_existing_files, newly_created_files, ws, worker_result.changed_files)
             return IntegrationResult(
                 success=False,
                 error_message=f"Failed to stage worker patch files: {stage_res.stderr}",
             )
+
+        # Post-staging index verification: ensure no forbidden file is staged in index
+        staged_diff = run_git(self.target_repo, ["diff", "--cached", "--name-only"])
+        if staged_diff.returncode == 0:
+            for staged_name in staged_diff.stdout.splitlines():
+                staged_name = staged_name.strip()
+                if not staged_name:
+                    continue
+                forbidden, reason = is_forbidden_path(staged_name)
+                if forbidden:
+                    run_git(self.target_repo, ["reset", "HEAD"])
+                    self._rollback_applied_files(applied_files, pre_existing_files, newly_created_files, ws, worker_result.changed_files)
+                    return IntegrationResult(
+                        success=False,
+                        error_message=f"Staged index contains forbidden file ({reason}): {staged_name}",
+                    )
 
         # Post-integration verification before commit/push
         if self.verify_post_integration and verification_cmd:
@@ -235,7 +388,7 @@ class IntegrationGuard:
                 passed = False
             if not passed:
                 # Safe rollback: Revert only touched files, DO NOT clean -fd or reset --hard canonical repo
-                self._rollback_applied_files(applied_files, pre_existing_files, newly_created_files)
+                self._rollback_applied_files(applied_files, pre_existing_files, newly_created_files, ws, worker_result.changed_files)
                 return IntegrationResult(
                     success=False,
                     verification_passed=False,
@@ -254,7 +407,7 @@ class IntegrationGuard:
                     applied_files=applied_files,
                     pushed=False,
                 )
-            self._rollback_applied_files(applied_files, pre_existing_files, newly_created_files)
+            self._rollback_applied_files(applied_files, pre_existing_files, newly_created_files, ws, worker_result.changed_files)
             return IntegrationResult(
                 success=False,
                 error_message=f"Git commit failed: {commit_res.stderr}",
@@ -311,13 +464,20 @@ class IntegrationGuard:
         applied_files: List[str],
         pre_existing_files: Dict[str, bytes],
         newly_created_files: List[Path],
+        ws: Optional[Path] = None,
+        ws_touched_files: Optional[List[str]] = None,
     ) -> None:
-        """Safely revert only touched files without reset --hard or clean -fd."""
+        """Safely revert only touched files without reset --hard or clean -fd on entire repo."""
         if applied_files:
             run_git(self.target_repo, ["reset", "HEAD", "--"] + applied_files)
         for rel_file, original_content in pre_existing_files.items():
             dest = self.target_repo / rel_file
+            dest.parent.mkdir(parents=True, exist_ok=True)
             dest.write_bytes(original_content)
         for new_file in newly_created_files:
             if new_file.exists():
                 new_file.unlink(missing_ok=True)
+        if ws and ws_touched_files and _has_git_head(ws):
+            for wf in ws_touched_files:
+                run_git(ws, ["checkout", "HEAD", "--", wf])
+                run_git(ws, ["clean", "-f", wf])
