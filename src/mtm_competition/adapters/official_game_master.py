@@ -355,6 +355,36 @@ class OfficialGameMasterAdapter(GameMasterAdapter):
                                 parsed = None
                         else:
                             parsed = None
+
+                        if not parsed and "initialProjection" in resp_body:
+                            try:
+                                idx = resp_body.find("initialProjection")
+                                start_obj = resp_body.find("{", idx)
+                                if start_obj != -1:
+                                    cleaned = resp_body[start_obj:].replace('\\\\\"', '\"').replace('\\\"', '\"')
+                                    proj_obj, _ = json.JSONDecoder().raw_decode(cleaned)
+                                    match_obj = proj_obj.get("match") or {}
+                                    team_obj = proj_obj.get("team") or {}
+                                    repo_obj = proj_obj.get("repo") or proj_obj.get("repository") or {}
+                                    items = proj_obj.get("backlog") or proj_obj.get("backlogItems") or []
+                                    parsed = {
+                                        "matchUuid": match_obj.get("id") or match_obj.get("matchUuid"),
+                                        "matchCode": match_obj.get("publicId") or match_obj.get("matchCode"),
+                                        "status": match_obj.get("status") or "IN_PROGRESS",
+                                        "backlogItems": items if isinstance(items, list) else [],
+                                        "team": team_obj,
+                                        "teamId": team_obj.get("id") or team_obj.get("code"),
+                                        "teamName": team_obj.get("name"),
+                                        "repository": repo_obj,
+                                        "projectContext": proj_obj.get("projectContext"),
+                                        "api": proj_obj.get("api"),
+                                    }
+                                    for k, v in proj_obj.items():
+                                        parsed.setdefault(k, v)
+                                    for k, v in match_obj.items():
+                                        parsed.setdefault(k, v)
+                            except Exception:
+                                parsed = None
                         if parsed is None or not isinstance(parsed, dict):
                             raise GameMasterError(f"Received non-JSON response from {url}")
 
@@ -564,11 +594,11 @@ class OfficialGameMasterAdapter(GameMasterAdapter):
                     f"SEC-01: matchPageUrl origin '{parsed_page.netloc}' not in allowedMatchOrigins: {allowed_origins}"
                 )
 
-        # 2. Authenticate against /login or /api/v1/auth/login or /api/auth/login
+        # 2. Authenticate against /api/v1/auth/login or /api/auth/login or /login
         login_endpoints = [
-            f"{page_origin}/login",
             f"{page_origin}/api/v1/auth/login",
             f"{page_origin}/api/auth/login",
+            f"{page_origin}/login",
         ]
 
         login_data = {
@@ -582,7 +612,7 @@ class OfficialGameMasterAdapter(GameMasterAdapter):
 
         for ep in login_endpoints:
             try:
-                res = self._request("POST", ep, data=login_data, retries=1)
+                res = self._request("POST", ep, data=login_data, retries=1, headers={"Origin": page_origin})
                 login_response = res if isinstance(res, dict) else {}
                 auth_succeeded = True
                 break
@@ -594,7 +624,7 @@ class OfficialGameMasterAdapter(GameMasterAdapter):
                 raise
             except Exception as e:
                 last_auth_error = e
-                break
+                continue
 
         if not auth_succeeded:
             if last_auth_error:
