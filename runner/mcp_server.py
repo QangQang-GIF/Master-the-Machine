@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
 import sys
 import time
@@ -238,20 +239,38 @@ class MCPHelperServer:
             # 3. Locate and execute genuine environment doctor or build command (R6)
             tech = detect_tech_stack(app_root, match_root=self.match_root)
             doc_file = None
-            for cand in [
-                self.match_root / "env-require" / "doctor.ps1",
-                self.match_root / "doctor.ps1",
-                self.checkout_root / "env-require" / "doctor.ps1",
-                self.checkout_root / "doctor.ps1",
-                app_root / "env-require" / "doctor.ps1",
-                app_root / "doctor.ps1",
-                self.match_root / "env-require" / "doctor.sh",
-                self.match_root / "doctor.sh",
-                self.checkout_root / "env-require" / "doctor.sh",
-                self.checkout_root / "doctor.sh",
-                app_root / "env-require" / "doctor.sh",
-                app_root / "doctor.sh",
-            ]:
+            if sys.platform.startswith("win"):
+                doctor_candidates = [
+                    self.match_root / "env-require" / "doctor.ps1",
+                    self.match_root / "doctor.ps1",
+                    self.checkout_root / "env-require" / "doctor.ps1",
+                    self.checkout_root / "doctor.ps1",
+                    app_root / "env-require" / "doctor.ps1",
+                    app_root / "doctor.ps1",
+                    self.match_root / "env-require" / "doctor.sh",
+                    self.match_root / "doctor.sh",
+                    self.checkout_root / "env-require" / "doctor.sh",
+                    self.checkout_root / "doctor.sh",
+                    app_root / "env-require" / "doctor.sh",
+                    app_root / "doctor.sh",
+                ]
+            else:
+                doctor_candidates = [
+                    self.match_root / "env-require" / "doctor.sh",
+                    self.match_root / "doctor.sh",
+                    self.checkout_root / "env-require" / "doctor.sh",
+                    self.checkout_root / "doctor.sh",
+                    app_root / "env-require" / "doctor.sh",
+                    app_root / "doctor.sh",
+                    self.match_root / "env-require" / "doctor.ps1",
+                    self.match_root / "doctor.ps1",
+                    self.checkout_root / "env-require" / "doctor.ps1",
+                    self.checkout_root / "doctor.ps1",
+                    app_root / "env-require" / "doctor.ps1",
+                    app_root / "doctor.ps1",
+                ]
+
+            for cand in doctor_candidates:
                 if cand.exists():
                     doc_file = cand
                     break
@@ -263,7 +282,19 @@ class MCPHelperServer:
             if doc_file:
                 cwd_run = doc_file.parent.parent if doc_file.parent.name == "env-require" else doc_file.parent
                 if doc_file.suffix == ".ps1":
-                    cmd_run = f'powershell.exe -ExecutionPolicy Bypass -File "{doc_file}"'
+                    if sys.platform.startswith("win"):
+                        cmd_run = f'powershell.exe -ExecutionPolicy Bypass -File "{doc_file}"'
+                    else:
+                        pwsh_bin = shutil.which("pwsh") or shutil.which("powershell")
+                        if pwsh_bin:
+                            cmd_run = f'"{pwsh_bin}" -File "{doc_file}"'
+                        else:
+                            sh_companion = doc_file.with_suffix(".sh")
+                            if sh_companion.exists():
+                                doc_file = sh_companion
+                                cmd_run = f'bash "{doc_file}"'
+                            else:
+                                cmd_run = f'bash "{doc_file}"'
                 else:
                     cmd_run = f'bash "{doc_file}"' if not sys.platform.startswith("win") else f'sh "{doc_file}"'
                 try:
