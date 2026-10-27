@@ -29,6 +29,38 @@ def validate_match_uuid(match_uuid: str) -> None:
         )
 
 
+def validate_match_projection_schema(data: Any) -> Dict[str, Any]:
+    """Strictly validate match projection schema per Digital Cuder wire contract.
+
+    Requires:
+    - Non-empty dictionary / JSON object
+    - matchUuid (or id) as a non-empty string
+    - matchCode as a non-empty string
+    - backlogItems as a list
+
+    Raises:
+        ValueError: if empty, non-dict, or missing mandatory fields.
+    Returns:
+        The validated projection dictionary.
+    """
+    if not isinstance(data, dict) or not data:
+        raise ValueError("Match projection must be a non-empty JSON object / dictionary")
+
+    match_uuid = data.get("matchUuid") or data.get("id")
+    if not match_uuid or not isinstance(match_uuid, str) or not match_uuid.strip():
+        raise ValueError("Match projection missing required 'matchUuid' or 'id'")
+
+    match_code = data.get("matchCode")
+    if not match_code or not isinstance(match_code, str) or not match_code.strip():
+        raise ValueError("Match projection missing required 'matchCode'")
+
+    backlog_items = data.get("backlogItems")
+    if backlog_items is None or not isinstance(backlog_items, list):
+        raise ValueError("Match projection missing required 'backlogItems' as a list")
+
+    return data
+
+
 class GameMasterAdapter(ABC):
     """Interface defining contracts with the Tournament Game Master."""
 
@@ -36,6 +68,23 @@ class GameMasterAdapter(ABC):
     def get_match_state(self) -> Dict[str, Any]:
         """Fetch current match state (duration, remaining time, points, teams)."""
         pass
+
+    def get_match_projection(self, match_id_or_code: Optional[str] = None) -> Dict[str, Any]:
+        """Fetch match projection for spectator / match view."""
+        return self.get_match_state()
+
+    def login_session(
+        self,
+        username: str,
+        password: str,
+        match_page_url: str,
+        allowed_origins: Optional[List[str]] = None,
+    ) -> Dict[str, Any]:
+        """Authenticate browser/cookie session for PREPARE_GAME.
+
+        Optional for mock adapters, implemented by official Game Master adapter.
+        """
+        raise NotImplementedError("login_session must be implemented by adapter supporting session authentication")
 
     @abstractmethod
     def list_backlog(self) -> List[Dict[str, Any]]:
@@ -92,3 +141,12 @@ class GameMasterAdapter(ABC):
     def get_submission_status(self, task_id: str) -> Dict[str, Any]:
         """Check grading status (ACCEPTED, PASSED, FAILED)."""
         pass
+
+
+__all__ = [
+    "validate_match_uuid",
+    "validate_match_projection_schema",
+    "GameMasterAdapter",
+    "UUID_REGEX",
+]
+

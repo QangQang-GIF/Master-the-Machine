@@ -73,6 +73,24 @@ class MockGameMasterHandler(BaseHTTPRequestHandler):
             body["error"]["details"] = details
         self._send_json(status_code, body, headers=headers)
 
+    def _send_html(
+        self,
+        status_code: int,
+        html_content: str,
+        headers: Optional[Dict[str, str]] = None,
+    ) -> None:
+        payload = html_content.encode("utf-8")
+        self.send_response(status_code)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(payload)))
+        req_id = f"req_{uuid.uuid4().hex[:12]}"
+        self.send_header("X-Request-Id", req_id)
+        if headers:
+            for k, v in headers.items():
+                self.send_header(k, v)
+        self.end_headers()
+        self.wfile.write(payload)
+
     def do_GET(self) -> None:
         clean_path = urllib.parse.urlparse(self.path).path.rstrip("/")
 
@@ -93,10 +111,79 @@ class MockGameMasterHandler(BaseHTTPRequestHandler):
             if match_view:
                 ident = match_view.group(1)
                 if ident.lower() in (self.server.match_code.lower(), self.server.match_uuid.lower()):
+                    # Session / Bearer authentication check if required
+                    if self.server.require_session_auth:
+                        cookie_header = self.headers.get("Cookie", "")
+                        session_match = re.search(r"session_token=([A-Za-z0-9-]+)", cookie_header)
+                        has_valid_cookie = bool(session_match and session_match.group(1) in self.server.active_sessions)
+                        auth_header = self.headers.get("Authorization", "")
+                        has_valid_bearer = bool(auth_header == f"Bearer {self.server.auth_token}")
+                        if not (has_valid_cookie or has_valid_bearer):
+                            self._send_error_envelope(401, "UNAUTHORIZED", "Missing or expired session authentication")
+                            return
+
+                    # Content negotiation: Next.js spectator HTML vs JSON projection
+                    accept_header = self.headers.get("Accept", "")
+                    wants_html = ("text/html" in accept_header) or self.server.render_html_mode
+
+                    if wants_html:
+                        if getattr(self.server, "malformed_next_data", False):
+                            html_body = (
+                                f"<!DOCTYPE html><html><head><title>Match {self.server.match_code}</title></head>"
+                                f"<body><script id=\"__NEXT_DATA__\">{{malformed json</script></body></html>"
+                            )
+                        else:
+                            page_props = {
+                                "team": {
+                                    "id": self.server.team_id,
+                                    "name": "Team MTM",
+                                },
+                                "matchUuid": self.server.match_uuid,
+                                "matchCode": self.server.match_code,
+                                "status": self.server.match_state,
+                                "wave": self.server.current_wave,
+                                "waveTimestamps": {
+                                    "wave1": 0,
+                                    "wave2": 840,
+                                    "wave3": 1740,
+                                },
+                                "backlogItems": list(self.server.backlog_items.values()),
+                            }
+                            next_data = {
+                                "props": {
+                                    "pageProps": {
+                                        **page_props,
+                                        "match": page_props,
+                                    }
+                                },
+                                "page": "/match/[matchId]",
+                                "query": {"matchId": self.server.match_code},
+                                "buildId": "mock-build-id-123",
+                            }
+                            json_str = json.dumps(next_data, indent=2)
+                            html_body = (
+                                f"<!DOCTYPE html>\n<html>\n<head><title>Match {self.server.match_code}</title></head>\n"
+                                f"<body>\n  <div id=\"__next\">\n    <main>Spectator view for match {self.server.match_code}</main>\n  </div>\n"
+                                f"  <script id=\"__NEXT_DATA__\" type=\"application/json\">\n{json_str}\n  </script>\n</body>\n</html>\n"
+                            )
+                        self._send_html(200, html_body)
+                        return
+
+                    # JSON projection
                     self._send_json(200, {
                         "status": self.server.match_state,
                         "matchUuid": self.server.match_uuid,
                         "matchCode": self.server.match_code,
+                        "team": {
+                            "id": self.server.team_id,
+                            "name": "Team MTM",
+                        },
+                        "wave": self.server.current_wave,
+                        "waveTimestamps": {
+                            "wave1": 0,
+                            "wave2": 840,
+                            "wave3": 1740,
+                        },
                         "backlogItems": list(self.server.backlog_items.values()),
                     })
                     return
@@ -154,6 +241,12 @@ class MockGameMasterHandler(BaseHTTPRequestHandler):
             )
             return
 
+        # Check session login route before bearer token check
+        clean_path = urllib.parse.urlparse(self.path).path.rstrip("/")
+        if clean_path in ("/login", "/api/v1/auth/login"):
+            self._handle_login(raw_body)
+            return
+
         # Authentication check
         auth_header = self.headers.get("Authorization", "")
         expected_token = f"Bearer {self.server.auth_token}"
@@ -177,6 +270,69 @@ class MockGameMasterHandler(BaseHTTPRequestHandler):
 
         # Default 404
         self._send_error_envelope(404, "NOT_FOUND", f"Endpoint {self.path} not found")
+
+    def _handle_login(self, raw_body: bytes) -> None:
+        username = None
+        password = None
+        content_type = self.headers.get("Content-Type", "")
+        if "application/json" in content_type:
+            try:
+                body_dict = json.loads(raw_body.decode("utf-8")) if raw_body else {}
+                username = body_dict.get("username")
+                password = body_dict.get("password")
+            except Exception:
+                self._send_error_envelope(400, "INVALID_JSON", "Request body is not valid JSON")
+                return
+        else:
+            try:
+                qs = urllib.parse.parse_qs(raw_body.decode("utf-8"))
+                username = qs.get("username", [None])[0]
+                password = qs.get("password", [None])[0]
+            except Exception:
+                pass
+            if username is None:
+                try:
+                    body_dict = json.loads(raw_body.decode("utf-8")) if raw_body else {}
+                    username = body_dict.get("username")
+                    password = body_dict.get("password")
+                except Exception:
+                    pass
+
+        if not username or not password:
+            self._send_error_envelope(401, "UNAUTHORIZED", "Missing username or password")
+            return
+
+        valid = False
+        with self.server.lock:
+            creds = self.server.valid_credentials
+            if isinstance(creds, dict):
+                if "username" in creds and "password" in creds:
+                    valid = (username == creds["username"] and password == creds["password"])
+                elif creds.get(username) == password:
+                    valid = True
+                elif username == "example-account" and password == "fake-password-for-example":
+                    valid = True
+                elif username == "user" and password == "pass123":
+                    valid = True
+
+        if not valid:
+            self._send_error_envelope(401, "UNAUTHORIZED", "Invalid username or password")
+            return
+
+        token = str(uuid.uuid4())
+        with self.server.lock:
+            self.server.active_sessions.add(token)
+
+        cookie_hdr = f"session_token={token}; Path=/; HttpOnly; SameSite=Lax"
+        self._send_json(
+            200,
+            {
+                "status": "AUTHENTICATED",
+                "sessionToken": token,
+                "username": username,
+            },
+            headers={"Set-Cookie": cookie_hdr},
+        )
 
     def _handle_start_work(self, match_uuid: str, raw_body: bytes) -> None:
         if not UUID_REGEX.match(match_uuid):
@@ -358,9 +514,23 @@ class MockGameMasterHTTPServer(ThreadingHTTPServer):
         self.lock = threading.Lock()
         self.match_uuid: str = "8c0e1b22-1111-4222-8333-444444444444"
         self.match_code: str = "KWO5GPMP"
+        self.team_id: str = "T01"
         self.auth_token: str = "secret-token-123"
         self.match_state: str = "IN_PROGRESS"
+        self.current_wave: int = 1
         self.allow_submits_during_pause: bool = False
+        self.require_session_auth: bool = False
+        self.render_html_mode: bool = False
+        self.malformed_next_data: bool = False
+
+        self.active_sessions: set[str] = set()
+        self.valid_credentials: Dict[str, str] = {
+            "example-account": "fake-password-for-example",
+            "player-1": "player-pass-123",
+            "user": "pass123",
+            "admin": "admin123",
+        }
+        self.force_submission_error: Optional[Tuple[int, str, str]] = None
 
         self.started_items: Dict[str, Dict[str, Any]] = {}
         self.accepted_items: set[str] = set()
@@ -392,10 +562,74 @@ class MockGameMasterHTTPServer(ThreadingHTTPServer):
             self.requests_log.clear()
             self.match_state = "IN_PROGRESS"
             self.allow_submits_during_pause = False
+            self.team_id = "T01"
+            self.current_wave = 1
+            self.require_session_auth = False
+            self.render_html_mode = False
+            self.malformed_next_data = False
+            self.active_sessions.clear()
+            self.force_submission_error = None
+            self.valid_credentials = {
+                "example-account": "fake-password-for-example",
+                "player-1": "player-pass-123",
+                "user": "pass123",
+                "admin": "admin123",
+            }
             self._rate_limit_count = 0
             self._rate_limit_retry_after = 1
             self._network_timeout_triggered = False
             self._validation_error_details = None
+
+    def set_wave(self, wave_number: int) -> None:
+        with self.lock:
+            self.current_wave = wave_number
+
+    def add_wave_items(self, wave_number: int, items: List[Dict[str, Any]]) -> None:
+        with self.lock:
+            self.current_wave = wave_number
+            for item in items:
+                k = item.get("id") or item.get("key") or item.get("backlogItemKey")
+                if k:
+                    self.backlog_items[str(k)] = item
+
+    def simulate_wave_2(self) -> None:
+        """Populate standard Wave 2 backlog items."""
+        wave_2_items = [
+            {
+                "id": "TASK-WAVE2-01",
+                "key": "TASK-WAVE2-01",
+                "name": "Wave 2 Feature 1",
+                "title": "Wave 2 Feature 1",
+                "wave": 2,
+                "status": "OPEN",
+                "points": 100,
+            },
+            {
+                "id": "TASK-WAVE2-02",
+                "key": "TASK-WAVE2-02",
+                "name": "Wave 2 Feature 2",
+                "title": "Wave 2 Feature 2",
+                "wave": 2,
+                "status": "OPEN",
+                "points": 150,
+            },
+        ]
+        self.add_wave_items(2, wave_2_items)
+
+    def simulate_wave_3(self) -> None:
+        """Populate standard Wave 3 backlog items."""
+        wave_3_items = [
+            {
+                "id": "TASK-WAVE3-01",
+                "key": "TASK-WAVE3-01",
+                "name": "Wave 3 Feature 1",
+                "title": "Wave 3 Feature 1",
+                "wave": 3,
+                "status": "OPEN",
+                "points": 200,
+            },
+        ]
+        self.add_wave_items(3, wave_3_items)
 
     def inject_rate_limit(self, count: int = 1, retry_after: int = 1) -> None:
         with self.lock:

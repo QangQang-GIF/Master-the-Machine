@@ -114,6 +114,11 @@ class SubmissionJournal:
                 raise ValueError(
                     f"Submission for {clean_key} in match {clean_match} already ACCEPTED with receipt {existing.get('receipt_id')}"
                 )
+            if st == "ALREADY_SUBMITTED" or existing.get("last_error_code") == "ALREADY_SUBMITTED":
+                raise ValueError(
+                    f"Submission for {clean_key} in match {clean_match} already submitted and locked on server (state={st}). "
+                    "Generating a new client_submission_id or altering payload bytes is blocked; reconciliation against server records is required."
+                )
             if st == "IN_FLIGHT":
                 # Verify that client_submission_id and idempotency_key match
                 if existing["client_submission_id"] != client_submission_id.strip():
@@ -137,7 +142,7 @@ class SubmissionJournal:
                     )
                 return computed_sha
 
-        # Insert new in-flight record or replace FAILED attempt
+        # Insert new in-flight record or replace FAILED/REJECTED attempt
         with self.conn:
             self.conn.execute(
                 """
@@ -158,7 +163,7 @@ class SubmissionJournal:
                     last_http_code = NULL,
                     last_error_code = NULL,
                     updated_at = excluded.updated_at
-                WHERE submission_journal.state != 'ACCEPTED'
+                WHERE submission_journal.state NOT IN ('ACCEPTED', 'ALREADY_SUBMITTED')
                 """,
                 (
                     clean_match,
@@ -176,10 +181,10 @@ class SubmissionJournal:
         return computed_sha
 
     def get_in_flight(self, match_uuid: str, backlog_item_key: str) -> Optional[Dict[str, Any]]:
-        """Retrieve existing IN_FLIGHT attempt for timeout/restart replay."""
+        """Retrieve existing IN_FLIGHT or ALREADY_SUBMITTED attempt for timeout/restart replay."""
         cursor = self.conn.cursor()
         cursor.execute(
-            "SELECT * FROM submission_journal WHERE match_uuid = ? AND backlog_item_key = ? AND state = 'IN_FLIGHT'",
+            "SELECT * FROM submission_journal WHERE match_uuid = ? AND backlog_item_key = ? AND state IN ('IN_FLIGHT', 'ALREADY_SUBMITTED')",
             (match_uuid.strip(), backlog_item_key.strip()),
         )
         row = cursor.fetchone()
@@ -196,16 +201,16 @@ class SubmissionJournal:
         return dict(row) if row else None
 
     def get_all_in_flight(self, match_uuid: Optional[str] = None) -> List[Dict[str, Any]]:
-        """Retrieve all currently IN_FLIGHT entries, optionally filtered by match."""
+        """Retrieve all currently in-flight or ALREADY_SUBMITTED entries, optionally filtered by match."""
         cursor = self.conn.cursor()
         if match_uuid is not None:
             cursor.execute(
-                "SELECT * FROM submission_journal WHERE match_uuid = ? AND state = 'IN_FLIGHT' ORDER BY created_at ASC",
+                "SELECT * FROM submission_journal WHERE match_uuid = ? AND state IN ('IN_FLIGHT', 'ALREADY_SUBMITTED') ORDER BY created_at ASC",
                 (match_uuid.strip(),),
             )
         else:
             cursor.execute(
-                "SELECT * FROM submission_journal WHERE state = 'IN_FLIGHT' ORDER BY created_at ASC"
+                "SELECT * FROM submission_journal WHERE state IN ('IN_FLIGHT', 'ALREADY_SUBMITTED') ORDER BY created_at ASC"
             )
         return [dict(r) for r in cursor.fetchall()]
 
@@ -279,6 +284,54 @@ class SubmissionJournal:
                 (http_code, error_code, now, clean_match, clean_key),
             )
 
+    def record_already_submitted(
+        self,
+        match_uuid: str,
+        backlog_item_key: str,
+        http_code: int = 409,
+        error_code: str = "ALREADY_SUBMITTED",
+        error_message: Optional[str] = None,
+    ) -> None:
+        """Record HTTP 409 ALREADY_SUBMITTED response from server.
+
+        Per R5: Do NOT transition to REJECTED, do NOT clear in-flight lock,
+        and do NOT permit generating a new client_submission_id or altering payload bytes.
+        Requires reconciliation against server records.
+        """
+        clean_match = match_uuid.strip()
+        clean_key = backlog_item_key.strip()
+        now = time.time()
+        err_val = error_code or error_message or "ALREADY_SUBMITTED"
+
+        with self.conn:
+            cursor = self.conn.execute(
+                """
+                UPDATE submission_journal
+                SET state = 'ALREADY_SUBMITTED',
+                    last_http_code = ?,
+                    last_error_code = ?,
+                    updated_at = ?
+                WHERE match_uuid = ? AND backlog_item_key = ?
+                """,
+                (http_code, err_val, now, clean_match, clean_key),
+            )
+            if cursor.rowcount == 0:
+                self.conn.execute(
+                    """
+                    INSERT INTO submission_journal (
+                        match_uuid, backlog_item_key, client_submission_id, idempotency_key,
+                        request_body_sha256, request_body_bytes, git_revision, remote_ref,
+                        state, receipt_id, last_http_code, last_error_code, created_at, updated_at
+                    ) VALUES (?, ?, 'UNKNOWN', 'UNKNOWN', '', X'', '', '', 'ALREADY_SUBMITTED', NULL, ?, ?, ?, ?)
+                    ON CONFLICT(match_uuid, backlog_item_key) DO UPDATE SET
+                        state = 'ALREADY_SUBMITTED',
+                        last_http_code = excluded.last_http_code,
+                        last_error_code = excluded.last_error_code,
+                        updated_at = excluded.updated_at
+                    """,
+                    (clean_match, clean_key, http_code, err_val, now, now),
+                )
+
     def record_rejection(
         self,
         match_uuid: str,
@@ -287,15 +340,30 @@ class SubmissionJournal:
         error_code: Optional[str] = None,
         error_message: Optional[str] = None,
     ) -> None:
-        """Record explicit server rejection (e.g. 400, 422 VALIDATION_ERROR).
+        """Record explicit server rejection (e.g. 400, 422 VALIDATION_ERROR, 409 IDEMPOTENCY_CONFLICT).
 
         Transitions state from IN_FLIGHT to REJECTED, releasing the in-flight lock
         so a corrected payload and new submission attempt can be safely registered.
+
+        Fails closed on ALREADY_SUBMITTED (HTTP 409): in-flight lock must NOT be released.
         """
         clean_match = match_uuid.strip()
         clean_key = backlog_item_key.strip()
         now = time.time()
-        err_val = error_code or error_message
+        err_val = error_code or error_message or ""
+
+        if error_code == "ALREADY_SUBMITTED" or "ALREADY_SUBMITTED" in str(err_val):
+            raise ValueError(
+                f"Cannot transition {clean_key} to REJECTED on ALREADY_SUBMITTED (HTTP 409). "
+                "In-flight lock must be retained; call record_already_submitted instead."
+            )
+
+        existing = self.get_entry(clean_match, clean_key)
+        if existing and existing["state"] == "ALREADY_SUBMITTED":
+            raise ValueError(
+                f"Cannot transition {clean_key} to REJECTED: entry is in ALREADY_SUBMITTED lock. "
+                "Reconciliation against server records is required."
+            )
 
         with self.conn:
             self.conn.execute(
@@ -309,3 +377,7 @@ class SubmissionJournal:
                 """,
                 (http_code, err_val, now, clean_match, clean_key),
             )
+
+
+__all__ = ["SubmissionJournal"]
+

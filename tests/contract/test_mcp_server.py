@@ -291,7 +291,7 @@ def test_mcp_server_start_and_submit(mock_gm_server, offline_git_env, tmp_path):
     proc.wait(timeout=5)
 
 
-def test_mcp_server_prepare_game_pipeline(offline_git_env, tmp_path):
+def test_mcp_server_prepare_game_pipeline(mock_gm_server, offline_git_env, tmp_path):
     """P0.5: Verifies PREPARE_GAME generates PROJECT_MAP.md outside repo and emits ENVIRONMENT_READY."""
     proc = subprocess.Popen(
         [sys.executable, "-m", "runner.mcp_server"],
@@ -304,7 +304,19 @@ def test_mcp_server_prepare_game_pipeline(offline_git_env, tmp_path):
 
     log_file = tmp_path / "prep.progress.ndjson"
     checkout_dir = offline_git_env["checkout_dir"]
-    match_code = "ABCD1234"
+    match_code = mock_gm_server.match_code
+    repo_url = "https://github.com/example/repo.git"
+    offline_git_env["set_remote_url"](repo_url)
+    (checkout_dir / match_code).mkdir(parents=True, exist_ok=True)
+
+    env_req = checkout_dir / "env-require"
+    env_req.mkdir(parents=True, exist_ok=True)
+    if sys.platform.startswith("win"):
+        (env_req / "doctor.ps1").write_text("Write-Output 'Environment status: READY'\nexit 0\n", encoding="utf-8")
+    else:
+        doc_sh = env_req / "doctor.sh"
+        doc_sh.write_text("#!/bin/sh\necho 'Environment status: READY'\nexit 0\n", encoding="utf-8")
+        doc_sh.chmod(0o755)
 
     cfg_req = {
         "jsonrpc": "2.0",
@@ -321,8 +333,12 @@ def test_mcp_server_prepare_game_pipeline(offline_git_env, tmp_path):
                     "progressLogFile": str(log_file),
                     "checkoutRoot": str(checkout_dir),
                     "matchRoot": str(checkout_dir),
+                    "username": "example-account",
+                    "password": "fake-password-for-example",
+                    "matchPageUrl": f"{mock_gm_server.base_url}/match/{match_code}",
+                    "allowedMatchOrigins": [mock_gm_server.base_url],
                     "repository": {
-                        "url": "https://github.com/example/repo.git",
+                        "url": repo_url,
                         "branch": "main",
                         "folder": match_code,
                     },
@@ -431,11 +447,14 @@ def test_mcp_server_waves_and_wait_for_update(mock_gm_server, offline_git_env, t
     proc.wait(timeout=5)
 
 
-def test_mcp_server_prepare_game_fails_on_broken_doctor(offline_git_env, tmp_path):
+def test_mcp_server_prepare_game_fails_on_broken_doctor(mock_gm_server, offline_git_env, tmp_path):
     """R1: If doctor.ps1 or build command exits non-zero, PREPARE_GAME fails closed and emits no ENVIRONMENT_READY."""
     checkout_dir = offline_git_env["checkout_dir"]
-    match_code = "ABCD1234"
+    match_code = mock_gm_server.match_code
     log_file = tmp_path / "broken_prep.progress.ndjson"
+    repo_url = "https://github.com/example/repo.git"
+    offline_git_env["set_remote_url"](repo_url)
+    (checkout_dir / match_code).mkdir(parents=True, exist_ok=True)
 
     # Create a failing doctor.ps1 in env-require
     env_req = checkout_dir / "env-require"
@@ -477,8 +496,12 @@ def test_mcp_server_prepare_game_fails_on_broken_doctor(offline_git_env, tmp_pat
                     "progressLogFile": str(log_file),
                     "checkoutRoot": str(checkout_dir),
                     "matchRoot": str(checkout_dir),
+                    "username": "example-account",
+                    "password": "fake-password-for-example",
+                    "matchPageUrl": f"{mock_gm_server.base_url}/match/{match_code}",
+                    "allowedMatchOrigins": [mock_gm_server.base_url],
                     "repository": {
-                        "url": "https://github.com/example/repo.git",
+                        "url": repo_url,
                         "branch": "main",
                         "folder": match_code,
                     },

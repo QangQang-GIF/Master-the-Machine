@@ -19,6 +19,7 @@ import os
 import subprocess
 import sys
 import time
+import urllib.parse
 import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -31,6 +32,7 @@ for _p in [str(_pack_root), str(_src_dir)]:
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
+from mtm_competition.adapters.base import validate_match_projection_schema
 from mtm_competition.adapters.official_game_master import OfficialGameMasterAdapter
 from mtm_competition.integration.git_guard import PreSubmissionGitGuard
 from mtm_competition.tasks.journal import SubmissionJournal
@@ -59,6 +61,12 @@ class MCPHelperServer:
         self.telemetry: Optional[TelemetryLogger] = None
         self.checkout_root: Path = self.workspace_root
         self.match_root: Path = self.workspace_root
+        self.username: Optional[str] = None
+        self.password: Optional[str] = None
+        self.match_page_url: Optional[str] = None
+        self.allowed_match_origins: Optional[List[str]] = None
+        self.repo_descriptor: Dict[str, Any] = {}
+        self.current_wave: int = 1
         self.known_backlog_items: Dict[str, Dict[str, Any]] = {}
         self.match_state: str = "IN_PROGRESS"
         self.running: bool = True
@@ -78,8 +86,17 @@ class MCPHelperServer:
         if session_id:
             self.player_session_id = str(session_id)
 
-        # Assigned branch resolution: require repository.branch, fail closed on missing branch
+        # Store session credentials and match page URL from descriptor
+        self.username = descriptor.get("username")
+        self.password = descriptor.get("password")
+        self.match_page_url = descriptor.get("matchPageUrl") or descriptor.get("match_page_url")
+        self.allowed_match_origins = descriptor.get("allowedMatchOrigins") or descriptor.get("allowed_origins") or descriptor.get("allowedOrigins")
+
+        # Repository descriptor
         repo_info = descriptor.get("repository") or {}
+        self.repo_descriptor = repo_info
+
+        # Assigned branch resolution: require repository.branch, fail closed on missing branch
         assigned_branch = (
             repo_info.get("branch")
             or descriptor.get("assignedBranch")
@@ -119,19 +136,33 @@ class MCPHelperServer:
         )
 
         # Adapter
+        # Separate browser/cookie authentication (PREPARE_GAME) from bearer key API authentication (START_GAME)
+        is_prepare = (descriptor.get("type") == "PREPARE_GAME")
+        if not is_prepare:
+            self.bearer_token = (
+                descriptor.get("apiKeySecret")
+                or descriptor.get("bearerToken")
+                or descriptor.get("runtimeTeamKey")
+                or ""
+            )
+        else:
+            self.bearer_token = ""
+
+        base_from_page = ""
+        if self.match_page_url:
+            parsed_u = urllib.parse.urlparse(self.match_page_url)
+            if parsed_u.scheme and parsed_u.netloc:
+                base_from_page = f"{parsed_u.scheme}://{parsed_u.netloc}"
+
         self.api_url = (
             descriptor.get("gameMasterApiUrl")
             or descriptor.get("gameMasterUrl")
             or descriptor.get("baseUrl")
+            or base_from_page
             or descriptor.get("origin")
             or "https://ai-fest-five.vercel.app"
         ).rstrip("/")
-        self.bearer_token = (
-            descriptor.get("apiKeySecret")
-            or descriptor.get("bearerToken")
-            or descriptor.get("runtimeTeamKey")
-            or ""
-        )
+
         self.adapter = OfficialGameMasterAdapter(
             base_url=self.api_url,
             auth_token=self.bearer_token,
@@ -164,22 +195,19 @@ class MCPHelperServer:
 
         # PREPARE_GAME Pipeline (R1 & R5)
         if descriptor.get("type") == "PREPARE_GAME":
+            is_offline = bool(descriptor.get("offline"))
             self.telemetry.emit_orchestrator_started("Team Orchestrator started in preparation phase.")
 
-            # 1. Genuine Git Checkout & Branch Verification (R1)
-            git_valid = False
-            head_sha = "0" * 40
-            if (self.checkout_root / ".git").exists():
-                from mtm_core.git import get_head_sha
-                head_sha = get_head_sha(self.checkout_root) or ("0" * 40)
-                if len(head_sha) >= 40 and head_sha != "0" * 40:
-                    git_valid = True
+            # 1. Genuine Git Invariants Verification (R2)
+            try:
+                from mtm_core.git import verify_assigned_repository
+                repo_res = verify_assigned_repository(self.checkout_root, repo_info or descriptor)
+                head_sha = repo_res.get("head_sha", "0" * 40)
+                self.telemetry.emit_preparation_status("REPOSITORY", "COMPLETED", "Assigned repository and branch verified.")
+            except Exception as exc:
+                self.telemetry.emit_preparation_status("REPOSITORY", "FAILED", f"Git repository verification failed: {exc}")
+                raise RuntimeError(f"PREPARE_GAME failed: Git verification failed: {exc}") from exc
 
-            if not git_valid:
-                self.telemetry.emit_preparation_status("REPOSITORY", "FAILED", f"Git directory or commit invalid in {self.checkout_root}")
-                raise RuntimeError(f"PREPARE_GAME failed: Invalid Git repository or HEAD commit in {self.checkout_root}")
-
-            self.telemetry.emit_preparation_status("REPOSITORY", "COMPLETED", "Assigned repository and branch verified.")
             self.telemetry.emit_preparation_status("ENVIRONMENT", "IN_PROGRESS", "Bootstrapping knowledge and verifying environment doctor.")
 
             # 2. Knowledge bootstrap into state/<matchCode>/knowledge/PROJECT_MAP.md (outside repo)
@@ -207,16 +235,21 @@ class MCPHelperServer:
                 app_root=app_root,
             )
 
-            # 3. Locate and execute genuine environment doctor or build command (R1)
+            # 3. Locate and execute genuine environment doctor or build command (R6)
             tech = detect_tech_stack(app_root, match_root=self.match_root)
             doc_file = None
             for cand in [
                 self.match_root / "env-require" / "doctor.ps1",
                 self.match_root / "doctor.ps1",
+                self.checkout_root / "env-require" / "doctor.ps1",
+                self.checkout_root / "doctor.ps1",
                 app_root / "env-require" / "doctor.ps1",
                 app_root / "doctor.ps1",
                 self.match_root / "env-require" / "doctor.sh",
                 self.match_root / "doctor.sh",
+                self.checkout_root / "env-require" / "doctor.sh",
+                self.checkout_root / "doctor.sh",
+                app_root / "env-require" / "doctor.sh",
                 app_root / "doctor.sh",
             ]:
                 if cand.exists():
@@ -224,13 +257,15 @@ class MCPHelperServer:
                     break
 
             build_pass = False
-            build_exit_code = 0
+            build_exit_code = 1
+            fail_reason = ""
+
             if doc_file:
-                cwd_run = self.match_root
+                cwd_run = doc_file.parent.parent if doc_file.parent.name == "env-require" else doc_file.parent
                 if doc_file.suffix == ".ps1":
                     cmd_run = f'powershell.exe -ExecutionPolicy Bypass -File "{doc_file}"'
                 else:
-                    cmd_run = f'bash "{doc_file}"'
+                    cmd_run = f'bash "{doc_file}"' if not sys.platform.startswith("win") else f'sh "{doc_file}"'
                 try:
                     res = subprocess.run(
                         cmd_run,
@@ -242,10 +277,19 @@ class MCPHelperServer:
                         check=False,
                     )
                     build_exit_code = res.returncode
-                    build_pass = (res.returncode == 0)
-                except Exception:
+                    doc_output = (res.stdout or "") + "\n" + (res.stderr or "")
+                    has_ready = "Environment status: READY" in doc_output
+                    if res.returncode == 0 and has_ready:
+                        build_pass = True
+                    else:
+                        fail_reason = (
+                            f"Doctor script exited with code {res.returncode}; "
+                            f"'Environment status: READY' in output: {has_ready}"
+                        )
+                except Exception as exc:
                     build_pass = False
                     build_exit_code = 1
+                    fail_reason = f"Execution error running doctor script: {exc}"
             else:
                 v_cmd = tech.get("Build command") or tech.get("Typecheck command")
                 if v_cmd and not v_cmd.startswith("default "):
@@ -260,14 +304,18 @@ class MCPHelperServer:
                             check=False,
                         )
                         build_exit_code = res.returncode
-                        build_pass = (res.returncode == 0)
-                    except Exception:
+                        if res.returncode == 0:
+                            build_pass = True
+                        else:
+                            fail_reason = f"Build command '{v_cmd}' exited with code {res.returncode}"
+                    except Exception as exc:
                         build_pass = False
                         build_exit_code = 1
+                        fail_reason = f"Execution error running build command: {exc}"
                 else:
-                    # In minimal or test offline repo without custom scripts, verification passes if git checkout is clean
-                    build_pass = True
-                    build_exit_code = 0
+                    build_pass = False
+                    build_exit_code = 1
+                    fail_reason = "No doctor script (doctor.ps1/doctor.sh) or valid build command found in repository"
 
             # Record verified status in PROJECT_MAP.md
             bootstrap.generate_project_map(
@@ -277,21 +325,45 @@ class MCPHelperServer:
             )
 
             if not build_pass:
-                self.telemetry.emit_preparation_status("BUILD", "FAILED", f"Environment build verification failed with exit code {build_exit_code}")
-                raise RuntimeError(f"PREPARE_GAME failed: Environment verification command exited with code {build_exit_code}")
+                self.telemetry.emit_preparation_status("BUILD", "FAILED", f"Environment build verification failed: {fail_reason}")
+                raise RuntimeError(f"PREPARE_GAME failed: Environment verification failed: {fail_reason}")
 
             self.telemetry.emit_preparation_status("BUILD", "COMPLETED", "Environment build verified.")
 
-            # 4. Verify Match Login credentials (R1)
-            has_credentials = bool(self.bearer_token or descriptor.get("apiKeySecret") or descriptor.get("gameMasterApiUrl"))
-            if self.adapter and has_credentials:
-                try:
-                    self.login_match()
-                except Exception as exc:
-                    self.telemetry.emit_preparation_status("MATCH_LOGIN", "FAILED", f"Match login verification failed: {exc}")
-                    raise RuntimeError(f"PREPARE_GAME failed: Match login verification failed: {exc}") from exc
+            # 4. Genuine Session Match Authentication (R1)
+            username = self.username or descriptor.get("username")
+            password = self.password or descriptor.get("password")
+            match_page_url = self.match_page_url or descriptor.get("matchPageUrl")
+            allowed_origins = self.allowed_match_origins or descriptor.get("allowedMatchOrigins") or descriptor.get("allowedOrigins")
 
-            self.telemetry.emit_preparation_status("MATCH_LOGIN", "COMPLETED", "Match credentials verified.")
+            if is_offline:
+                self.telemetry.emit_preparation_status("MATCH_LOGIN", "COMPLETED", "Match credentials verified (offline test mode).")
+            else:
+                if not username or not password or not match_page_url or not self.adapter:
+                    missing = [f for f, v in [("username", username), ("password", password), ("matchPageUrl", match_page_url)] if not v]
+                    self.telemetry.emit_preparation_status("MATCH_LOGIN", "FAILED", f"Missing required PREPARE_GAME fields: {', '.join(missing)}")
+                    raise RuntimeError(f"PREPARE_GAME failed: Missing required authentication fields: {', '.join(missing)}")
+
+                try:
+                    auth_res = self.adapter.login_session(
+                        username=username,
+                        password=password,
+                        match_page_url=match_page_url,
+                        allowed_origins=allowed_origins,
+                    )
+                    if auth_res.get("status") != "AUTHENTICATED":
+                        raise RuntimeError(f"login_session returned non-authenticated status: {auth_res.get('status')}")
+                    proj = auth_res.get("projection") or {}
+                    if proj.get("matchUuid"):
+                        self.match_uuid = str(proj["matchUuid"])
+                        self.adapter.match_uuid = self.match_uuid
+                    if proj.get("matchCode") and not self.match_code:
+                        self.match_code = str(proj["matchCode"])
+                except Exception as exc:
+                    self.telemetry.emit_preparation_status("MATCH_LOGIN", "FAILED", f"Match session login verification failed: {exc}")
+                    raise RuntimeError(f"PREPARE_GAME failed: Match session login verification failed: {exc}") from exc
+
+                self.telemetry.emit_preparation_status("MATCH_LOGIN", "COMPLETED", "Match credentials verified.")
 
             # 5. Emit ENVIRONMENT_READY only when all 3 gates have genuinely passed!
             self.telemetry.emit_environment_ready(
@@ -343,31 +415,65 @@ class MCPHelperServer:
         }
 
     def refresh_match(self) -> Dict[str, Any]:
-        """Read public match projection and discover open backlog items (waves)."""
+        """Read public match projection, validate schema, and track wave releases (waves 1..3)."""
         if not self.adapter:
             raise RuntimeError("Session not configured. Call configure_session first.")
 
         newly_discovered: List[str] = []
-        has_credentials = bool(self.bearer_token or self.descriptor.get("apiKeySecret") or self.descriptor.get("gameMasterApiUrl") or self.descriptor.get("baseUrl"))
+        has_credentials = bool(self.bearer_token or self.descriptor.get("apiKeySecret") or self.descriptor.get("gameMasterApiUrl") or self.descriptor.get("baseUrl") or self.match_page_url)
         is_offline = bool(self.descriptor.get("offline") or not has_credentials)
 
         try:
             projection = self.adapter.get_match_projection(self.match_code or self.match_uuid)
+            projection = validate_match_projection_schema(projection)
         except Exception as exc:
             if not is_offline:
                 raise RuntimeError(f"Failed to refresh match projection for {self.match_code}: {exc}") from exc
             else:
                 sys.stderr.write(f"Offline fallback for refresh_match: {exc}\n")
-                projection = {"status": self.match_state, "backlogItems": []}
+                projection = {
+                    "matchUuid": self.match_uuid or "offline-match-uuid",
+                    "matchCode": self.match_code or "offline-match-code",
+                    "status": self.match_state or "IN_PROGRESS",
+                    "wave": self.current_wave,
+                    "backlogItems": [],
+                }
+                projection = validate_match_projection_schema(projection)
 
         self.match_state = projection.get("status", self.match_state or "IN_PROGRESS")
         if not self.match_uuid and projection.get("matchUuid"):
             self.match_uuid = projection.get("matchUuid")
             self.adapter.match_uuid = self.match_uuid
 
+        # Track waves: Wave 2 at min 14 (840s), Wave 3 at min 29 (1740s)
+        proj_wave = projection.get("wave")
+        if proj_wave is not None:
+            try:
+                self.current_wave = max(self.current_wave, int(proj_wave))
+            except (ValueError, TypeError):
+                pass
+        else:
+            try:
+                state = self.adapter.get_match_state()
+                elapsed_sec = state.get("elapsedSeconds") or state.get("elapsed_seconds") or state.get("duration")
+                if elapsed_sec is not None:
+                    if elapsed_sec >= 1740:
+                        self.current_wave = max(self.current_wave, 3)
+                    elif elapsed_sec >= 840:
+                        self.current_wave = max(self.current_wave, 2)
+            except Exception:
+                pass
+
         items = projection.get("backlogItems", [])
         for item in items:
             if isinstance(item, dict):
+                item_wave = item.get("wave")
+                if item_wave is not None:
+                    try:
+                        self.current_wave = max(self.current_wave, int(item_wave))
+                    except (ValueError, TypeError):
+                        pass
+
                 key = item.get("id") or item.get("backlogItemKey") or item.get("key")
                 if key and str(key) not in self.known_backlog_items:
                     key_str = str(key)
@@ -388,6 +494,7 @@ class MCPHelperServer:
             "status": self.match_state,
             "matchUuid": self.match_uuid,
             "matchCode": self.match_code,
+            "wave": self.current_wave,
             "backlogItems": list(self.known_backlog_items.values()),
             "newlyDiscovered": newly_discovered,
         }
@@ -595,13 +702,24 @@ class MCPHelperServer:
 
             # Distinguish deterministic 4xx rejection (excluding 429) from unknown outcome (timeouts, 5xx)
             if status_code is not None and 400 <= status_code < 500 and status_code != 429:
-                self.journal.record_rejection(
-                    match_uuid=self.match_uuid,
-                    backlog_item_key=backlog_item_key,
-                    http_code=status_code,
-                    error_code=err_code,
-                    error_message=str(exc),
-                )
+                err_code_str = str(err_code or "")
+                if status_code == 409 and ("already_submitted" in err_code_str.lower() or "already submitted" in str(exc).lower()):
+                    # R5: 409 ALREADY_SUBMITTED retains in-flight lock, requiring reconciliation against server records
+                    self.journal.record_already_submitted(
+                        match_uuid=self.match_uuid,
+                        backlog_item_key=backlog_item_key,
+                        http_code=status_code,
+                        error_code=err_code or "ALREADY_SUBMITTED",
+                        error_message=str(exc),
+                    )
+                else:
+                    self.journal.record_rejection(
+                        match_uuid=self.match_uuid,
+                        backlog_item_key=backlog_item_key,
+                        http_code=status_code,
+                        error_code=err_code,
+                        error_message=str(exc),
+                    )
 
             if self.telemetry:
                 self.telemetry.emit_game_master_api(
@@ -643,12 +761,14 @@ class MCPHelperServer:
         while elapsed_ms < bounded_ms:
             # Poll match state and waves
             if self.adapter:
+                old_wave = self.current_wave
                 res = self.refresh_match()
                 new_items = res.get("newlyDiscovered", [])
-                if new_items:
+                if new_items or self.current_wave > old_wave:
                     return {
                         "status": "UPDATED",
                         "matchState": self.match_state,
+                        "wave": self.current_wave,
                         "newItems": new_items,
                         "elapsedMs": int((time.time() - start_time) * 1000),
                     }

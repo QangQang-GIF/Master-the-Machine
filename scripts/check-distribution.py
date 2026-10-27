@@ -27,20 +27,21 @@ def fail(msg: str) -> None:
     sys.exit(1)
 
 
-def verify_distribution(base_dir: Path) -> None:
-    # Resolve pack directory and workspace directory (R3 layout parity)
-    if (base_dir / "team-sdlc-pack" / "team-runtime.json").exists():
-        ws_dir = base_dir
-        pack_dir = base_dir / "team-sdlc-pack"
-    elif (base_dir / "team-runtime.json").exists():
-        pack_dir = base_dir
-        ws_dir = base_dir
-    elif base_dir.name == "team-sdlc-pack":
-        pack_dir = base_dir
-        ws_dir = base_dir.parent
+def verify_distribution(ws_dir: Path, pack_dir: Path | None = None) -> None:
+    ws_dir = ws_dir.resolve()
+    if pack_dir is not None:
+        pack_dir = pack_dir.resolve()
     else:
-        pack_dir = base_dir
-        ws_dir = base_dir
+        # Resolve pack directory and workspace directory (R3 layout parity)
+        if (ws_dir / "team-sdlc-pack" / "team-runtime.json").exists():
+            pack_dir = ws_dir / "team-sdlc-pack"
+        elif (ws_dir / "team-runtime.json").exists():
+            pack_dir = ws_dir
+        elif ws_dir.name == "team-sdlc-pack":
+            pack_dir = ws_dir
+            ws_dir = ws_dir.parent
+        else:
+            pack_dir = ws_dir / "team-sdlc-pack"
 
     # 1. team-runtime.json
     runtime_path = pack_dir / "team-runtime.json"
@@ -66,13 +67,18 @@ def verify_distribution(base_dir: Path) -> None:
 
     # 1b. Parity check with .mtm/team-runtime.json
     mtm_runtime = ws_dir / ".mtm" / "team-runtime.json"
-    if mtm_runtime.exists():
-        try:
-            mtm_data = json.loads(mtm_runtime.read_text(encoding="utf-8"))
-            if mtm_data.get("version") != runtime.get("version"):
-                fail(f"Manifest version mismatch between team-sdlc-pack and .mtm/ ({runtime.get('version')} vs {mtm_data.get('version')})")
-        except Exception as exc:
-            fail(f"Invalid JSON in .mtm/team-runtime.json: {exc}")
+    if not mtm_runtime.exists():
+        fail(f"Missing mandatory manifest at {mtm_runtime}")
+    try:
+        mtm_data = json.loads(mtm_runtime.read_text(encoding="utf-8"))
+    except Exception as exc:
+        fail(f"Corrupted or invalid JSON in {mtm_runtime}: {exc}")
+
+    for field in ["schemaVersion", "kind", "name", "version", "protocolVersion", "provider"]:
+        if mtm_data.get(field) != runtime.get(field):
+            fail(f"Manifest mismatch in .mtm/team-runtime.json field '{field}': '{mtm_data.get(field)}' vs '{runtime.get(field)}'")
+    if mtm_data.get("entrypoint") != runtime.get("entrypoint"):
+        fail(f"Manifest mismatch in .mtm/team-runtime.json 'entrypoint': {mtm_data.get('entrypoint')} vs {runtime.get('entrypoint')}")
 
     # 2. team-pack-info.json
     info_path = pack_dir / "team-pack-info.json"
@@ -98,23 +104,51 @@ def verify_distribution(base_dir: Path) -> None:
 
     # 2b. Parity check with .mtm/team-pack-info.json
     mtm_info = ws_dir / ".mtm" / "team-pack-info.json"
-    if mtm_info.exists():
-        try:
-            mtm_info_data = json.loads(mtm_info.read_text(encoding="utf-8"))
-            if mtm_info_data.get("teamId") != info.get("teamId"):
-                fail("teamId mismatch between team-sdlc-pack and .mtm/")
-        except Exception as exc:
-            fail(f"Invalid JSON in .mtm/team-pack-info.json: {exc}")
+    if not mtm_info.exists():
+        fail(f"Missing mandatory manifest at {mtm_info}")
+    try:
+        mtm_info_data = json.loads(mtm_info.read_text(encoding="utf-8"))
+    except Exception as exc:
+        fail(f"Corrupted or invalid JSON in {mtm_info}: {exc}")
 
-    # 2c. Root package.json check (R3)
-    if ws_dir != pack_dir and (ws_dir / "team-sdlc-pack").exists():
-        ws_pkg = ws_dir / "package.json"
-        if not ws_pkg.exists():
-            fail(f"Missing root package.json in TeamWorkspace at {ws_pkg}")
-        try:
-            json.loads(ws_pkg.read_text(encoding="utf-8"))
-        except Exception as exc:
-            fail(f"Invalid root package.json at {ws_pkg}: {exc}")
+    for field in ["schemaVersion", "version", "teamId", "teamName"]:
+        if mtm_info_data.get(field) != info.get(field):
+            fail(f"Manifest mismatch in .mtm/team-pack-info.json field '{field}': '{mtm_info_data.get(field)}' vs '{info.get(field)}'")
+
+    # 2c. Root package.json check and files array verification (R3 & R6)
+    ws_pkg = ws_dir / "package.json"
+    if not ws_pkg.exists():
+        fail(f"Missing root package.json in TeamWorkspace at {ws_pkg}")
+    try:
+        pkg_data = json.loads(ws_pkg.read_text(encoding="utf-8"))
+    except Exception as exc:
+        fail(f"Invalid root package.json at {ws_pkg}: {exc}")
+
+    REQUIRED_FILES = [
+        "agents/",
+        "bin/",
+        "config/",
+        "contracts/",
+        "docs/",
+        "install.ps1",
+        "scripts/check-distribution.mjs",
+        "scripts/install.mjs",
+        "skills/",
+        "src/",
+        "README.md",
+        "team-pack-info.json",
+        "team-runtime.json",
+    ]
+    pkg_files = pkg_data.get("files")
+    if not isinstance(pkg_files, list):
+        fail(f"Root package.json at {ws_pkg} must contain a 'files' array")
+    if pkg_files != REQUIRED_FILES:
+        fail(f"Root package.json 'files' array must match Technical Guide specifications exactly.\nExpected: {REQUIRED_FILES}\nGot: {pkg_files}")
+
+    if pkg_data.get("name") != runtime.get("name"):
+        fail(f"Root package.json 'name' mismatch: '{pkg_data.get('name')}' vs runtime '{runtime.get('name')}'")
+    if pkg_data.get("version") != runtime.get("version"):
+        fail(f"Root package.json 'version' mismatch: '{pkg_data.get('version')}' vs runtime '{runtime.get('version')}'")
 
     # 3. Static Provider Profiles
     required_profiles = [
@@ -243,8 +277,11 @@ def verify_distribution(base_dir: Path) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(description="Check MTM player pack distribution")
     parser.add_argument("--team-workspace", dest="team_workspace", default=".", help="Path to team workspace")
+    parser.add_argument("--pack-root", dest="pack_root", default=None, help="Path to runtime pack folder")
     args = parser.parse_args()
-    verify_distribution(Path(args.team_workspace).resolve())
+    ws_path = Path(args.team_workspace).resolve()
+    pack_path = Path(args.pack_root).resolve() if args.pack_root else None
+    verify_distribution(ws_path, pack_path)
 
 
 if __name__ == "__main__":

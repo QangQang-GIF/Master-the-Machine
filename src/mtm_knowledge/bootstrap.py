@@ -284,6 +284,92 @@ class KnowledgeBootstrap:
         else:
             self.app_root = self.match_root
 
+    def verify_environment(self, fail_closed: bool = True) -> Dict[str, Any]:
+        """Verify environment doctor or build command with strict readiness checks.
+
+        Returns dict:
+        - passed (bool): True if doctor exit code == 0 AND "Environment status: READY" in output.
+        - exit_code (int): 0 on success, non-zero on failure.
+        - output (str): combined stdout and stderr.
+        - doctor_file (str | None): path to doctor script if found.
+        """
+        doc_file = None
+        for cand in [
+            self.match_root / "env-require" / "doctor.ps1",
+            self.match_root / "doctor.ps1",
+            self.app_root / "env-require" / "doctor.ps1",
+            self.app_root / "doctor.ps1",
+            self.match_root / "env-require" / "doctor.sh",
+            self.match_root / "doctor.sh",
+            self.app_root / "doctor.sh",
+        ]:
+            if cand.exists():
+                doc_file = cand
+                break
+
+        if not doc_file:
+            tech = detect_tech_stack(self.app_root, match_root=self.match_root)
+            v_cmd = tech.get("Build command") or tech.get("Typecheck command")
+            if v_cmd and not v_cmd.startswith("default "):
+                try:
+                    res = subprocess.run(
+                        v_cmd,
+                        cwd=str(self.app_root),
+                        shell=True,
+                        capture_output=True,
+                        text=True,
+                        timeout=60,
+                        check=False,
+                    )
+                    out = (res.stdout or "") + (res.stderr or "")
+                    passed = (res.returncode == 0)
+                    return {"passed": passed, "exit_code": res.returncode, "output": out, "doctor_file": None}
+                except Exception as exc:
+                    return {"passed": False, "exit_code": 1, "output": str(exc), "doctor_file": None}
+
+            if fail_closed:
+                return {
+                    "passed": False,
+                    "exit_code": 1,
+                    "output": "No doctor script (doctor.ps1/doctor.sh) or valid build command found",
+                    "doctor_file": None,
+                }
+            return {"passed": True, "exit_code": 0, "output": "Default verification bypassed", "doctor_file": None}
+
+        if doc_file.suffix == ".ps1":
+            cmd_run = f'powershell.exe -ExecutionPolicy Bypass -File "{doc_file}"'
+        else:
+            cmd_run = f'bash "{doc_file}"' if not sys.platform.startswith("win") else f'sh "{doc_file}"'
+
+        cwd_run = self.match_root
+        try:
+            res = subprocess.run(
+                cmd_run,
+                cwd=str(cwd_run),
+                shell=True,
+                capture_output=True,
+                text=True,
+                timeout=60,
+                check=False,
+            )
+            combined_output = (res.stdout or "") + (res.stderr or "")
+            ready_found = "Environment status: READY" in combined_output
+            passed = (res.returncode == 0 and ready_found)
+            exit_code = res.returncode if res.returncode != 0 else (0 if passed else 1)
+            return {
+                "passed": passed,
+                "exit_code": exit_code,
+                "output": combined_output,
+                "doctor_file": str(doc_file),
+            }
+        except Exception as exc:
+            return {
+                "passed": False,
+                "exit_code": 1,
+                "output": str(exc),
+                "doctor_file": str(doc_file),
+            }
+
     def generate_project_map(
         self,
         output_path: Path | str,
@@ -323,7 +409,7 @@ class KnowledgeBootstrap:
             v_passed = bool(verification_result.get("passed"))
             v_code = verification_result.get("exit_code", 0 if v_passed else 1)
             discovery_status = "VERIFIED" if v_passed else "FAILED"
-            exit_result_str = f"PASS (exit {v_code})" if v_passed else f"FAIL (exit {v_code})"
+            exit_result_str = f"PASS (exit {v_code}) — Passed (Exit Code: `{v_code}`)" if v_passed else f"FAIL (exit {v_code}) — Failed (Exit Code: `{v_code}`)"
         elif run_verification:
             # Locate doctor script or build/typecheck command
             doc_file = None
@@ -340,21 +426,12 @@ class KnowledgeBootstrap:
                     doc_file = cand
                     break
 
-            cmd_run = None
-            cwd_run = self.match_root
             if doc_file:
                 if doc_file.suffix == ".ps1":
                     cmd_run = f'powershell.exe -ExecutionPolicy Bypass -File "{doc_file}"'
                 else:
                     cmd_run = f'bash "{doc_file}"'
                 cwd_run = self.match_root
-            else:
-                v_cmd = tech.get("Build command") or tech.get("Typecheck command")
-                if v_cmd and not v_cmd.startswith("default "):
-                    cmd_run = v_cmd
-                    cwd_run = self.app_root
-
-            if cmd_run:
                 try:
                     res = subprocess.run(
                         cmd_run,
@@ -365,19 +442,46 @@ class KnowledgeBootstrap:
                         timeout=30,
                         check=False,
                     )
-                    if res.returncode == 0:
+                    combined_output = (res.stdout or "") + (res.stderr or "")
+                    if res.returncode == 0 and "Environment status: READY" in combined_output:
                         discovery_status = "VERIFIED"
-                        exit_result_str = "PASS (exit 0)"
+                        exit_result_str = "PASS (exit 0) — Passed (Exit Code: `0`)"
                     else:
                         discovery_status = "FAILED"
-                        exit_result_str = f"FAIL (exit {res.returncode})"
+                        ret = res.returncode if res.returncode != 0 else 0
+                        exit_result_str = f"FAIL (exit {ret}) — Failed (Exit Code: `{ret}`)"
                 except Exception as exc:
                     discovery_status = "FAILED"
                     exit_result_str = f"FAIL ({exc})"
             else:
-                # No verification command was configured or executed
-                discovery_status = "UNVERIFIED"
-                exit_result_str = "NOT_RUN"
+                v_cmd = tech.get("Build command") or tech.get("Typecheck command")
+                if v_cmd and not v_cmd.startswith("default "):
+                    cmd_run = v_cmd
+                    cwd_run = self.app_root
+                    try:
+                        res = subprocess.run(
+                            cmd_run,
+                            cwd=str(cwd_run),
+                            shell=True,
+                            capture_output=True,
+                            text=True,
+                            timeout=30,
+                            check=False,
+                        )
+                        if res.returncode == 0:
+                            discovery_status = "VERIFIED"
+                            exit_result_str = "PASS (exit 0) — Passed (Exit Code: `0`)"
+                        else:
+                            discovery_status = "FAILED"
+                            exit_result_str = f"FAIL (exit {res.returncode}) — Failed (Exit Code: `{res.returncode}`)"
+                    except Exception as exc:
+                        discovery_status = "FAILED"
+                        exit_result_str = f"FAIL ({exc})"
+                else:
+                    # Fail closed: if no doctor script or valid build command is found, raise RuntimeError
+                    raise RuntimeError(
+                        "Environment verification failed: No doctor script (doctor.ps1/doctor.sh) or valid build command found."
+                    )
         else:
             # No verification executed
             discovery_status = "UNVERIFIED"

@@ -11,14 +11,31 @@ import process from 'node:process';
 
 function parseArgs() {
   const args = process.argv.slice(2);
-  let baseDir = process.cwd();
+  let teamWorkspace = process.cwd();
+  let packRoot = null;
   for (let i = 0; i < args.length; i++) {
     if (args[i] === '--team-workspace' && i + 1 < args.length) {
-      baseDir = args[i + 1];
+      teamWorkspace = args[i + 1];
+      i++;
+    } else if (args[i] === '--pack-root' && i + 1 < args.length) {
+      packRoot = args[i + 1];
       i++;
     }
   }
-  return path.resolve(baseDir);
+  const wsDir = path.resolve(teamWorkspace);
+  let packDir = packRoot ? path.resolve(packRoot) : null;
+  if (!packDir) {
+    if (fs.existsSync(path.join(wsDir, 'team-sdlc-pack', 'team-runtime.json'))) {
+      packDir = path.join(wsDir, 'team-sdlc-pack');
+    } else if (fs.existsSync(path.join(wsDir, 'team-runtime.json'))) {
+      packDir = wsDir;
+    } else if (path.basename(wsDir) === 'team-sdlc-pack') {
+      packDir = wsDir;
+    } else {
+      packDir = path.join(wsDir, 'team-sdlc-pack');
+    }
+  }
+  return { wsDir, packDir };
 }
 
 function fail(msg) {
@@ -26,9 +43,9 @@ function fail(msg) {
   process.exit(1);
 }
 
-function verifyDistribution(baseDir) {
+function verifyDistribution(wsDir, packDir) {
   // 1. team-runtime.json
-  const runtimePath = path.join(baseDir, 'team-runtime.json');
+  const runtimePath = path.join(packDir, 'team-runtime.json');
   if (!fs.existsSync(runtimePath)) {
     fail(`Missing team-runtime.json at ${runtimePath}`);
   }
@@ -47,8 +64,28 @@ function verifyDistribution(baseDir) {
     fail(`team-runtime.json entrypoint.rootAgentType must be "team_orchestrator"`);
   }
 
+  // 1b. Parity check with .mtm/team-runtime.json
+  const mtmRuntimePath = path.join(wsDir, '.mtm', 'team-runtime.json');
+  if (!fs.existsSync(mtmRuntimePath)) {
+    fail(`Missing mandatory manifest at ${mtmRuntimePath}`);
+  }
+  let mtmData;
+  try {
+    mtmData = JSON.parse(fs.readFileSync(mtmRuntimePath, 'utf8'));
+  } catch (err) {
+    fail(`Corrupted or invalid JSON in ${mtmRuntimePath}: ${err.message}`);
+  }
+  for (const field of ['schemaVersion', 'kind', 'name', 'version', 'protocolVersion', 'provider']) {
+    if (mtmData[field] !== runtime[field]) {
+      fail(`Manifest mismatch in .mtm/team-runtime.json field "${field}": "${mtmData[field]}" vs "${runtime[field]}"`);
+    }
+  }
+  if (JSON.stringify(mtmData.entrypoint) !== JSON.stringify(runtime.entrypoint)) {
+    fail(`Manifest mismatch in .mtm/team-runtime.json "entrypoint"`);
+  }
+
   // 2. team-pack-info.json
-  const infoPath = path.join(baseDir, 'team-pack-info.json');
+  const infoPath = path.join(packDir, 'team-pack-info.json');
   if (!fs.existsSync(infoPath)) {
     fail(`Missing team-pack-info.json at ${infoPath}`);
   }
@@ -68,6 +105,64 @@ function verifyDistribution(baseDir) {
   if (!info.teamId || typeof info.teamId !== 'string') fail(`Invalid teamId in team-pack-info.json`);
   if (!info.teamName || typeof info.teamName !== 'string') fail(`Invalid teamName in team-pack-info.json`);
 
+  // 2b. Parity check with .mtm/team-pack-info.json
+  const mtmInfoPath = path.join(wsDir, '.mtm', 'team-pack-info.json');
+  if (!fs.existsSync(mtmInfoPath)) {
+    fail(`Missing mandatory manifest at ${mtmInfoPath}`);
+  }
+  let mtmInfoData;
+  try {
+    mtmInfoData = JSON.parse(fs.readFileSync(mtmInfoPath, 'utf8'));
+  } catch (err) {
+    fail(`Corrupted or invalid JSON in ${mtmInfoPath}: ${err.message}`);
+  }
+  for (const field of ['schemaVersion', 'version', 'teamId', 'teamName']) {
+    if (mtmInfoData[field] !== info[field]) {
+      fail(`Manifest mismatch in .mtm/team-pack-info.json field "${field}": "${mtmInfoData[field]}" vs "${info[field]}"`);
+    }
+  }
+
+  // 2c. Root package.json check and files array verification (R3 & R6)
+  const wsPkgPath = path.join(wsDir, 'package.json');
+  if (!fs.existsSync(wsPkgPath)) {
+    fail(`Missing root package.json in TeamWorkspace at ${wsPkgPath}`);
+  }
+  let pkgData;
+  try {
+    pkgData = JSON.parse(fs.readFileSync(wsPkgPath, 'utf8'));
+  } catch (err) {
+    fail(`Invalid root package.json at ${wsPkgPath}: ${err.message}`);
+  }
+
+  const REQUIRED_FILES = [
+    'agents/',
+    'bin/',
+    'config/',
+    'contracts/',
+    'docs/',
+    'install.ps1',
+    'scripts/check-distribution.mjs',
+    'scripts/install.mjs',
+    'skills/',
+    'src/',
+    'README.md',
+    'team-pack-info.json',
+    'team-runtime.json'
+  ];
+
+  if (!Array.isArray(pkgData.files)) {
+    fail(`Root package.json at ${wsPkgPath} must contain a 'files' array`);
+  }
+  if (JSON.stringify(pkgData.files) !== JSON.stringify(REQUIRED_FILES)) {
+    fail(`Root package.json 'files' array mismatch.\nExpected: ${JSON.stringify(REQUIRED_FILES)}\nGot: ${JSON.stringify(pkgData.files)}`);
+  }
+  if (pkgData.name !== runtime.name) {
+    fail(`Root package.json 'name' mismatch: "${pkgData.name}" vs runtime "${runtime.name}"`);
+  }
+  if (pkgData.version !== runtime.version) {
+    fail(`Root package.json 'version' mismatch: "${pkgData.version}" vs runtime "${runtime.version}"`);
+  }
+
   // 3. Static Provider Profiles
   const requiredProfiles = [
     'team_orchestrator',
@@ -78,10 +173,13 @@ function verifyDistribution(baseDir) {
 
   for (const prof of requiredProfiles) {
     const candidates = [
-      path.join(baseDir, 'agents', `${prof}.toml`),
-      path.join(baseDir, 'agents', `${prof.replace(/_/g, '-')}.toml`),
-      path.join(baseDir, 'profiles', 'agents', `${prof}.toml`),
-      path.join(baseDir, 'profiles', 'agents', `${prof.replace(/_/g, '-')}.toml`)
+      path.join(packDir, 'agents', `${prof}.toml`),
+      path.join(packDir, 'agents', `${prof.replace(/_/g, '-')}.toml`),
+      path.join(packDir, 'profiles', 'agents', `${prof}.toml`),
+      path.join(packDir, 'profiles', 'agents', `${prof.replace(/_/g, '-')}.toml`),
+      path.join(packDir, '.codex', 'agents', `${prof}.toml`),
+      path.join(wsDir, '.codex', 'agents', `${prof}.toml`),
+      path.join(wsDir, 'agents', `${prof}.toml`)
     ];
     const found = candidates.find(p => fs.existsSync(p));
     if (!found) {
@@ -95,21 +193,23 @@ function verifyDistribution(baseDir) {
   }
 
   // 4. Progress Event Schema
-  const schemaPath = path.join(baseDir, 'schemas', 'progress-event.schema.json');
-  if (fs.existsSync(schemaPath)) {
+  const schemaPath = path.join(packDir, 'schemas', 'progress-event.schema.json');
+  const wsSchemaPath = path.join(wsDir, 'schemas', 'progress-event.schema.json');
+  const targetSchema = fs.existsSync(schemaPath) ? schemaPath : wsSchemaPath;
+  if (fs.existsSync(targetSchema)) {
     try {
-      JSON.parse(fs.readFileSync(schemaPath, 'utf8'));
+      JSON.parse(fs.readFileSync(targetSchema, 'utf8'));
     } catch (err) {
-      fail(`Invalid schema JSON at ${schemaPath}: ${err.message}`);
+      fail(`Invalid schema JSON at ${targetSchema}: ${err.message}`);
     }
   }
 
   // 5. Root Skill Verification (team-orchestrator/SKILL.md)
   const skillCandidates = [
-    path.join(baseDir, 'skills', 'team-orchestrator', 'SKILL.md'),
-    path.join(baseDir, '.agents', 'skills', 'team-orchestrator', 'SKILL.md'),
-    path.join(path.dirname(baseDir), '.agents', 'skills', 'team-orchestrator', 'SKILL.md'),
-    path.join(path.dirname(baseDir), 'skills', 'team-orchestrator', 'SKILL.md'),
+    path.join(packDir, 'skills', 'team-orchestrator', 'SKILL.md'),
+    path.join(packDir, '.agents', 'skills', 'team-orchestrator', 'SKILL.md'),
+    path.join(wsDir, '.agents', 'skills', 'team-orchestrator', 'SKILL.md'),
+    path.join(wsDir, 'skills', 'team-orchestrator', 'SKILL.md'),
   ];
   const skillFound = skillCandidates.find(p => fs.existsSync(p) && fs.statSync(p).size > 50);
   if (!skillFound) {
@@ -120,5 +220,5 @@ function verifyDistribution(baseDir) {
   console.log('READY');
 }
 
-const targetDir = parseArgs();
-verifyDistribution(targetDir);
+const { wsDir, packDir } = parseArgs();
+verifyDistribution(wsDir, packDir);

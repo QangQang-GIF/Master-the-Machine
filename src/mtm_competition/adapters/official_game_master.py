@@ -11,7 +11,13 @@ import urllib.parse
 import urllib.request
 from typing import Any, Dict, List, Optional
 
-from .base import GameMasterAdapter, UUID_REGEX, validate_match_uuid
+from .base import (
+    GameMasterAdapter,
+    UUID_REGEX,
+    validate_match_projection_schema,
+    validate_match_uuid,
+)
+
 
 logger = logging.getLogger("mtm.game_master")
 
@@ -84,7 +90,7 @@ class GameMasterAlreadySubmittedError(GameMasterConflictError):
     pass
 
 
-class GameMasterValidationError(GameMasterAPIError):
+class GameMasterValidationError(GameMasterAPIError, ValueError):
     """422: Validation error (schema, invalid UUID, malformed idempotency key)."""
     pass
 
@@ -155,6 +161,7 @@ class OfficialGameMasterAdapter(GameMasterAdapter):
         self.timeout = timeout
         self.max_retries = max_retries
         self.match_uuid = match_uuid or os.environ.get("MTM_MATCH_UUID", "")
+        self.session_cookies: Dict[str, str] = {}
 
         # Pre-validate base URL for SEC-01 security compliance
         self._validate_url_security(self.api_base_url)
@@ -190,6 +197,10 @@ class OfficialGameMasterAdapter(GameMasterAdapter):
     def _build_url(self, path: str) -> str:
         """Builds normalized URL ensuring base ends with /api/v1 for match wire endpoints,
         and stripping redundant /api/v1 prefixes."""
+        if path.startswith("http://") or path.startswith("https://"):
+            self._validate_url_security(path)
+            return path
+
         base = self.api_base_url.rstrip("/")
         clean_path = "/" + path.lstrip("/")
 
@@ -225,6 +236,14 @@ class OfficialGameMasterAdapter(GameMasterAdapter):
         if self.api_key:
             req_headers["Authorization"] = f"Bearer {self.api_key}"
 
+        # Attach session cookies if available
+        if self.session_cookies:
+            cookie_hdr = "; ".join(f"{k}={v}" for k, v in self.session_cookies.items())
+            if "Cookie" in req_headers:
+                req_headers["Cookie"] = f"{req_headers['Cookie']}; {cookie_hdr}"
+            else:
+                req_headers["Cookie"] = cookie_hdr
+
         # Prohibit forbidden X-Team-ID header (Digital Cuder derives team strictly from Bearer token)
         if headers:
             for k, v in headers.items():
@@ -253,6 +272,24 @@ class OfficialGameMasterAdapter(GameMasterAdapter):
                 )
                 with urllib.request.urlopen(req, timeout=self.timeout) as resp:
                     status_code = getattr(resp, "status", getattr(resp, "code", 200))
+
+                    # Parse and store cookies from response
+                    if hasattr(resp, "headers") and resp.headers:
+                        cookie_hdrs = []
+                        if hasattr(resp.headers, "get_all"):
+                            cookie_hdrs = resp.headers.get_all("Set-Cookie") or []
+                        elif hasattr(resp.headers, "getlist"):
+                            cookie_hdrs = resp.headers.getlist("Set-Cookie") or []
+                        if not cookie_hdrs:
+                            single_sc = resp.headers.get("Set-Cookie")
+                            if single_sc:
+                                cookie_hdrs = [single_sc]
+                        for c in cookie_hdrs:
+                            c_part = c.split(";")[0]
+                            if "=" in c_part:
+                                k, v = c_part.split("=", 1)
+                                self.session_cookies[k.strip()] = v.strip()
+
                     resp_body = resp.read().decode("utf-8")
                     if not resp_body.strip():
                         return {}
@@ -265,7 +302,28 @@ class OfficialGameMasterAdapter(GameMasterAdapter):
                             try:
                                 next_data = json.loads(m.group(1))
                                 page_props = next_data.get("props", {}).get("pageProps", {})
-                                parsed = page_props.get("match") or page_props.get("matchData") or page_props.get("state") or page_props
+                                match_obj = page_props.get("match") or page_props.get("matchData") or page_props.get("state") or {}
+                                team_obj = page_props.get("team") or {}
+                                repo_obj = page_props.get("repository") or page_props.get("assignment") or {}
+                                items = match_obj.get("backlogItems") or page_props.get("backlogItems") or []
+                                wave_timestamps = match_obj.get("waveTimestamps") or page_props.get("waveTimestamps") or {}
+
+                                parsed = {
+                                    "matchUuid": match_obj.get("matchUuid") or match_obj.get("id") or page_props.get("matchUuid") or page_props.get("id"),
+                                    "matchCode": match_obj.get("matchCode") or page_props.get("matchCode"),
+                                    "status": match_obj.get("status") or page_props.get("status") or "IN_PROGRESS",
+                                    "backlogItems": items if isinstance(items, list) else [],
+                                    "waveTimestamps": wave_timestamps,
+                                    "team": team_obj,
+                                    "teamId": team_obj.get("id") or team_obj.get("teamId") or page_props.get("teamId"),
+                                    "teamName": team_obj.get("name") or team_obj.get("teamName") or page_props.get("teamName"),
+                                    "repository": repo_obj,
+                                    "pageProps": page_props,
+                                }
+                                for k, v in page_props.items():
+                                    parsed.setdefault(k, v)
+                                for k, v in match_obj.items():
+                                    parsed.setdefault(k, v)
                             except Exception:
                                 parsed = None
                         else:
@@ -282,6 +340,23 @@ class OfficialGameMasterAdapter(GameMasterAdapter):
                     return parsed
 
             except urllib.error.HTTPError as e:
+                # Capture Set-Cookie headers from HTTP error responses
+                if hasattr(e, "headers") and e.headers:
+                    cookie_hdrs = []
+                    if hasattr(e.headers, "get_all"):
+                        cookie_hdrs = e.headers.get_all("Set-Cookie") or []
+                    elif hasattr(e.headers, "getlist"):
+                        cookie_hdrs = e.headers.getlist("Set-Cookie") or []
+                    if not cookie_hdrs:
+                        single_sc = e.headers.get("Set-Cookie")
+                        if single_sc:
+                            cookie_hdrs = [single_sc]
+                    for c in cookie_hdrs:
+                        c_part = c.split(";")[0]
+                        if "=" in c_part:
+                            k, v = c_part.split("=", 1)
+                            self.session_cookies[k.strip()] = v.strip()
+
                 error_body = e.read().decode("utf-8", errors="replace")
                 parsed_error = {}
                 try:
@@ -368,10 +443,11 @@ class OfficialGameMasterAdapter(GameMasterAdapter):
 
     def get_match_projection(self, match_id_or_code: Optional[str] = None) -> Dict[str, Any]:
         """Fetch public match projection and open backlog items from Game Master.
-        
+
         Authoritative endpoint: /match/<matchId> per Technical Guide Step 9.
         Secondary fallback: /api/v1/matches/<matchUuid>.
-        Fails closed on authentication or connection failure.
+        Strictly validates schema requiring matchUuid (or id), matchCode, and backlogItems list.
+        Fails closed on authentication, validation, or connection failure.
         """
         ident = match_id_or_code or self.match_uuid
         if not ident:
@@ -383,10 +459,8 @@ class OfficialGameMasterAdapter(GameMasterAdapter):
         # 1. Authoritative endpoint: /match/<matchId>
         try:
             res = self._request("GET", f"/match/{clean_ident}")
-            if isinstance(res, dict) and ("backlogItems" in res or "matchUuid" in res or "status" in res or "id" in res):
-                return res
-            if isinstance(res, dict) and res:
-                return res
+            if isinstance(res, dict):
+                return validate_match_projection_schema(res)
         except GameMasterAuthError:
             raise
         except Exception as e:
@@ -395,10 +469,8 @@ class OfficialGameMasterAdapter(GameMasterAdapter):
         # 2. Official API: /api/v1/matches/<matchUuid>
         try:
             res = self._request("GET", f"/api/v1/matches/{clean_ident}")
-            if isinstance(res, dict) and ("backlogItems" in res or "matchUuid" in res or "status" in res or "id" in res):
-                return res
-            if isinstance(res, dict) and res:
-                return res
+            if isinstance(res, dict):
+                return validate_match_projection_schema(res)
         except GameMasterAuthError:
             raise
         except Exception as e:
@@ -406,8 +478,146 @@ class OfficialGameMasterAdapter(GameMasterAdapter):
 
         # 3. If endpoints failed, raise rather than returning unverified default
         if last_error:
-            raise last_error
+            if isinstance(last_error, (GameMasterError, ValueError)):
+                raise last_error
+            raise GameMasterError(f"Could not retrieve match projection for {clean_ident}: {last_error}") from last_error
         raise GameMasterError(f"Could not retrieve match projection for {clean_ident}")
+
+    def login_session(
+        self,
+        username: str,
+        password: str,
+        match_page_url: str,
+        allowed_origins: Optional[List[str]] = None,
+    ) -> Dict[str, Any]:
+        """Authenticate genuine browser/cookie session for PREPARE_GAME.
+
+        1. Validates match_page_url against SEC-01 and allowed_origins whitelist.
+        2. Authenticates against /login or /api/v1/auth/login with username/password, capturing cookies.
+        3. Fetches match page /match/<matchId> using session cookies.
+        4. Validates match projection schema (matchUuid, matchCode, backlogItems).
+        5. Fails closed: raises GameMasterError/RuntimeError if authentication fails.
+
+        Returns:
+            Dict containing {"status": "AUTHENTICATED", "session_token": str, "projection": Dict[str, Any], "cookies": Dict[str, str]}
+        """
+        if not username or not isinstance(username, str) or not username.strip():
+            raise GameMasterAuthError(401, "Username is required for session login")
+        if not password or not isinstance(password, str) or not password.strip():
+            raise GameMasterAuthError(401, "Password is required for session login")
+        if not match_page_url or not isinstance(match_page_url, str) or not match_page_url.strip():
+            raise GameMasterValidationError(422, "match_page_url is required for session login")
+
+        # 1. SEC-01 & allowed_origins validation
+        self._validate_url_security(match_page_url)
+        parsed_page = urllib.parse.urlparse(match_page_url)
+        page_origin = f"{parsed_page.scheme}://{parsed_page.netloc}".rstrip("/")
+
+        if allowed_origins:
+            allowed_normalized = []
+            for o in allowed_origins:
+                o_str = str(o).strip().lower().rstrip("/")
+                if "://" in o_str:
+                    allowed_normalized.append(urllib.parse.urlparse(o_str).netloc.lower())
+                    allowed_normalized.append(o_str)
+                else:
+                    allowed_normalized.append(o_str)
+
+            page_netloc = parsed_page.netloc.lower()
+            if page_netloc not in allowed_normalized and page_origin.lower() not in allowed_normalized:
+                raise GameMasterSecurityError(
+                    f"SEC-01: matchPageUrl origin '{parsed_page.netloc}' not in allowedMatchOrigins: {allowed_origins}"
+                )
+
+        # 2. Authenticate against /login or /api/v1/auth/login or /api/auth/login
+        login_endpoints = [
+            f"{page_origin}/login",
+            f"{page_origin}/api/v1/auth/login",
+            f"{page_origin}/api/auth/login",
+        ]
+
+        login_data = {
+            "username": username.strip(),
+            "password": password.strip(),
+        }
+
+        last_auth_error: Optional[Exception] = None
+        auth_succeeded = False
+        login_response: Dict[str, Any] = {}
+
+        for ep in login_endpoints:
+            try:
+                res = self._request("POST", ep, data=login_data, retries=1)
+                login_response = res if isinstance(res, dict) else {}
+                auth_succeeded = True
+                break
+            except GameMasterAPIError as e:
+                if e.status_code == 404:
+                    last_auth_error = e
+                    continue
+                # If 401, 403, etc., fail closed immediately
+                raise
+            except Exception as e:
+                last_auth_error = e
+                break
+
+        if not auth_succeeded:
+            if last_auth_error:
+                if isinstance(last_auth_error, GameMasterError):
+                    raise last_auth_error
+                raise GameMasterAuthError(
+                    401,
+                    f"Authentication failed across login endpoints: {last_auth_error}",
+                ) from last_auth_error
+            raise GameMasterAuthError(401, "Authentication failed: could not connect to login endpoint")
+
+        # Extract session token from cookies or response body
+        session_token = ""
+        if "session_token" in self.session_cookies:
+            session_token = self.session_cookies["session_token"]
+        elif "token" in self.session_cookies:
+            session_token = self.session_cookies["token"]
+        elif isinstance(login_response, dict):
+            session_token = (
+                login_response.get("token")
+                or login_response.get("session_token")
+                or login_response.get("access_token")
+                or ""
+            )
+            if session_token and "session_token" not in self.session_cookies:
+                self.session_cookies["session_token"] = session_token
+
+        # Check that session cookies exist or token was returned
+        if not self.session_cookies and not session_token:
+            raise GameMasterAuthError(
+                401,
+                "Authentication failed closed: no session cookies or token established by Game Master.",
+            )
+
+        # 3. Fetch match page using session cookies
+        projection_raw = None
+        try:
+            projection_raw = self._request("GET", match_page_url, retries=1)
+        except Exception as e:
+            # Fallback: extract match identifier from match_page_url and call get_match_projection
+            match_id = parsed_page.path.split("/match/")[-1].strip("/") if "/match/" in parsed_page.path else ""
+            if match_id:
+                projection_raw = self.get_match_projection(match_id)
+            else:
+                if isinstance(e, GameMasterError):
+                    raise
+                raise GameMasterError(f"Failed to fetch match page at {match_page_url}: {e}") from e
+
+        # 4. Strictly validate match projection schema
+        validated_projection = validate_match_projection_schema(projection_raw)
+
+        return {
+            "status": "AUTHENTICATED",
+            "session_token": session_token,
+            "projection": validated_projection,
+            "cookies": dict(self.session_cookies),
+        }
+
 
     def get_match_state(self) -> Dict[str, Any]:
         """Fetch current match state (duration, remaining time, status, clock)."""
@@ -638,3 +848,21 @@ class OfficialGameMasterAdapter(GameMasterAdapter):
         """Check grading status (ACCEPTED, GRADING, PASSED, FAILED)."""
         encoded_id = urllib.parse.quote(task_id)
         return self._request("GET", f"/tasks/{encoded_id}/submission")
+
+
+__all__ = [
+    "GameMasterError",
+    "GameMasterConnectionError",
+    "GameMasterAPIError",
+    "GameMasterAuthError",
+    "GameMasterConflictError",
+    "GameMasterIdempotencyConflictError",
+    "GameMasterAlreadySubmittedError",
+    "GameMasterValidationError",
+    "GameMasterRateLimitError",
+    "GameMasterSecurityError",
+    "MVSLockedError",
+    "OfficialGameMasterAdapter",
+    "validate_match_projection_schema",
+]
+

@@ -88,11 +88,17 @@ def verify_remote_ref_sha(repo_path: Path, remote_name: str, branch: str, expect
     return remote_sha.lower() == expected_sha.lower()
 
 
+def set_git_origin_url(repo_path: Path, new_url: str) -> None:
+    """Set or update the origin remote URL in a git repository."""
+    run_git(repo_path, ["remote", "set-url", "origin", new_url])
+
+
 @pytest.fixture
 def offline_git_env(tmp_path: Path) -> Dict[str, Any]:
     """
     Pytest fixture creating an isolated bare remote and cloned working directory.
-    Configures local git identity and initializes main branch with an initial commit.
+    Configures local git identity, adds valid doctor.ps1 in env-require/,
+    and initializes main branch with an initial commit.
     """
     base_dir = tmp_path / "git_env"
     base_dir.mkdir(parents=True, exist_ok=True)
@@ -113,12 +119,36 @@ def offline_git_env(tmp_path: Path) -> Dict[str, Any]:
     (match_root / "app.py").write_text("print('init')\n", encoding="utf-8")
     (match_root / "README.md").write_text("# Project\nInitial readme\n", encoding="utf-8")
 
+    # Add valid environment doctor in env-require/ emitting 'Environment status: READY'
+    match_env_req = match_root / "env-require"
+    match_env_req.mkdir(parents=True, exist_ok=True)
+    (match_env_req / "doctor.ps1").write_text(
+        'Write-Output "Environment status: READY"\nexit 0\n',
+        encoding="utf-8",
+    )
+    (match_env_req / "doctor.sh").write_text(
+        '#!/bin/sh\necho "Environment status: READY"\nexit 0\n',
+        encoding="utf-8",
+    )
+
+    checkout_env_req = checkout_dir / "env-require"
+    checkout_env_req.mkdir(parents=True, exist_ok=True)
+    (checkout_env_req / "doctor.ps1").write_text(
+        'Write-Output "Environment status: READY"\nexit 0\n',
+        encoding="utf-8",
+    )
+    (checkout_env_req / "doctor.sh").write_text(
+        '#!/bin/sh\necho "Environment status: READY"\nexit 0\n',
+        encoding="utf-8",
+    )
+
     run_git(checkout_dir, ["add", "-A"])
-    run_git(checkout_dir, ["commit", "-m", "initial commit"])
+    run_git(checkout_dir, ["commit", "-m", "initial commit with doctor"])
     run_git(checkout_dir, ["branch", "-M", "main"])
     run_git(checkout_dir, ["push", "-u", "origin", "main"])
 
     initial_sha = run_git(checkout_dir, ["rev-parse", "HEAD"]).stdout.strip()
+    remote_url = run_git(checkout_dir, ["remote", "get-url", "origin"]).stdout.strip()
 
     return {
         "base_dir": base_dir,
@@ -127,4 +157,7 @@ def offline_git_env(tmp_path: Path) -> Dict[str, Any]:
         "match_root": match_root,
         "branch": "main",
         "initial_sha": initial_sha,
+        "remote_url": remote_url,
+        "origin_url": remote_url,
+        "set_remote_url": lambda url: set_git_origin_url(checkout_dir, url),
     }

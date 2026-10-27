@@ -28,6 +28,7 @@ worker_result.json
 # Editors
 .vscode/
 .idea/
+.codex/
 
 # AI-Arena environment, cache and heavy dataset files
 AI-Arena/.venv/

@@ -12,6 +12,7 @@ Installs the team pack into the target TeamWorkspace:
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import shutil
 import subprocess
@@ -22,6 +23,16 @@ if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 if hasattr(sys.stderr, "reconfigure"):
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+
+
+def safe_copy2(src: Path, dst: Path) -> None:
+    if src.resolve() != dst.resolve():
+        shutil.copy2(src, dst)
+
+
+def safe_copytree(src: Path, dst: Path) -> None:
+    if src.resolve() != dst.resolve():
+        shutil.copytree(src, dst, dirs_exist_ok=True)
 
 
 def install_pack(source_dir: Path, workspace_dir: Path) -> None:
@@ -41,14 +52,14 @@ def install_pack(source_dir: Path, workspace_dir: Path) -> None:
     for f in files_to_copy:
         src_f = source_dir / f
         if src_f.exists():
-            shutil.copy2(src_f, target_pack_dir / f)
-            shutil.copy2(src_f, ws / ".mtm" / f)
+            safe_copy2(src_f, target_pack_dir / f)
+            safe_copy2(src_f, ws / ".mtm" / f)
 
     # 1b. Install standard root package.json in TeamWorkspace and team-sdlc-pack (R3)
     pkg_json_src = source_dir / "package.json"
     if pkg_json_src.exists():
-        shutil.copy2(pkg_json_src, ws / "package.json")
-        shutil.copy2(pkg_json_src, target_pack_dir / "package.json")
+        safe_copy2(pkg_json_src, ws / "package.json")
+        safe_copy2(pkg_json_src, target_pack_dir / "package.json")
     else:
         root_pkg = {
             "name": "team-sdlc-pack",
@@ -56,6 +67,21 @@ def install_pack(source_dir: Path, workspace_dir: Path) -> None:
             "description": "Master the Machine Team SDLC Pack",
             "private": True,
             "type": "module",
+            "files": [
+                "agents/",
+                "bin/",
+                "config/",
+                "contracts/",
+                "docs/",
+                "install.ps1",
+                "scripts/check-distribution.mjs",
+                "scripts/install.mjs",
+                "skills/",
+                "src/",
+                "README.md",
+                "team-pack-info.json",
+                "team-runtime.json",
+            ],
         }
         (ws / "package.json").write_text(json.dumps(root_pkg, indent=2), encoding="utf-8")
         (target_pack_dir / "package.json").write_text(json.dumps(root_pkg, indent=2), encoding="utf-8")
@@ -75,7 +101,7 @@ def install_pack(source_dir: Path, workspace_dir: Path) -> None:
         src_d = source_dir / d
         if src_d.exists():
             dst_d = target_pack_dir / d
-            shutil.copytree(src_d, dst_d, dirs_exist_ok=True)
+            safe_copytree(src_d, dst_d)
 
     # 3. Setup skills layout: .agents/skills/team-orchestrator/SKILL.md
     ws_agents_skills = ws / ".agents" / "skills"
@@ -85,15 +111,15 @@ def install_pack(source_dir: Path, workspace_dir: Path) -> None:
 
     src_agents_skills = source_dir / ".agents" / "skills"
     if src_agents_skills.exists():
-        shutil.copytree(src_agents_skills, ws_agents_skills, dirs_exist_ok=True)
-        shutil.copytree(src_agents_skills, pack_agents_skills, dirs_exist_ok=True)
+        safe_copytree(src_agents_skills, ws_agents_skills)
+        safe_copytree(src_agents_skills, pack_agents_skills)
 
     src_skills = source_dir / "skills"
     if src_skills.exists():
         for skill_dir in src_skills.iterdir():
             if skill_dir.is_dir():
-                shutil.copytree(skill_dir, ws_agents_skills / skill_dir.name, dirs_exist_ok=True)
-                shutil.copytree(skill_dir, pack_agents_skills / skill_dir.name, dirs_exist_ok=True)
+                safe_copytree(skill_dir, ws_agents_skills / skill_dir.name)
+                safe_copytree(skill_dir, pack_agents_skills / skill_dir.name)
 
     # 4. Setup agent profiles layout: .codex/agents/*.toml
     ws_codex_agents = ws / ".codex" / "agents"
@@ -104,8 +130,8 @@ def install_pack(source_dir: Path, workspace_dir: Path) -> None:
     agents_source = source_dir / "agents"
     if agents_source.exists():
         for toml_f in agents_source.glob("*.toml"):
-            shutil.copy2(toml_f, ws_codex_agents / toml_f.name)
-            shutil.copy2(toml_f, pack_codex_agents / toml_f.name)
+            safe_copy2(toml_f, ws_codex_agents / toml_f.name)
+            safe_copy2(toml_f, pack_codex_agents / toml_f.name)
 
     # 5. Create required state, log, and .mtm storage directories
     (ws / ".mtm").mkdir(parents=True, exist_ok=True)
@@ -139,7 +165,14 @@ PYTHONPATH = "{src_posix}{sep}{target_posix}"
     check_script = target_pack_dir / "scripts" / "check-distribution.py"
     if check_script.exists():
         res = subprocess.run(
-            [sys.executable, str(check_script), "--team-workspace", str(target_pack_dir)],
+            [
+                sys.executable,
+                str(check_script),
+                "--team-workspace",
+                str(ws),
+                "--pack-root",
+                str(target_pack_dir),
+            ],
             capture_output=True,
             text=True,
         )
