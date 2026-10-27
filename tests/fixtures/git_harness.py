@@ -130,6 +130,10 @@ def offline_git_env(tmp_path: Path) -> Dict[str, Any]:
         '#!/bin/sh\necho "Environment status: READY"\nexit 0\n',
         encoding="utf-8",
     )
+    try:
+        (match_env_req / "doctor.sh").chmod(0o755)
+    except Exception:
+        pass
 
     checkout_env_req = checkout_dir / "env-require"
     checkout_env_req.mkdir(parents=True, exist_ok=True)
@@ -141,6 +145,10 @@ def offline_git_env(tmp_path: Path) -> Dict[str, Any]:
         '#!/bin/sh\necho "Environment status: READY"\nexit 0\n',
         encoding="utf-8",
     )
+    try:
+        (checkout_env_req / "doctor.sh").chmod(0o755)
+    except Exception:
+        pass
 
     run_git(checkout_dir, ["add", "-A"])
     run_git(checkout_dir, ["commit", "-m", "initial commit with doctor"])

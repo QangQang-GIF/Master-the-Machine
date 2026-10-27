@@ -10,6 +10,7 @@ import datetime
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -83,19 +84,34 @@ def detect_tech_stack(repo_dir: Path, match_root: Optional[Path] = None) -> Dict
 
     # Locate doctor script from match_root, repo_dir, or env-require/
     doctor_candidates = []
-    if match_root:
+    if sys.platform.startswith("win"):
+        if match_root:
+            doctor_candidates.extend([
+                match_root / "env-require" / "doctor.ps1",
+                match_root / "doctor.ps1",
+                match_root / "env-require" / "doctor.sh",
+                match_root / "doctor.sh",
+            ])
         doctor_candidates.extend([
-            match_root / "env-require" / "doctor.ps1",
-            match_root / "doctor.ps1",
-            match_root / "env-require" / "doctor.sh",
-            match_root / "doctor.sh",
+            repo_dir / "env-require" / "doctor.ps1",
+            repo_dir / "doctor.ps1",
+            repo_dir / "env-require" / "doctor.sh",
+            repo_dir / "doctor.sh",
         ])
-    doctor_candidates.extend([
-        repo_dir / "env-require" / "doctor.ps1",
-        repo_dir / "doctor.ps1",
-        repo_dir / "env-require" / "doctor.sh",
-        repo_dir / "doctor.sh",
-    ])
+    else:
+        if match_root:
+            doctor_candidates.extend([
+                match_root / "env-require" / "doctor.sh",
+                match_root / "doctor.sh",
+                match_root / "env-require" / "doctor.ps1",
+                match_root / "doctor.ps1",
+            ])
+        doctor_candidates.extend([
+            repo_dir / "env-require" / "doctor.sh",
+            repo_dir / "doctor.sh",
+            repo_dir / "env-require" / "doctor.ps1",
+            repo_dir / "doctor.ps1",
+        ])
     found_doc = next((c for c in doctor_candidates if c.exists()), None)
     if found_doc:
         ref_root = match_root or repo_dir
@@ -294,15 +310,28 @@ class KnowledgeBootstrap:
         - doctor_file (str | None): path to doctor script if found.
         """
         doc_file = None
-        for cand in [
-            self.match_root / "env-require" / "doctor.ps1",
-            self.match_root / "doctor.ps1",
-            self.app_root / "env-require" / "doctor.ps1",
-            self.app_root / "doctor.ps1",
-            self.match_root / "env-require" / "doctor.sh",
-            self.match_root / "doctor.sh",
-            self.app_root / "doctor.sh",
-        ]:
+        if sys.platform.startswith("win"):
+            cand_list = [
+                self.match_root / "env-require" / "doctor.ps1",
+                self.match_root / "doctor.ps1",
+                self.app_root / "env-require" / "doctor.ps1",
+                self.app_root / "doctor.ps1",
+                self.match_root / "env-require" / "doctor.sh",
+                self.match_root / "doctor.sh",
+                self.app_root / "doctor.sh",
+            ]
+        else:
+            cand_list = [
+                self.match_root / "env-require" / "doctor.sh",
+                self.match_root / "doctor.sh",
+                self.app_root / "env-require" / "doctor.sh",
+                self.app_root / "doctor.sh",
+                self.match_root / "env-require" / "doctor.ps1",
+                self.match_root / "doctor.ps1",
+                self.app_root / "doctor.ps1",
+            ]
+
+        for cand in cand_list:
             if cand.exists():
                 doc_file = cand
                 break
@@ -337,7 +366,20 @@ class KnowledgeBootstrap:
             return {"passed": True, "exit_code": 0, "output": "Default verification bypassed", "doctor_file": None}
 
         if doc_file.suffix == ".ps1":
-            cmd_run = f'powershell.exe -ExecutionPolicy Bypass -File "{doc_file}"'
+            if sys.platform.startswith("win"):
+                cmd_run = f'powershell.exe -ExecutionPolicy Bypass -File "{doc_file}"'
+            else:
+                pwsh_bin = shutil.which("pwsh") or shutil.which("powershell")
+                if pwsh_bin:
+                    cmd_run = f'"{pwsh_bin}" -File "{doc_file}"'
+                else:
+                    # On Linux without pwsh, try companion .sh if available
+                    sh_companion = doc_file.with_suffix(".sh")
+                    if sh_companion.exists():
+                        doc_file = sh_companion
+                        cmd_run = f'bash "{doc_file}"'
+                    else:
+                        cmd_run = f'bash "{doc_file}"'
         else:
             cmd_run = f'bash "{doc_file}"' if not sys.platform.startswith("win") else f'sh "{doc_file}"'
 
