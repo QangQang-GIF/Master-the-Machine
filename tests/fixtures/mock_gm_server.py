@@ -260,6 +260,11 @@ class MockGameMasterHandler(BaseHTTPRequestHandler):
                 self._send_json(201, data)
 
     def _handle_submission(self, match_uuid: str, raw_body: bytes) -> None:
+        if getattr(self.server, "force_submission_error", None):
+            code, err_code, msg = self.server.force_submission_error
+            self._send_error_envelope(code, err_code, msg)
+            return
+
         if not UUID_REGEX.match(match_uuid):
             self._send_error_envelope(404, "INVALID_MATCH_UUID", "Match identifier must be a valid 36-char UUID")
             return

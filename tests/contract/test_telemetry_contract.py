@@ -174,3 +174,73 @@ def test_log_02_telemetry_event_fields_and_playersessionid(tmp_path: Path):
     }
     with pytest.raises(jsonschema.ValidationError):
         validate_event_object(empty_session_event)
+
+
+def test_log_03_origin_parsing_and_submitted_status_strict_validation(tmp_path: Path):
+    """
+    LOG-03: Verify URL origin parsing with path prefixes and SUBMITTED receipt/revision enforcement.
+    """
+    from runner.telemetry import TelemetryLogger
+
+    log_file = tmp_path / "telemetry_test.ndjson"
+    logger = TelemetryLogger(log_path=log_file, player_session_id="session-strict-01")
+
+    # 1. URL origin parsing retains https://<netloc> even with path prefixes
+    ev_api = logger.emit_game_master_api(
+        operation="SUBMIT",
+        phase="SUCCEEDED",
+        summary="Submitted via API",
+        backlog_id="TASK-01",
+        method="POST",
+        origin="https://ai-fest-five.vercel.app/api/v1",
+        path="/api/v1/matches/abc/submissions",
+        http_status=201,
+        request_id="req-12345",
+    )
+    assert ev_api["origin"] == "https://ai-fest-five.vercel.app"
+
+    # 2. Non-HTTPS origin sanitized to None per schema ^https://[^/?#]+$ pattern
+    ev_http = logger.emit_game_master_api(
+        operation="START",
+        phase="SUCCEEDED",
+        summary="Started local",
+        backlog_id="TASK-01",
+        method="POST",
+        origin="http://127.0.0.1:8080/api/v1",
+        path="/api/v1/matches/abc/backlogs/start",
+        http_status=200,
+    )
+    assert ev_http["origin"] is None
+
+    # 3. SUBMITTED event requires non-empty receipt_id and 40-64 char hex revision
+    with pytest.raises(ValueError, match="SUBMITTED event requires a valid non-empty receiptId"):
+        logger.emit_backlog_status(
+            backlog_id="TASK-01",
+            title="Task 1",
+            status="SUBMITTED",
+            summary="Submitted",
+            receipt_id="",
+            revision="a" * 40,
+        )
+
+    with pytest.raises(ValueError, match="SUBMITTED event requires a valid 40-64 char hex revision"):
+        logger.emit_backlog_status(
+            backlog_id="TASK-01",
+            title="Task 1",
+            status="SUBMITTED",
+            summary="Submitted",
+            receipt_id="receipt-1234",
+            revision="invalid-non-hex-sha",
+        )
+
+    # Valid SUBMITTED event succeeds and validates against schema
+    ev_submitted = logger.emit_backlog_status(
+        backlog_id="TASK-01",
+        title="Task 1",
+        status="SUBMITTED",
+        summary="Submitted successfully",
+        receipt_id="sub-rec-12345",
+        revision="a" * 40,
+    )
+    assert ev_submitted["receiptId"] == "sub-rec-12345"
+    assert ev_submitted["revision"] == "a" * 40

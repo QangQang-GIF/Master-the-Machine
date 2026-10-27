@@ -32,7 +32,8 @@ def install_pack(source_dir: Path, workspace_dir: Path) -> None:
 
     print(f"Installing team pack from {source_dir} to {target_pack_dir}...")
 
-    # 1. Copy key pack manifests
+    # 1. Copy key pack manifests to team-sdlc-pack and mirror to .mtm/
+    (ws / ".mtm").mkdir(parents=True, exist_ok=True)
     files_to_copy = [
         "team-runtime.json",
         "team-pack-info.json",
@@ -41,6 +42,23 @@ def install_pack(source_dir: Path, workspace_dir: Path) -> None:
         src_f = source_dir / f
         if src_f.exists():
             shutil.copy2(src_f, target_pack_dir / f)
+            shutil.copy2(src_f, ws / ".mtm" / f)
+
+    # 1b. Install standard root package.json in TeamWorkspace and team-sdlc-pack (R3)
+    pkg_json_src = source_dir / "package.json"
+    if pkg_json_src.exists():
+        shutil.copy2(pkg_json_src, ws / "package.json")
+        shutil.copy2(pkg_json_src, target_pack_dir / "package.json")
+    else:
+        root_pkg = {
+            "name": "team-sdlc-pack",
+            "version": "1.0.0",
+            "description": "Master the Machine Team SDLC Pack",
+            "private": True,
+            "type": "module",
+        }
+        (ws / "package.json").write_text(json.dumps(root_pkg, indent=2), encoding="utf-8")
+        (target_pack_dir / "package.json").write_text(json.dumps(root_pkg, indent=2), encoding="utf-8")
 
     # 2. Copy directories including src/ (CRITICAL: P0.3 runtime packages)
     dirs_to_copy = [

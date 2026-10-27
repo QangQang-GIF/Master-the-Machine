@@ -444,7 +444,7 @@ class SubmissionGuard:
         status_code = getattr(e, "status_code", None)
         error_code = getattr(e, "error_code", None)
         if status_code is not None and 400 <= status_code < 500 and status_code != 429:
-            self.journal.record_failure(
+            self.journal.record_rejection(
                 match_uuid=target_match_uuid,
                 backlog_item_key=task_id,
                 http_code=status_code,

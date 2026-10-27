@@ -28,8 +28,22 @@ def fail(msg: str) -> None:
 
 
 def verify_distribution(base_dir: Path) -> None:
+    # Resolve pack directory and workspace directory (R3 layout parity)
+    if (base_dir / "team-sdlc-pack" / "team-runtime.json").exists():
+        ws_dir = base_dir
+        pack_dir = base_dir / "team-sdlc-pack"
+    elif (base_dir / "team-runtime.json").exists():
+        pack_dir = base_dir
+        ws_dir = base_dir
+    elif base_dir.name == "team-sdlc-pack":
+        pack_dir = base_dir
+        ws_dir = base_dir.parent
+    else:
+        pack_dir = base_dir
+        ws_dir = base_dir
+
     # 1. team-runtime.json
-    runtime_path = base_dir / "team-runtime.json"
+    runtime_path = pack_dir / "team-runtime.json"
     if not runtime_path.exists():
         fail(f"Missing team-runtime.json at {runtime_path}")
     try:
@@ -50,8 +64,18 @@ def verify_distribution(base_dir: Path) -> None:
     if not isinstance(runtime.get("entrypoint"), dict) or runtime["entrypoint"].get("rootAgentType") != "team_orchestrator":
         fail("team-runtime.json entrypoint.rootAgentType must be 'team_orchestrator'")
 
+    # 1b. Parity check with .mtm/team-runtime.json
+    mtm_runtime = ws_dir / ".mtm" / "team-runtime.json"
+    if mtm_runtime.exists():
+        try:
+            mtm_data = json.loads(mtm_runtime.read_text(encoding="utf-8"))
+            if mtm_data.get("version") != runtime.get("version"):
+                fail(f"Manifest version mismatch between team-sdlc-pack and .mtm/ ({runtime.get('version')} vs {mtm_data.get('version')})")
+        except Exception as exc:
+            fail(f"Invalid JSON in .mtm/team-runtime.json: {exc}")
+
     # 2. team-pack-info.json
-    info_path = base_dir / "team-pack-info.json"
+    info_path = pack_dir / "team-pack-info.json"
     if not info_path.exists():
         fail(f"Missing team-pack-info.json at {info_path}")
     try:
@@ -72,6 +96,26 @@ def verify_distribution(base_dir: Path) -> None:
     if not isinstance(info.get("teamName"), str) or not info["teamName"].strip():
         fail("Invalid teamName in team-pack-info.json")
 
+    # 2b. Parity check with .mtm/team-pack-info.json
+    mtm_info = ws_dir / ".mtm" / "team-pack-info.json"
+    if mtm_info.exists():
+        try:
+            mtm_info_data = json.loads(mtm_info.read_text(encoding="utf-8"))
+            if mtm_info_data.get("teamId") != info.get("teamId"):
+                fail("teamId mismatch between team-sdlc-pack and .mtm/")
+        except Exception as exc:
+            fail(f"Invalid JSON in .mtm/team-pack-info.json: {exc}")
+
+    # 2c. Root package.json check (R3)
+    if ws_dir != pack_dir and (ws_dir / "team-sdlc-pack").exists():
+        ws_pkg = ws_dir / "package.json"
+        if not ws_pkg.exists():
+            fail(f"Missing root package.json in TeamWorkspace at {ws_pkg}")
+        try:
+            json.loads(ws_pkg.read_text(encoding="utf-8"))
+        except Exception as exc:
+            fail(f"Invalid root package.json at {ws_pkg}: {exc}")
+
     # 3. Static Provider Profiles
     required_profiles = [
         "team_orchestrator",
@@ -82,11 +126,13 @@ def verify_distribution(base_dir: Path) -> None:
 
     for prof in required_profiles:
         candidates = [
-            base_dir / "agents" / f"{prof}.toml",
-            base_dir / "agents" / f"{prof.replace('_', '-')}.toml",
-            base_dir / "profiles" / "agents" / f"{prof}.toml",
-            base_dir / "profiles" / "agents" / f"{prof.replace('_', '-')}.toml",
-            base_dir / ".codex" / "agents" / f"{prof}.toml",
+            pack_dir / "agents" / f"{prof}.toml",
+            pack_dir / "agents" / f"{prof.replace('_', '-')}.toml",
+            pack_dir / "profiles" / "agents" / f"{prof}.toml",
+            pack_dir / "profiles" / "agents" / f"{prof.replace('_', '-')}.toml",
+            pack_dir / ".codex" / "agents" / f"{prof}.toml",
+            ws_dir / ".codex" / "agents" / f"{prof}.toml",
+            ws_dir / "agents" / f"{prof}.toml",
         ]
         found = next((p for p in candidates if p.exists()), None)
         if not found:
@@ -98,7 +144,9 @@ def verify_distribution(base_dir: Path) -> None:
             fail(f"Profile at {found} must declare name = '{prof}'")
 
     # 4. Progress Event Schema
-    schema_path = base_dir / "schemas" / "progress-event.schema.json"
+    schema_path = pack_dir / "schemas" / "progress-event.schema.json"
+    if not schema_path.exists():
+        schema_path = ws_dir / "schemas" / "progress-event.schema.json"
     if schema_path.exists():
         try:
             json.loads(schema_path.read_text(encoding="utf-8"))
@@ -107,36 +155,36 @@ def verify_distribution(base_dir: Path) -> None:
 
     # 5. Root Skill Verification (team-orchestrator/SKILL.md)
     skill_candidates = [
-        base_dir / "skills" / "team-orchestrator" / "SKILL.md",
-        base_dir / ".agents" / "skills" / "team-orchestrator" / "SKILL.md",
-        base_dir.parent / ".agents" / "skills" / "team-orchestrator" / "SKILL.md",
-        base_dir.parent / "skills" / "team-orchestrator" / "SKILL.md",
+        pack_dir / "skills" / "team-orchestrator" / "SKILL.md",
+        pack_dir / ".agents" / "skills" / "team-orchestrator" / "SKILL.md",
+        ws_dir / ".agents" / "skills" / "team-orchestrator" / "SKILL.md",
+        ws_dir / "skills" / "team-orchestrator" / "SKILL.md",
     ]
     skill_found = next((s for s in skill_candidates if s.exists() and s.stat().st_size > 50), None)
     if not skill_found:
         fail(f"Missing team-orchestrator/SKILL.md. Checked: {[str(s) for s in skill_candidates]}")
 
     # 6. Runtime Package Import Verification (P0.3)
-    src_dir = base_dir / "src"
+    src_dir = pack_dir / "src"
     if not src_dir.exists():
-        src_dir = base_dir.parent / "src"
+        src_dir = ws_dir / "src"
     if src_dir.exists():
         test_import_code = "import mtm_core; import mtm_competition; import mtm_knowledge; import runner.telemetry; print('OK')"
         env = os.environ.copy()
-        env["PYTHONPATH"] = f"{src_dir}{os.pathsep}{base_dir}{os.pathsep}{env.get('PYTHONPATH', '')}"
+        env["PYTHONPATH"] = f"{src_dir}{os.pathsep}{pack_dir}{os.pathsep}{ws_dir}{os.pathsep}{env.get('PYTHONPATH', '')}"
         res = subprocess.run([sys.executable, "-c", test_import_code], capture_output=True, text=True, env=env)
         if res.returncode != 0:
             fail(f"Runtime packages in src/ failed import test:\n{res.stderr}")
 
     # 7. MCP Server Active Smoke Test (P1)
-    runner_script = base_dir / "runner" / "mcp_server.py"
+    runner_script = pack_dir / "runner" / "mcp_server.py"
     if not runner_script.exists():
-        runner_script = base_dir.parent / "runner" / "mcp_server.py"
+        runner_script = ws_dir / "runner" / "mcp_server.py"
 
     if runner_script.exists():
         smoke_env = os.environ.copy()
         if src_dir.exists():
-            smoke_env["PYTHONPATH"] = f"{src_dir}{os.pathsep}{base_dir}{os.pathsep}{smoke_env.get('PYTHONPATH', '')}"
+            smoke_env["PYTHONPATH"] = f"{src_dir}{os.pathsep}{pack_dir}{os.pathsep}{ws_dir}{os.pathsep}{smoke_env.get('PYTHONPATH', '')}"
 
         proc = subprocess.Popen(
             [sys.executable, str(runner_script)],
@@ -145,7 +193,7 @@ def verify_distribution(base_dir: Path) -> None:
             stderr=subprocess.PIPE,
             text=True,
             env=smoke_env,
-            cwd=str(base_dir),
+            cwd=str(pack_dir),
         )
 
         try:

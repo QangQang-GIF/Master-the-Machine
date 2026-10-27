@@ -210,9 +210,11 @@ class SubmissionJournal:
         return [dict(r) for r in cursor.fetchall()]
 
     def verify_or_abort(self, match_uuid: str, backlog_item_key: str, request_body_bytes: bytes) -> bool:
-        """Check SHA256 against saved attempt; fails closed if body altered."""
+        """Check SHA256 against saved attempt; fails closed if body altered during IN_FLIGHT."""
         entry = self.get_entry(match_uuid.strip(), backlog_item_key.strip())
         if not entry:
+            return True
+        if entry["state"] in ("REJECTED", "FAILED"):
             return True
 
         computed_sha = hashlib.sha256(request_body_bytes).hexdigest()
@@ -275,4 +277,35 @@ class SubmissionJournal:
                 WHERE match_uuid = ? AND backlog_item_key = ?
                 """,
                 (http_code, error_code, now, clean_match, clean_key),
+            )
+
+    def record_rejection(
+        self,
+        match_uuid: str,
+        backlog_item_key: str,
+        http_code: Optional[int] = None,
+        error_code: Optional[str] = None,
+        error_message: Optional[str] = None,
+    ) -> None:
+        """Record explicit server rejection (e.g. 400, 422 VALIDATION_ERROR).
+
+        Transitions state from IN_FLIGHT to REJECTED, releasing the in-flight lock
+        so a corrected payload and new submission attempt can be safely registered.
+        """
+        clean_match = match_uuid.strip()
+        clean_key = backlog_item_key.strip()
+        now = time.time()
+        err_val = error_code or error_message
+
+        with self.conn:
+            self.conn.execute(
+                """
+                UPDATE submission_journal
+                SET state = 'REJECTED',
+                    last_http_code = ?,
+                    last_error_code = ?,
+                    updated_at = ?
+                WHERE match_uuid = ? AND backlog_item_key = ?
+                """,
+                (http_code, err_val, now, clean_match, clean_key),
             )

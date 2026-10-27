@@ -228,6 +228,16 @@ class TelemetryLogger:
             if re.match(r"^[a-f0-9]{40,64}$", s_rev):
                 clean_rev = s_rev
 
+        if status == "SUBMITTED":
+            if not clean_receipt:
+                raise ValueError(
+                    f"SUBMITTED event requires a valid non-empty receiptId matching pattern, got: '{receipt_id}'"
+                )
+            if not clean_rev:
+                raise ValueError(
+                    f"SUBMITTED event requires a valid 40-64 char hex revision SHA, got: '{revision}'"
+                )
+
         return self.log_event({
             "type": "BACKLOG_STATUS",
             "backlogId": backlog_id,
@@ -276,9 +286,10 @@ class TelemetryLogger:
         # Validate origin against schema pattern ^https://[^/?#]+$ or null
         clean_origin = None
         if origin:
-            s_orig = str(origin).strip().rstrip("/")
-            if s_orig.startswith("https://") and not re.search(r"[/?#]", s_orig[8:]):
-                clean_origin = s_orig[:256]
+            from urllib.parse import urlsplit
+            parsed = urlsplit(str(origin).strip())
+            if parsed.scheme == "https" and parsed.netloc:
+                clean_origin = f"https://{parsed.netloc}"[:256]
 
         # Validate request_id against schema id pattern or null
         clean_request_id = None

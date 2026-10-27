@@ -256,7 +256,23 @@ class OfficialGameMasterAdapter(GameMasterAdapter):
                     resp_body = resp.read().decode("utf-8")
                     if not resp_body.strip():
                         return {}
-                    parsed = json.loads(resp_body)
+                    try:
+                        parsed = json.loads(resp_body)
+                    except json.JSONDecodeError:
+                        # Attempt to extract embedded Next.js page state from HTML: <script id="__NEXT_DATA__" ...>
+                        m = re.search(r'<script\s+id="__NEXT_DATA__"[^>]*>(.*?)</script>', resp_body, re.DOTALL)
+                        if m:
+                            try:
+                                next_data = json.loads(m.group(1))
+                                page_props = next_data.get("props", {}).get("pageProps", {})
+                                parsed = page_props.get("match") or page_props.get("matchData") or page_props.get("state") or page_props
+                            except Exception:
+                                parsed = None
+                        else:
+                            parsed = None
+                        if parsed is None or not isinstance(parsed, dict):
+                            raise GameMasterError(f"Received non-JSON response from {url}")
+
                     if isinstance(parsed, dict):
                         if "replay" not in parsed and status_code in (200, 201):
                             parsed["replay"] = (status_code == 200)
@@ -353,38 +369,45 @@ class OfficialGameMasterAdapter(GameMasterAdapter):
     def get_match_projection(self, match_id_or_code: Optional[str] = None) -> Dict[str, Any]:
         """Fetch public match projection and open backlog items from Game Master.
         
-        Queries /match/<matchId> as specified in Team Orchestrator Technical Guide Step 9.
-        Falls back to /api/v1/matches/<uuid> or /match/state.
+        Authoritative endpoint: /match/<matchId> per Technical Guide Step 9.
+        Secondary fallback: /api/v1/matches/<matchUuid>.
+        Fails closed on authentication or connection failure.
         """
         ident = match_id_or_code or self.match_uuid
         if not ident:
             return self.get_match_state()
 
         clean_ident = str(ident).strip()
-        # 1. Try public projection /match/<matchId>
+        last_error = None
+
+        # 1. Authoritative endpoint: /match/<matchId>
         try:
             res = self._request("GET", f"/match/{clean_ident}")
-            if isinstance(res, dict):
+            if isinstance(res, dict) and ("backlogItems" in res or "matchUuid" in res or "status" in res or "id" in res):
                 return res
-        except Exception:
-            pass
+            if isinstance(res, dict) and res:
+                return res
+        except GameMasterAuthError:
+            raise
+        except Exception as e:
+            last_error = e
 
-        # 2. Try official API /api/v1/matches/<matchUuid>
+        # 2. Official API: /api/v1/matches/<matchUuid>
         try:
             res = self._request("GET", f"/api/v1/matches/{clean_ident}")
-            if isinstance(res, dict):
+            if isinstance(res, dict) and ("backlogItems" in res or "matchUuid" in res or "status" in res or "id" in res):
                 return res
-        except Exception:
-            pass
+            if isinstance(res, dict) and res:
+                return res
+        except GameMasterAuthError:
+            raise
+        except Exception as e:
+            last_error = e
 
-        # 3. Fallback to /match/state
-        state = self.get_match_state()
-        try:
-            tasks = self.list_backlog()
-            state.setdefault("backlogItems", tasks)
-        except Exception:
-            state.setdefault("backlogItems", [])
-        return state
+        # 3. If endpoints failed, raise rather than returning unverified default
+        if last_error:
+            raise last_error
+        raise GameMasterError(f"Could not retrieve match projection for {clean_ident}")
 
     def get_match_state(self) -> Dict[str, Any]:
         """Fetch current match state (duration, remaining time, status, clock)."""

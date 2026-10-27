@@ -66,8 +66,11 @@ def _get_git_diff_names(repo_dir: Path, base_rev: Optional[str] = None) -> List[
     return []
 
 
-def detect_tech_stack(repo_dir: Path) -> Dict[str, str]:
-    """Detect platform, language, framework, package manager, and verification commands."""
+def detect_tech_stack(repo_dir: Path, match_root: Optional[Path] = None) -> Dict[str, str]:
+    """Detect platform, language, framework, package manager, and verification commands.
+    
+    Supports 3-tier layout: checkoutRoot -> matchRoot -> appRoot.
+    """
     platform_name = "Windows" if sys.platform.startswith("win") else "Linux"
     language_framework = "Unknown"
     pkg_manager = "Unknown"
@@ -77,24 +80,60 @@ def detect_tech_stack(repo_dir: Path) -> Dict[str, str]:
     typecheck_cmd = ""
     target_test_cmd = ""
     full_test_cmd = ""
-    doctor_cmd = "doctor.ps1" if sys.platform.startswith("win") else "./doctor.sh"
+
+    # Locate doctor script from match_root, repo_dir, or env-require/
+    doctor_candidates = []
+    if match_root:
+        doctor_candidates.extend([
+            match_root / "env-require" / "doctor.ps1",
+            match_root / "doctor.ps1",
+            match_root / "env-require" / "doctor.sh",
+            match_root / "doctor.sh",
+        ])
+    doctor_candidates.extend([
+        repo_dir / "env-require" / "doctor.ps1",
+        repo_dir / "doctor.ps1",
+        repo_dir / "env-require" / "doctor.sh",
+        repo_dir / "doctor.sh",
+    ])
+    found_doc = next((c for c in doctor_candidates if c.exists()), None)
+    if found_doc:
+        ref_root = match_root or repo_dir
+        try:
+            doctor_cmd = found_doc.relative_to(ref_root).as_posix()
+        except ValueError:
+            doctor_cmd = found_doc.name
+    else:
+        doctor_cmd = "doctor.ps1" if sys.platform.startswith("win") else "./doctor.sh"
+
+    # Search app root candidates (e.g. repo_dir, match_root / "src", repo_dir / "src")
+    app_candidates = []
+    if match_root:
+        if (match_root / "src" / "package.json").exists() or (match_root / "src" / "pyproject.toml").exists():
+            app_candidates.append(match_root / "src")
+        app_candidates.append(match_root)
+    if (repo_dir / "src" / "package.json").exists() or (repo_dir / "src" / "pyproject.toml").exists():
+        app_candidates.append(repo_dir / "src")
+    app_candidates.append(repo_dir)
+
+    target_app = app_candidates[0]
 
     # Node / JS / TS ecosystem
-    pkg_json_path = repo_dir / "package.json"
-    pnpm_lock = repo_dir / "pnpm-lock.yaml"
-    yarn_lock = repo_dir / "yarn.lock"
-    npm_lock = repo_dir / "package-lock.json"
+    pkg_json_path = target_app / "package.json"
+    pnpm_lock = target_app / "pnpm-lock.yaml"
+    yarn_lock = target_app / "yarn.lock"
+    npm_lock = target_app / "package-lock.json"
 
     # Python ecosystem
-    pyproject = repo_dir / "pyproject.toml"
-    req_txt = repo_dir / "requirements.txt"
-    setup_py = repo_dir / "setup.py"
+    pyproject = target_app / "pyproject.toml"
+    req_txt = target_app / "requirements.txt"
+    setup_py = target_app / "setup.py"
 
     # Go
-    go_mod = repo_dir / "go.mod"
+    go_mod = target_app / "go.mod"
 
     # Rust
-    cargo_toml = repo_dir / "Cargo.toml"
+    cargo_toml = target_app / "Cargo.toml"
 
     if pkg_json_path.exists():
         try:
@@ -220,11 +259,30 @@ class KnowledgeBootstrap:
         match_code: str = "MTMMATCH",
         branch: str = "main",
         folder: str = "repo",
+        checkout_root: Optional[Path | str] = None,
+        match_root: Optional[Path | str] = None,
+        app_root: Optional[Path | str] = None,
     ) -> None:
-        self.repo_path = Path(repo_path).resolve()
+        self.checkout_root = Path(checkout_root).resolve() if checkout_root else Path(repo_path).resolve()
+        self.repo_path = self.checkout_root
         self.match_code = match_code
         self.branch = branch
         self.folder = folder
+
+        # 3-tier paths resolution (checkoutRoot -> matchRoot -> appRoot)
+        if match_root:
+            self.match_root = Path(match_root).resolve()
+        elif folder and (self.checkout_root / folder).exists():
+            self.match_root = (self.checkout_root / folder).resolve()
+        else:
+            self.match_root = self.checkout_root
+
+        if app_root:
+            self.app_root = Path(app_root).resolve()
+        elif (self.match_root / "src" / "package.json").exists() or (self.match_root / "src" / "pyproject.toml").exists():
+            self.app_root = (self.match_root / "src").resolve()
+        else:
+            self.app_root = self.match_root
 
     def generate_project_map(
         self,
@@ -236,27 +294,27 @@ class KnowledgeBootstrap:
     ) -> Path:
         """
         Generate PROJECT_MAP.md adhering to docs/PROJECT_MAP_TEMPLATE.md.
-        Validates that output_path resides outside self.repo_path unless allow_inside_repo is True.
+        Validates that output_path resides outside self.checkout_root unless allow_inside_repo is True.
         Executes actual build/doctor verification if requested to avoid recording false VERIFIED status.
         """
         out = Path(output_path).resolve()
         if not allow_inside_repo:
             try:
                 # Check containment
-                out.relative_to(self.repo_path)
+                out.relative_to(self.checkout_root)
                 raise ValueError(
-                    f"PROJECT_MAP.md must never be created inside the challenge Git repository: {out} resides inside {self.repo_path}"
+                    f"PROJECT_MAP.md must never be created inside the challenge Git repository: {out} resides inside {self.checkout_root}"
                 )
             except ValueError as exc:
                 if "must never be created inside" in str(exc):
                     raise
-                # Valid: out is not relative to repo_path
+                # Valid: out is not relative to checkout_root
 
         out.parent.mkdir(parents=True, exist_ok=True)
 
-        rev = base_revision or _get_git_revision(self.repo_path)
+        rev = base_revision or _get_git_revision(self.checkout_root)
         timestamp = datetime.datetime.now(datetime.timezone.utc).isoformat()
-        tech = detect_tech_stack(self.repo_path)
+        tech = detect_tech_stack(self.app_root, match_root=self.match_root)
 
         # Real verification execution or status inspection
         discovery_status = "UNVERIFIED"
@@ -267,13 +325,40 @@ class KnowledgeBootstrap:
             discovery_status = "VERIFIED" if v_passed else "FAILED"
             exit_result_str = f"PASS (exit {v_code})" if v_passed else f"FAIL (exit {v_code})"
         elif run_verification:
-            # Execute environment doctor or build command safely
-            v_cmd = tech.get("Environment doctor") or tech.get("Build command")
-            if v_cmd and not v_cmd.startswith("default "):
+            # Locate doctor script or build/typecheck command
+            doc_file = None
+            for cand in [
+                self.match_root / "env-require" / "doctor.ps1",
+                self.match_root / "doctor.ps1",
+                self.app_root / "env-require" / "doctor.ps1",
+                self.app_root / "doctor.ps1",
+                self.match_root / "env-require" / "doctor.sh",
+                self.match_root / "doctor.sh",
+                self.app_root / "doctor.sh",
+            ]:
+                if cand.exists():
+                    doc_file = cand
+                    break
+
+            cmd_run = None
+            cwd_run = self.match_root
+            if doc_file:
+                if doc_file.suffix == ".ps1":
+                    cmd_run = f'powershell.exe -ExecutionPolicy Bypass -File "{doc_file}"'
+                else:
+                    cmd_run = f'bash "{doc_file}"'
+                cwd_run = self.match_root
+            else:
+                v_cmd = tech.get("Build command") or tech.get("Typecheck command")
+                if v_cmd and not v_cmd.startswith("default "):
+                    cmd_run = v_cmd
+                    cwd_run = self.app_root
+
+            if cmd_run:
                 try:
                     res = subprocess.run(
-                        v_cmd,
-                        cwd=str(self.repo_path),
+                        cmd_run,
+                        cwd=str(cwd_run),
                         shell=True,
                         capture_output=True,
                         text=True,
@@ -290,21 +375,23 @@ class KnowledgeBootstrap:
                     discovery_status = "FAILED"
                     exit_result_str = f"FAIL ({exc})"
             else:
-                discovery_status = "VERIFIED"
-                exit_result_str = "PASS (exit 0)"
+                # No verification command was configured or executed
+                discovery_status = "UNVERIFIED"
+                exit_result_str = "NOT_RUN"
         else:
-            discovery_status = "VERIFIED"
-            exit_result_str = "PASS (exit 0)"
+            # No verification executed
+            discovery_status = "UNVERIFIED"
+            exit_result_str = "NOT_RUN"
 
-        # Index repository files
+        # Index repository files from app_root (or match_root)
         try:
-            index_data = build_index(self.repo_path)
+            index_data = build_index(self.app_root if self.app_root.exists() else self.match_root)
             files_list = index_data.get("files", [])
         except Exception:
             files_list = []
 
         # Find entrypoints, architecture, and module map
-        entrypoint = "src/index.ts" if (self.repo_path / "src" / "index.ts").exists() else "app.py"
+        entrypoint = "src/index.ts" if (self.app_root / "src" / "index.ts").exists() or (self.app_root / "index.ts").exists() else "app.py"
         routes = []
         services = []
         models = []
@@ -333,6 +420,13 @@ class KnowledgeBootstrap:
                 if p in ["src/main.ts", "src/index.ts", "src/app.ts", "app.py", "main.py", "server.js"]:
                     entrypoint = p
 
+        app_rel_line = ""
+        try:
+            if self.app_root != self.checkout_root and self.app_root.is_relative_to(self.checkout_root):
+                app_rel_line = f"- Application root: `{self.app_root.relative_to(self.checkout_root).as_posix()}`\n"
+        except (ValueError, AttributeError):
+            pass
+
         # Assemble markdown according to template
         lines: List[str] = [
             f"# PROJECT_MAP — {self.repo_path.name}",
@@ -342,6 +436,10 @@ class KnowledgeBootstrap:
             "## 1. Identity & Snapshot",
             f"- Match code: `{self.match_code}`",
             f"- Assigned Git repository / branch / folder: `{self.repo_path.name} / {self.branch} / {self.folder}`",
+        ]
+        if app_rel_line:
+            lines.append(app_rel_line.strip())
+        lines.extend([
             f"- Base revision: `{rev}`",
             f"- Generated at: `{timestamp}`",
             f"- Discovery status: `{discovery_status}`",
@@ -350,7 +448,7 @@ class KnowledgeBootstrap:
             "## 2. Technology & Local Environment",
             "| Property | Value | Evidence / Verification |",
             "|---|---|---|",
-        ]
+        ])
 
         for k, v in tech.items():
             lines.append(f"| {k} | {v} | Detected from repository config |")

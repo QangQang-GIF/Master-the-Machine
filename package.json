@@ -1,0 +1,11 @@
+{
+  "name": "team-sdlc-pack",
+  "version": "1.0.0",
+  "description": "Master the Machine Team SDLC Pack",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "check-distribution": "node scripts/check-distribution.mjs",
+    "check-distribution:py": "python scripts/check-distribution.py"
+  }
+}

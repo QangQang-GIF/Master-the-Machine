@@ -20,6 +20,8 @@ htmlcov/
 
 # Runtime artifacts
 *.log
+*.ndjson
+logs/
 trace.jsonl
 worker_result.json
 
