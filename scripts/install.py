@@ -151,11 +151,33 @@ def install_pack(source_dir: Path, workspace_dir: Path) -> None:
             safe_copy2(toml_f, ws_codex_agents / toml_f.name)
             safe_copy2(toml_f, pack_codex_agents / toml_f.name)
 
-    # 5. Create required state, log, and .mtm storage directories
+    # 5. Create required state, log, matches, and .mtm storage directories
     (ws / ".mtm").mkdir(parents=True, exist_ok=True)
     (ws / "logs").mkdir(parents=True, exist_ok=True)
+    (ws / "matches").mkdir(parents=True, exist_ok=True)
     (target_pack_dir / "logs").mkdir(parents=True, exist_ok=True)
     (target_pack_dir / "state").mkdir(parents=True, exist_ok=True)
+
+    # 5b. Populate team-sdlc-pack/runtime for MTM Player verifyTeamRuntime compatibility
+    runtime_dir = target_pack_dir / "runtime"
+    runtime_dir.mkdir(parents=True, exist_ok=True)
+    # Check if a template pack exists adjacent to Thi or in source
+    template_candidates = [
+        ws.parent / "team-orchestrator-pack",
+        source_dir.parent / "Thi" / "team-orchestrator-pack",
+    ]
+    for cand in template_candidates:
+        if cand.exists() and cand.is_dir():
+            safe_copytree(cand, runtime_dir)
+            break
+    # Always ensure current pack manifests and verified agents match exactly
+    for f in ["team-runtime.json", "team-pack-info.json"]:
+        src_f = source_dir / f
+        if src_f.exists():
+            safe_copy2(src_f, runtime_dir / f)
+    if (source_dir / "agents" / "team-orchestrator.toml").exists():
+        (runtime_dir / "agents").mkdir(parents=True, exist_ok=True)
+        safe_copy2(source_dir / "agents" / "team-orchestrator.toml", runtime_dir / "agents" / "team-orchestrator.toml")
 
     # 6. Configure .codex/config.toml with PYTHONPATH
     codex_dir = ws / ".codex"
