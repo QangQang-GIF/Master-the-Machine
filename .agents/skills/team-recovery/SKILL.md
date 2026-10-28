@@ -37,7 +37,7 @@ When receiving a recovery frame (`RESUME_PREPARATION_V1` or `RESUME_GAME_V1`):
    - **Terminal Closed Items**: If a backlog item received `409 [BACKLOG_ITEM_CLOSED]`, its deadline has passed and it is permanently closed by Game Master.
      - **NEVER** re-attempt submission or loop re-authenticating the portal for closed items.
      - Append `{"type": "BACKLOG_STATUS", "backlogId": "<id>", "status": "CLOSED", "summary": "Item deadline expired; advancing to next item."}`.
-     - **DO NOT block the game loop**: Immediately advance to the next OPEN or DISCOVERED backlog item (`CR-01`, `TASK-02`, `TASK-01`).
+     - **DO NOT block the game loop**: Immediately advance to the next OPEN or DISCOVERED backlog item.
    - **Completed Items**: If an item has `status: "SUBMITTED"` with a valid `receiptId`, it is complete. Do not re-submit.
    - **Active/Open Items**: Pick the next available OPEN backlog item and execute it via the standard game loop.
 
