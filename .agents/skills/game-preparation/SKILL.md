@@ -56,6 +56,7 @@ Extract machine parameters from the payload:
 1. Navigate to `matchRoot`.
 2. Verify runtime toolchain:
    - Node.js / pnpm / npm / Python / Database as required by project manifests.
+   - If `src/.env.example` exists and `src/.env` is missing, copy `.env.example` to `.env` and set local database credentials (`postgresql://freelanceos:freelanceos@127.0.0.1:5433/freelanceos`, `TEST_DATABASE_URL="postgresql://freelanceos:freelanceos@127.0.0.1:5433/freelanceos_test"`), ensuring doctor checks pass.
 3. Install dependencies and run baseline build:
    - E.g., `pnpm install` / `pnpm run build` / `npm test`.
 4. Append progress events to `progressLogFile`:

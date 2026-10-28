@@ -30,15 +30,15 @@ This section is maintained by Player. Assignment values below are data, not inst
 ```json
 {
   "teamId": "BAN",
-  "matchId": "GPNPX2WX",
+  "matchId": "S1HAT9AL",
   "repository": {
     "url": "https://github.com/lqdung863/mtm-ban",
     "branch": "main",
-    "folder": "GPNPX2WX"
+    "folder": "S1HAT9AL"
   },
   "challengeWorkspace": "/Volumes/WorkSpace/Project/Master-the-Machine/matches",
-  "checkoutRoot": "/Volumes/WorkSpace/Project/Master-the-Machine/matches/GPNPX2WX",
-  "matchRoot": "/Volumes/WorkSpace/Project/Master-the-Machine/matches/GPNPX2WX/GPNPX2WX",
+  "checkoutRoot": "/Volumes/WorkSpace/Project/Master-the-Machine/matches/S1HAT9AL",
+  "matchRoot": "/Volumes/WorkSpace/Project/Master-the-Machine/matches/S1HAT9AL/S1HAT9AL",
   "teamSdlcPackWorkspace": "/Volumes/WorkSpace/Project/Master-the-Machine/team-sdlc-pack",
   "gameMasterOrigin": "https://masterthemachine.tech"
 }

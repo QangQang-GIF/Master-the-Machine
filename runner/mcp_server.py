@@ -408,6 +408,17 @@ class MCPHelperServer:
             # Resolve 3-tier layout: checkoutRoot -> matchRoot -> appRoot (R5)
             app_root = (self.match_root / "src") if (self.match_root / "src" / "package.json").exists() else self.match_root
 
+            # Pre-flight: Ensure .env is populated from .env.example with local credentials if missing
+            env_example = app_root / ".env.example"
+            env_file = app_root / ".env"
+            if env_example.exists() and not env_file.exists():
+                try:
+                    content = env_example.read_text(encoding="utf-8")
+                    content = content.replace("CHANGE_ME", "freelanceos")
+                    env_file.write_text(content, encoding="utf-8")
+                except Exception:
+                    pass
+
             bootstrap = KnowledgeBootstrap(
                 repo_path=self.checkout_root,
                 match_code=self.match_code or "PREP",
