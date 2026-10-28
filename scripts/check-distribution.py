@@ -35,11 +35,11 @@ def verify_distribution(ws_dir: Path, pack_dir: Path | None = None) -> None:
         # Resolve pack directory and workspace directory (R3 layout parity)
         if (ws_dir / "team-sdlc-pack" / "team-runtime.json").exists():
             pack_dir = ws_dir / "team-sdlc-pack"
-        elif (ws_dir / "team-runtime.json").exists():
-            pack_dir = ws_dir
         elif ws_dir.name == "team-sdlc-pack":
             pack_dir = ws_dir
             ws_dir = ws_dir.parent
+        elif (ws_dir / "team-runtime.json").exists():
+            pack_dir = ws_dir
         else:
             pack_dir = ws_dir / "team-sdlc-pack"
 
