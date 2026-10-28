@@ -1,299 +1,1336 @@
-# MASTER THE MACHINE 2026
-## Remediation & End-to-End Verification Plan
-
-**Baseline:** `81860902db7978f6f8d923dd087aacd3f8d86f1f`  
-**Target:** Production-ready tournament orchestration  
-**Phạm vi:** `mtm_core`, `mtm_competition`, cấu hình production, tests và CI. Giữ nguyên kiến trúc bốn package hiện tại.
-
----
-
-## Phase 0 — Sửa CI và thiết lập baseline đáng tin cậy
-
-**Mục tiêu:** Có bộ kiểm thử xanh trước khi sửa các thành phần nghiệp vụ.
-
-**Công việc**
-
-- Sửa `test_orchestrator_blocks_submission_if_push_fails` trong `tests/test_audit_fixes.py`.
-- Cấu hình Git identity cho repository được clone trong test.
-- Kiểm tra return code của toàn bộ lệnh `git commit`, `git push` khi chuẩn bị fixture.
-- Cập nhật số test thực tế trong README; không hardcode một con số dễ lỗi thời.
-- Chạy CI trên Python 3.12 và 3.13.
-- Thêm test cho cả trường hợp clone repo rỗng, HEAD chưa tồn tại và Git thiếu identity.
-
-**File liên quan**
-
-`tests/test_audit_fixes.py`, `.github/workflows/ci.yml`, `README.md`, `src/mtm_core/git/repository.py`.
-
-**Acceptance Criteria**
-
-- CI cả hai phiên bản Python thành công.
-- Toàn bộ test hiện hành chạy thành công; smoke test cần CLI thật được đánh dấu rõ là chưa chạy, không tính như một lần kiểm chứng thành công.
-- Không có test phụ thuộc Git config toàn cục trên máy developer.
-
----
-
-## Phase 1 — Hardening đường đi Submit (P0)
-
-### P0.1 — Git Push & Revision Verification
-
-**File:** `integration/integration_guard.py`, `integration/git_guard.py`, `orchestrator.py`.
-
-- Production bắt buộc phải có remote Git hợp lệ.
-- Không cho phép submit nếu `push_to_remote=False`, remote không tồn tại hoặc push thất bại.
-- Xác minh SHA trực tiếp trên remote bằng `git ls-remote` hoặc cơ chế xác thực tương đương; không chỉ dựa vào remote-tracking branch local.
-- Chỉ stage các file hợp lệ thuộc Worker patch.
-- Kiểm tra đường dẫn, symlink, deletion và thay đổi nằm ngoài phạm vi tác vụ.
-- Không dùng `reset --hard` hoặc `clean -fd` trên canonical repository khi có nguy cơ xóa thay đổi không liên quan.
-- Thực hiện post-integration verification trước khi push.
-
-**Done khi:** 100% submission trong production được gắn với một commit SHA xác nhận tồn tại trên remote.
-
-### P0.2 — Independent QA & MVS Enforcement
-
-**File:** `verification/qa_gate.py`, `verification/test_policy.py`, `orchestrator.py`, contracts.
-
-- Production mặc định bật kiểm thử độc lập.
-- Không chấp nhận `test_results.passed=True` của Worker như bằng chứng duy nhất.
-- Thiết lập verification command do Orchestrator hoặc Game Master cung cấp, không tin tưởng tùy ý command do Worker sinh ra.
-- Chạy test với timeout, working directory được kiểm soát, lưu exit code và log.
-- Ánh xạ mỗi MVS do Game Master công bố với một kết quả kiểm thử.
-- Chặn submission nếu một MVS bắt buộc chưa được thực thi hoặc chưa pass.
-- Chạy lại bộ test đã xác định sau bước tích hợp patch vào canonical repository.
-
-**Lưu ý:** Nếu Game Master chỉ cung cấp mô tả MVS mà không cung cấp lệnh thực thi, cần thêm lớp chuyển đổi hoặc mapping theo contract chính thức; không tự coi mô tả là test đã pass.
-
-**Done khi:** Không thể submit với test giả, test rỗng, test fail hoặc thiếu MVS bắt buộc.
-
-### P0.3 — Submission Idempotency
-
-**File:** `adapters/official_game_master.py`, `integration/submission_guard.py`, `tasks/store.py`.
-
-- Vô hiệu hóa retry tự động cho `POST /submit`, trừ khi server hỗ trợ idempotency key chính thức.
-- Ghi trạng thái `SUBMIT_IN_FLIGHT` bằng thao tác database nguyên tử trước khi truyền request.
-- Ngăn hai Worker hoặc hai process submit cùng một task.
-- Khi bị timeout hoặc mất kết nối: không gửi lại ngay; kiểm tra trạng thái trên Game Master.
-- Nếu trạng thái chưa xác định, giữ submission ở trạng thái cần reconcile.
-- Khi restart, xử lý mọi submission đang `IN_FLIGHT` trước khi cho phép tạo submission mới.
-- Phân biệt lỗi network, lỗi bị server từ chối và kết quả FAILED của Grader.
-
-**Done khi:** Trong mọi kịch bản timeout, crash hoặc retry được kiểm thử, mỗi task có tối đa một submission thực sự được gửi.
-
-### P0.4 — Grading & Scoring Lifecycle
-
-**File:** `orchestrator.py`, `tasks/store.py`, `integration/submission_guard.py`.
-
-- Bổ sung grading reconciliation loop.
-- Theo dõi `ACCEPTED` / `GRADING` cho đến khi nhận `PASSED` hoặc `FAILED`, hoặc đến khi vượt ngưỡng chờ và ghi nhận trạng thái unresolved.
-- Tách `provisional_points` khỏi `confirmed_points`.
-- Chỉ tính điểm đã được Grader xác nhận vào tổng điểm nội bộ.
-- Ngăn submit lại task có grading `FAILED` nếu luật không cho phép.
-- Đồng bộ kết quả grading sau restart.
-
-**Done khi:** Trạng thái cuối trong database khớp với Game Master; không cộng điểm chưa được xác nhận.
-
----
-
-## Phase 2 — Worker Runtime, Preemption và Clock (P1)
-
-### P1.1 — Supervisor Reliability
-
-**File:** `workers/supervisor.py`, `workers/launcher.py`, `runtime/codex.py`.
-
-- Sửa lỗi `_runner()` có thể gọi `launcher_fn()` lần thứ hai nếu lần đầu ném exception.
-- Tách xử lý exception Worker khỏi logic kiểm tra function signature.
-- Bổ sung cancellation state rõ ràng: `RUNNING`, `PREEMPT_REQUESTED`, `PREEMPTED`, `COMPLETED`, `FAILED`.
-- Quản lý subprocess handle và process tree khi hủy Worker.
-- Tránh race condition giữa preemption và Worker vừa hoàn thành.
-- Cleanup workspace/worktree đúng cách.
-- Dùng attempt ID duy nhất thay cho `{task_id}_att1` cố định.
-- Đảm bảo concurrency limit của Supervisor và Scheduler thống nhất.
-
-**Done khi:** Mỗi attempt chỉ launch một lần; PI preemption không tạo Worker mồ côi hoặc ghi nhầm kết quả của attempt cũ.
-
-### P1.2 — PAUSED, Deadline và Timeout
-
-**File:** `scheduling/scheduler.py`, `runtime/codex.py`, `orchestrator.py`.
-
-- Sử dụng đồng hồ server làm nguồn thời gian thi đấu.
-- Tách wall-clock timeout, active-execution timeout và match-time budget.
-- Không để PAUSED làm hao hụt match-time budget.
-- Bảo đảm policy PAUSED nhất quán với hành vi process đang chạy.
-- Kiểm tra deadline lại ngay trước khi submit.
-- Khi trận FINISHED, dừng dispatch task mới và kết thúc Worker theo policy.
-
-**Done khi:** Thử tạm dừng rồi tiếp tục trận không tạo timeout sai hoặc submission quá deadline.
-
-### P1.3 — Token & Cost Budget
-
-**File:** `orchestrator.py`, `runtime/usage.py`, `routing/model_router.py`.
-
-- Giới hạn token theo match và theo task.
-- Giảm model/effort trước khi đạt giới hạn.
-- Chặn launch task mới khi vượt hard budget.
-- Phân biệt usage chính xác, usage ước lượng và usage không được CLI cung cấp.
-- Không xem việc giảm `reasoning_effort` là biện pháp giới hạn chi phí duy nhất.
-- Báo cáo token, elapsed time, số attempt và chi phí khi có dữ liệu giá đáng tin cậy.
-
-**Done khi:** Vượt ngưỡng ngân sách gây hành động kiểm soát xác định; không âm thầm tiếp tục chạy.
-
-### P1.4 — Backend & Configuration Consistency
-
-**File:** `config/loader.py`, `config/development.yaml`, `config/production.yaml`, `workers/launcher.py`, `runtime/codex.py`.
-
-- Chuẩn hóa `MTM_MODE` và `MTM_ENV` thành một cơ chế chọn environment thống nhất.
-- Giữ thứ tự ưu tiên backend: explicit argument → environment override → configuration.
-- Nếu backend không hợp lệ, báo lỗi thay vì tự chuyển sang Codex.
-- Bắt buộc Worker dùng đúng backend được Orchestrator chọn.
-- Kiểm chứng cú pháp CLI, model ID, effort và JSON trace của Codex và Antigravity thực.
-- Bật checksum verification theo production mode.
-- Xác định rõ project root chứa Skills/manifest, không phụ thuộc tùy ý vào current working directory.
-
-**Done khi:** Chọn Codex chỉ chạy Codex; chọn Antigravity chỉ chạy `agy`; cấu hình không tạo kết quả mơ hồ.
-
----
-
-## Phase 3 — Củng cố Game Master Contract
-
-**File:** `adapters/official_game_master.py`, `adapters/base.py`, `orchestrator.py`.
-
-- Xác nhận endpoints, authentication, payload và response schema với API/spec chính thức khi có.
-- Không mặc định `server_epoch=time.time()` rồi coi đó là thời gian server đã được đồng bộ chính xác.
-- Kiểm tra response của `Start Working` trước khi lấy MVS.
-- Phân biệt server không có MVS, MVS chưa được mở khóa và lỗi lấy MVS.
-- Xử lý rate limiting, 401/403, 409, 429 và 5xx theo từng phương thức HTTP.
-- Chỉ retry các thao tác bảo đảm an toàn, hoặc có cơ chế idempotency được xác nhận.
-- Bổ sung contract tests cho tất cả endpoint.
-
-**Done khi:** Adapter đạt contract tests và chạy được với Game Master staging/mock HTTP server. Các giả định chưa có API chính thức phải được ghi rõ, không xem là đã xác minh.
-
----
-
-## Phase 4 — E2E Test Suite
-
-Thực hiện theo bốn tầng, mỗi tầng có báo cáo riêng.
-
-### E2E-A — Component Integration
-
-Không yêu cầu CLI thật hoặc server thật.
-
-Test các đường đi:
-
-| ID | Kịch bản | Kỳ vọng |
-|---|---|---|
-| A01 | Worker khai báo test pass giả | QA từ chối |
-| A02 | Một MVS bắt buộc fail | Không submit |
-| A03 | Git push thất bại | Không submit |
-| A04 | Remote trả SHA không khớp | Không submit |
-| A05 | Submission timeout nhưng server đã nhận | Không gửi lần hai |
-| A06 | Grader trả FAILED | Điểm xác nhận bằng 0 |
-| A07 | Restart khi `SUBMIT_IN_FLIGHT` | Reconcile an toàn |
-| A08 | Worker CLI exit nonzero | Không READY_FOR_REVIEW |
-| A09 | Backend không hợp lệ hoặc CLI thiếu | Fail rõ ràng |
-| A10 | Patch thay đổi file ngoài phạm vi | Integration từ chối |
-
-### E2E-B — Full Tournament Simulation
-
-Sử dụng Mock Game Master, Git remote local và fake clock để tái hiện trận có ngân sách 2.400 giây mà không cần chờ đủ 40 phút.
-
-Các sự kiện cần mô phỏng theo thứ tự:
-
-1. Game Master cung cấp customer repository và Wave 1.
-2. Orchestrator tiếp nhận TASK/CR/BUG.
-3. Gọi Start Working, mở khóa MVS.
-4. Worker bắt đầu xử lý một CR.
-5. Wave 2 xuất hiện với PI khẩn cấp.
-6. Supervisor preempt CR, scheduler ưu tiên PI.
-7. Match chuyển PAUSED rồi RESUMED.
-8. PI được sửa, kiểm thử, commit, push, submit.
-9. Grader trả ACCEPTED trước, PASSED sau.
-10. Các task còn lại tiếp tục chạy.
-11. Chèn sự cố mạng và crash/restart.
-12. Game Master trả FINISHED; hệ thống tạo báo cáo cuối trận.
-
-**Kỳ vọng:** Không submit trùng, không mất trạng thái, không cộng điểm trước khi Grader xác nhận và không chạy quá budget.
-
-### E2E-C — Real CLI Execution
-
-Chạy với customer repository giả lập có lỗi thật và test thật.
-
-**Matrix thực thi**
-
-| Backend | Tác vụ | Kỳ vọng |
-|---|---|---|
-| Codex CLI | BUG đơn giản | Sửa code và chạy test |
-| Codex CLI | CR nhiều file | Tạo patch hợp lệ |
-| Codex CLI | Worker timeout | Process được dừng đúng |
-| Anti CLI (`agy`) | BUG đơn giản | Sửa code và chạy test |
-| Anti CLI (`agy`) | CR nhiều file | Tạo patch hợp lệ |
-| Anti CLI (`agy`) | Worker timeout | Process được dừng đúng |
-
-Kiểm tra cả prompt delivery, runtime exit code, workspace isolation, trace parsing, token usage và `worker_result.json`.
-
-Không dùng mocked Worker cho tầng này. Nếu một CLI không sẵn có, đánh dấu BLOCKED; không chuyển thành PASS.
-
-### E2E-D — Game Master Staging Integration
-
-Chỉ thực hiện khi có endpoint hoặc môi trường thử nghiệm do ban tổ chức cung cấp.
-
-- Kết nối bằng thông tin xác thực thử nghiệm.
-- Đọc backlog và match state.
-- Xác minh Start Working và MVS.
-- Sử dụng repository và dữ liệu thử nghiệm.
-- Kiểm tra nộp và grading khi staging cho phép.
-- Không tự động gửi bài vào hệ thống thi chính thức để kiểm thử.
-
-**Done khi:** Contract, credentials, thời gian server và trạng thái grading được xác nhận trên môi trường tích hợp thật.
-
----
-
-## Phase 5 — Production Readiness & Release Gate
-
-### Lệnh kiểm tra tối thiểu
-
-```bash
-python -m pip install -e ".[dev]"
-python -m pytest -v
-python -m pytest tests/test_e2e_contest_scenario.py -v
-python -c "from mtm_core.config.loader import verify_skill_checksums; verify_skill_checksums('.')"
+Dựa trên kiến trúc repo hiện tại, tôi đề xuất refactor theo hướng **“một đường chạy duy nhất, ít abstraction, lỗi là lỗi, không tự cứu bằng fallback”**. Mục tiêu không phải làm framework tổng quát, mà làm một hệ thống thi Master The Machine đơn giản, dễ debug và dễ chỉnh trước ngày thi.
+
+## 1. Kiến trúc đích
+
+Hiện tại repo có nhiều lớp có tính chất platform/framework: routing model, learning/training, nhiều backend, competition engine tổng quát, simulator/arena, config production, recovery/fallback...
+
+Sau refactor, runtime chính nên chỉ còn:
+
+```text
+Game Master
+    │
+    ▼
+MCP Helper / Competition Bridge
+    │
+    ▼
+Team Orchestrator
+    │
+    ├── BUG  → Bug Agent
+    ├── TASK → Task Agent
+    ├── CR   → Change Request Agent
+    └── PI   → Incident Agent
+                 │
+                 ▼
+           Verification
+                 │
+                 ▼
+          Git Guard
+                 │
+                 ▼
+             Submit
+                 │
+                 ▼
+       Official Receipt / Error
 ```
 
-Ngoài các lệnh hiện hữu, cần bổ sung các runner hoặc marker riêng cho:
+Không có:
 
-```bash
-python -m pytest tests/e2e/ -v
-python -m pytest -m live_cli -v
-python -m pytest -m staging_game_master -v
+```text
+Model Router
+Learning System
+Backend Fallback
+Provider Fallback
+Submission Fallback
+Generic Worker Scheduler
+Complex Runtime Config
+Automatic Recovery Chain
+Multi-engine orchestration
 ```
 
-Các đường dẫn và marker `tests/e2e/`, `live_cli`, `staging_game_master` là **hạng mục cần tạo trong kế hoạch**, chưa phải các test hiện có.
+Một lỗi ở bất kỳ bước nào sẽ đi theo:
 
-### Definition of Done
+```text
+Operation
+   │
+   ├── Success → continue
+   │
+   └── Failure → raise explicit error → orchestrator decides
+```
 
-- [ ] CI xanh trên Python 3.12 và 3.13.
-- [ ] 100% test P0/P1 mới pass.
-- [ ] QA độc lập và kiểm chứng MVS bắt buộc trong production.
-- [ ] Không có đường đi submit SHA chưa được xác nhận trên remote.
-- [ ] Không có submission trùng trong fault-injection tests.
-- [ ] Mọi điểm xác nhận đều xuất phát từ kết quả Grader.
-- [ ] Preemption, cancellation và PAUSED không tạo tiến trình mồ côi.
-- [ ] Codex CLI và Anti CLI hoàn thành smoke tests thực.
-- [ ] Mô phỏng đầy đủ vòng đời trận 40 phút pass.
-- [ ] Có báo cáo E2E chứa task states, điểm, token, timing, Git SHA và lỗi.
-- [ ] Có cấu hình production và hướng dẫn rollback.
-- [ ] Commit release được đóng băng bằng SHA và Skills checksums.
+Thay vì:
 
-**Quy tắc phát hành:** Không coi hệ thống production-ready nếu bất kỳ điều kiện P0 nào còn fail, hoặc nếu các bước tích hợp với CLI/Game Master thật chưa được xác nhận nhưng được báo cáo như đã hoàn tất.
+```text
+A failed
+ → try B
+ → B failed
+ → use cached C
+ → C missing
+ → retry D
+ → fallback E
+```
+
+Đây là thay đổi quan trọng nhất của toàn bộ refactor.
 
 ---
 
-## Deliverables
+# 2. Scope refactor theo module
 
-1. Code hoàn thiện các điểm P0/P1.
-2. Bộ regression tests và fault-injection tests.
-3. E2E tournament simulator có thể tái chạy.
-4. Bộ smoke tests Codex/Antigravity.
-5. GitHub Actions CI với kết quả kiểm chứng rõ ràng.
-6. `E2E_REPORT.md` ghi kết quả theo từng tầng và từng kịch bản.
-7. `PRODUCTION_READINESS.md` gồm checklist vận hành, cấu hình và rollback.
+| Module hiện tại | Hướng xử lý | Kiến trúc mới |
+|---|---|---|
+| `mtm_training` | **DELETE** | Không Learning System |
+| `routing/model_router.py` | **DELETE** | Model cố định |
+| Multiple model configs | **DELETE** | Hardcode Codex/model dùng thi |
+| `mtm_backends` | **DELETE / collapse mạnh** | Runtime gọi trực tiếp backend cần thiết |
+| Generic Competition Engine | **DELETE phần lớn** | Competition Bridge tối thiểu |
+| `orchestrator.py` engine cũ | **REPLACE** | Một TeamOrchestrator đơn giản |
+| Worker scheduler | **DELETE** | Orchestrator dispatch trực tiếp |
+| Worker supervisor | **DELETE** nếu không cần | Agent lỗi → báo lỗi |
+| Retry/fallback framework | **DELETE** | Explicit errors |
+| `mtm_agents` | **SIMPLIFY** | 4 sub-agent theo loại task |
+| `mtm_knowledge` | **SIMPLIFY** | Project context / repo map |
+| `mtm_arena` | **MOVE/DELETE** | Chỉ giữ test thật sự hữu ích |
+| AI-Arena | **REMOVE khỏi runtime** | Có thể archive riêng |
+| `config/production.yaml` | **DELETE** | Constants trong source |
+| release config/manifest | **DELETE nếu không phục vụ launch** | Build đơn giản |
+| official Game Master adapter | **KEEP + simplify** | Competition bridge |
+| Git Guard | **KEEP** | Submission safety |
+| Submission Journal | **KEEP nhưng simplify** | Idempotency/receipt |
+| QA gate | **KEEP + simplify** | Một deterministic verification gate |
+| `runner/mcp_server.py` | **KEEP nhưng giảm mạnh** | Thin MCP/competition bridge |
 
-**Thứ tự merge:** Phase 0 → Phase 1 → Phase 2 → Phase 3 → Phase 4 → Phase 5. Không bỏ qua release gate để chuyển sang thi thật.
+Điểm đặc biệt: tôi **không khuyến nghị xoá `GitGuard`, submission journal hoặc verification gate**. Đây không phải những abstraction dư thừa; chúng bảo vệ những thứ trực tiếp ảnh hưởng điểm thi: commit đúng, answer đúng, evidence đúng, submission không bị gửi hai lần.
+
+Ngược lại, generic scheduler, model routing và training system không trực tiếp giúp vòng thi hiện tại và nên bị loại bỏ. 
+
+---
+
+# 3. Hardcode nhưng không hardcode rải rác
+
+Yêu cầu “Hardcode only” là hợp lý cho giai đoạn này, nhưng không nên để literal xuất hiện 30 nơi.
+
+Nên có đúng **một file code chứa runtime constants**, ví dụ:
+
+```text
+src/mtm/constants.py
+```
+
+Ví dụ:
+
+```python
+MODEL = "..."
+CONCURRENCY = 1
+
+BUG_AGENT = "bug"
+TASK_AGENT = "task"
+CR_AGENT = "cr"
+PI_AGENT = "pi"
+
+MATCH_DURATION_SECONDS = 2400
+
+START_WORK_PATH = "/api/v1/matches/{match_id}/backlogs/start"
+SUBMIT_PATH = "/api/v1/matches/{match_id}/submissions"
+
+REQUIRE_MVS = True
+REQUIRE_EVIDENCE = True
+```
+
+Như vậy:
+
+```text
+Không YAML
+Không TOML config runtime
+Không config loader
+Không env-driven feature flags
+Không config layering
+Không fallback configuration
+```
+
+Các credential bắt buộc vẫn phải tới từ environment/secrets:
+
+```text
+API token
+session credential
+Git credential
+```
+
+Không hardcode secret vào repository.
+
+---
+
+# 4. Refactor Orchestrator
+
+Orchestrator mới không cần là một scheduling engine.
+
+Nó chỉ cần làm 6 việc:
+
+```text
+receive task
+→ classify based on official task type
+→ select sub-agent
+→ run agent
+→ verify result
+→ submit
+```
+
+Pseudo-flow:
+
+```python
+def execute(task):
+    agent = get_agent(task.type)
+
+    result = agent.solve(task)
+
+    verification = verify(task, result)
+    if not verification.ok:
+        raise VerificationError(verification.reason)
+
+    submission = prepare_submission(result)
+
+    receipt = submit(submission)
+
+    return receipt
+```
+
+Routing cũng không cần scoring/model routing:
+
+```python
+def get_agent(task_type):
+    if task_type == "BUG":
+        return bug_agent
+    if task_type == "TASK":
+        return task_agent
+    if task_type == "CR":
+        return cr_agent
+    if task_type == "PI":
+        return incident_agent
+
+    raise UnsupportedTaskType(task_type)
+```
+
+Task type do Game Master cung cấp thì sử dụng trực tiếp.
+
+Không cần AI classifier cho thứ server đã biết.
+
+---
+
+# 5. Sub-Agent architecture
+
+Tôi đề xuất chỉ giữ **4 execution agent**.
+
+### Bug Agent
+
+Focus:
+
+```text
+reproduce
+→ locate defect
+→ minimal patch
+→ tests
+```
+
+### Task Agent
+
+```text
+understand requirement
+→ inspect project
+→ implementation
+→ tests
+```
+
+### Change Request Agent
+
+```text
+analyse impact
+→ implementation
+→ regression verification
+```
+
+### Incident / PI Agent
+
+```text
+identify immediate failure
+→ minimal high-confidence fix
+→ verification
+```
+
+Không cần BA agent riêng.
+
+Không cần QA agent riêng.
+
+Không cần Security agent riêng ở runtime.
+
+Các concern này có thể nằm trong instruction/skill của từng agent.
+
+Ví dụ CR agent có checklist:
+
+```text
+requirements
+security impact
+regression
+tests
+evidence
+```
+
+Nhờ vậy:
+
+```text
+1 Orchestrator
++
+4 Worker types
+```
+
+thay vì một graph agent phức tạp.
+
+---
+
+# 6. Skills cũng cần giảm
+
+Repo hiện tại có khá nhiều skills và profile. Không nên giữ skill chỉ vì đã viết rồi.
+
+Target có thể là:
+
+```text
+.agents/
+└── skills/
+    ├── team-orchestrator/
+    ├── bug/
+    ├── task/
+    ├── change-request/
+    ├── incident/
+    └── verification/
+```
+
+`evidence` có thể merge vào `verification`.
+
+`mtm-init` có thể merge vào orchestrator.
+
+Các worker skill/profile trùng chức năng nên hợp nhất.
+
+Nguyên tắc:
+
+> Một behavior chỉ nên có một nguồn instruction chính.
+
+Tránh:
+
+```text
+profile says X
+skill says Y
+production yaml says Z
+master plan says W
+```
+
+---
+
+# 7. Competition Engine → Competition Bridge
+
+Đây là khu vực nên refactor mạnh nhất sau model routing.
+
+Hiện tại có sự chồng lấn giữa generic Competition Engine và production MCP path. Sau refactor chỉ nên tồn tại một đường chạy. 
+
+Target:
+
+```text
+src/mtm/competition/
+├── client.py
+├── session.py
+├── submission.py
+├── git_guard.py
+├── journal.py
+├── types.py
+└── errors.py
+```
+
+### `client.py`
+
+Chỉ chịu trách nhiệm HTTP tới Game Master:
+
+```text
+login
+start_work
+refresh
+submit
+```
+
+Không retry chain.
+
+Không alternate endpoint.
+
+Không legacy endpoint.
+
+Không silent fallback.
+
+Ví dụ:
+
+```python
+response = client.start_work(key)
+
+if response.status_code != 200:
+    raise StartWorkError(...)
+```
+
+### `session.py`
+
+Chỉ giữ:
+
+```text
+match id
+match code
+assigned branch
+authentication/session
+current backlog item
+```
+
+### `submission.py`
+
+Chỉ:
+
+```text
+build request
+→ validate
+→ journal
+→ submit
+→ validate receipt
+```
+
+### `git_guard.py`
+
+Giữ.
+
+Nhưng chỉ kiểm tra những thứ cần trước submit:
+
+```text
+commit exists
+remote branch contains SHA
+answer exists in commit
+required evidence exists
+prohibited files untouched
+```
+
+### `journal.py`
+
+Giữ vì idempotency là quan trọng.
+
+Nhưng API có thể thu lại thành:
+
+```python
+journal.begin(submission)
+journal.accept(receipt)
+journal.reject(error)
+```
+
+Không cần xây state framework tổng quát nếu không sử dụng.
+
+---
+
+# 8. Loại bỏ legacy Game Master fallback
+
+Adapter hiện tại có cả official flow lẫn một số compatibility/legacy behavior.
+
+Refactor nên có nguyên tắc:
+
+```text
+Official API only.
+```
+
+Nếu official API sai:
+
+```text
+raise ProtocolError
+```
+
+Nếu credential sai:
+
+```text
+raise AuthenticationError
+```
+
+Nếu response shape sai:
+
+```text
+raise InvalidGameMasterResponse
+```
+
+Nếu receipt không hợp lệ:
+
+```text
+raise InvalidSubmissionReceipt
+```
+
+Không:
+
+```text
+try legacy endpoint
+try alternate parser
+assume response
+continue anyway
+```
+
+Điều này sẽ làm thi thử ban đầu có thể fail nhiều hơn.
+
+Đó lại là điều tốt ở giai đoạn này, vì các failure đó cho chúng ta biết chính xác contract thật của server.
+
+---
+
+# 9. Verification nên được đưa thành hard gate
+
+Có một điểm tôi đánh giá quan trọng từ kiến trúc hiện tại: production submit path và QA engine đang không hoàn toàn là cùng một pipeline. 
+
+Refactor nên loại sự khác biệt này.
+
+Pipeline mới bắt buộc:
+
+```text
+Agent result
+    │
+    ▼
+Verification
+    │
+    ├── FAIL → stop
+    │
+    ▼
+Git Guard
+    │
+    ├── FAIL → stop
+    │
+    ▼
+Submit
+```
+
+Không tồn tại đường submit bypass verification.
+
+Verification tối thiểu:
+
+```text
+required files
+required evidence
+MVS returned by Start Work
+project-specific test
+git diff sanity
+answer JSON validation
+```
+
+Nếu MVS fail:
+
+```text
+raise VerificationError
+```
+
+Không fallback.
+
+Không submit “best effort”.
+
+---
+
+# 10. Knowledge system
+
+Không nhất thiết xoá toàn bộ `mtm_knowledge`.
+
+Khả năng scan project và tạo repo context vẫn hữu ích cho agent.
+
+Nhưng nó nên được giảm thành:
+
+```text
+src/mtm/project/
+├── inspect.py
+├── context.py
+└── types.py
+```
+
+Chức năng:
+
+```text
+detect language/framework
+find package manager
+find tests
+find build command
+find important directories
+produce concise project context
+```
+
+Không cần:
+
+```text
+knowledge learning
+historical learning
+adaptive routing
+model scoring
+complex knowledge persistence
+```
+
+---
+
+# 11. Repo structure đích
+
+Tôi đề xuất cuối refactor repo gần dạng:
+
+```text
+Master-the-Machine/
+│
+├── .agents/
+│   └── skills/
+│       ├── team-orchestrator/
+│       ├── bug/
+│       ├── task/
+│       ├── change-request/
+│       ├── incident/
+│       └── verification/
+│
+├── runner/
+│   └── mcp_server.py
+│
+├── src/
+│   └── mtm/
+│       ├── __init__.py
+│       ├── constants.py
+│       ├── errors.py
+│       ├── types.py
+│       │
+│       ├── orchestrator.py
+│       │
+│       ├── agents/
+│       │   ├── bug.py
+│       │   ├── task.py
+│       │   ├── change_request.py
+│       │   └── incident.py
+│       │
+│       ├── project/
+│       │   ├── inspect.py
+│       │   └── context.py
+│       │
+│       ├── verification/
+│       │   └── verify.py
+│       │
+│       └── competition/
+│           ├── client.py
+│           ├── session.py
+│           ├── submission.py
+│           ├── git_guard.py
+│           └── journal.py
+│
+├── tests/
+│   ├── unit/
+│   ├── integration/
+│   └── fixtures/
+│
+├── docs/
+│   ├── ARCHITECTURE.md
+│   ├── COMPETITION_PROTOCOL.md
+│   ├── PRACTICE_RUNBOOK.md
+│   └── REFACTOR_REPORT.md
+│
+├── pyproject.toml
+├── README.md
+└── LICENSE
+```
+
+Đây là mức complexity tôi cho là hợp lý với mục tiêu hiện tại.
+
+---
+
+# 12. Phase 0 — Freeze baseline
+
+Trước khi xoá code, tạo baseline:
+
+```text
+baseline commit SHA
+current CI result
+existing tests
+list runtime entrypoints
+list import dependencies
+list competition-critical modules
+```
+
+Không sửa architecture ở phase này.
+
+Mục đích là có điểm để so sánh:
+
+```text
+Before refactor
+vs
+After refactor
+```
+
+Đồng thời đánh dấu ba nhóm:
+
+```text
+RUNTIME
+TEST-ONLY
+DEAD / LEGACY
+```
+
+---
+
+# 13. Phase 1 — Delete Model Routing + Learning
+
+Đây nên là PR đầu tiên vì khá độc lập.
+
+Delete:
+
+```text
+src/mtm_training/
+src/mtm_competition/routing/model_router.py
+routing configs
+learning configs
+training pipeline
+learning tests
+model scoring/routing tests
+unused dependencies
+```
+
+Thay tất cả model selection bằng một model constant.
+
+Ví dụ:
+
+```python
+MODEL = "TARGET_MODEL"
+```
+
+Acceptance:
+
+```text
+No import mtm_training
+No import model_router
+No runtime model selection
+No fallback model
+Main test suite passes
+```
+
+---
+
+# 14. Phase 2 — Remove backend/fallback abstractions
+
+Tìm và xoá toàn bộ patterns kiểu:
+
+```python
+try:
+    primary()
+except:
+    fallback()
+```
+
+trong những nơi không thực sự cần recovery.
+
+Thay bằng typed error.
+
+Ví dụ:
+
+```python
+result = codex.execute(request)
+
+if not result.ok:
+    raise AgentExecutionError(result.error)
+```
+
+Đồng thời giảm `mtm_backends`.
+
+Nếu chỉ còn Codex production path thì backend abstraction có thể biến mất hoàn toàn.
+
+Acceptance:
+
+```text
+one production execution backend
+zero provider fallback
+zero auto backend switching
+errors propagated explicitly
+```
+
+---
+
+# 15. Phase 3 — Replace Competition Engine
+
+Đây là phase lớn nhất.
+
+Loại bỏ:
+
+```text
+generic scheduler
+worker supervisor
+priority runtime framework
+complex worker lifecycle
+generic execution runtime
+duplicate orchestration path
+```
+
+Giữ:
+
+```text
+Game Master client
+session
+submission
+journal
+git guard
+verification
+```
+
+Sau phase này phải có đúng một:
+
+```text
+start_work()
+```
+
+và đúng một:
+
+```text
+submit_work()
+```
+
+production path.
+
+Không có legacy submit route.
+
+---
+
+# 16. Phase 4 — Rewrite Orchestrator
+
+Sau khi engine đã gọn, viết orchestrator mới.
+
+Target size hợp lý:
+
+```text
+~150–300 LOC
+```
+
+chứ không phải một framework hàng nghìn dòng.
+
+Nó chỉ quản lý lifecycle:
+
+```text
+START
+→ FETCH TASK
+→ SELECT AGENT
+→ EXECUTE
+→ VERIFY
+→ COMMIT/PUSH
+→ SUBMIT
+→ RECEIPT
+→ DONE
+```
+
+State cũng chỉ cần những trạng thái thật sự có ý nghĩa:
+
+```python
+IDLE
+WORKING
+VERIFYING
+SUBMITTING
+DONE
+FAILED
+```
+
+Không cần elaborate state machine nếu Game Master đã là authoritative state.
+
+---
+
+# 17. Phase 5 — Simplify MCP Server
+
+`runner/mcp_server.py` hiện tại có khá nhiều trách nhiệm. 
+
+Sau refactor MCP server nên là **transport layer**, không phải business engine.
+
+Nó nên kiểu:
+
+```python
+@tool
+def start_work(key):
+    return competition.start_work(key)
+
+
+@tool
+def submit_work(...):
+    return competition.submit_work(...)
+
+
+@tool
+def get_status():
+    return competition.status()
+```
+
+Business logic chuyển vào:
+
+```text
+src/mtm/
+```
+
+Mục tiêu:
+
+```text
+runner/mcp_server.py
+≈ protocol translation + tool exposure
+```
+
+Không:
+
+```text
+verification engine
+routing logic
+config resolution
+fallback
+workflow policy
+```
+
+---
+
+# 18. Phase 6 — Simplify agents + skills
+
+Merge/rename skills theo architecture mới.
+
+Bỏ những prompt/profile duplicate.
+
+Mỗi task có:
+
+```text
+1 skill
+1 agent implementation
+1 clear responsibility
+```
+
+Orchestrator instruction chứa logic chung.
+
+Verification chứa quy tắc chung.
+
+Agent không tự submit.
+
+Agent không tự lựa model.
+
+Agent không tự retry model khác.
+
+Agent không thay competition state.
+
+Đây là boundary rất quan trọng.
+
+---
+
+# 19. Phase 7 — Tests cleanup
+
+Không nên cố giữ tất cả test cũ.
+
+Refactor architecture lớn mà cố giữ test của abstraction đã xoá chỉ làm repo phức tạp trở lại.
+
+Test mới nên tập trung vào runtime-critical behavior.
+
+### Unit
+
+Test:
+
+```text
+task → correct agent
+unknown task → error
+
+Game Master bad response → error
+auth failure → error
+
+verification failure → no submit
+
+git guard failure → no submit
+
+receipt malformed → error
+
+journal idempotency
+```
+
+### Integration
+
+Test:
+
+```text
+fake Game Master
+→ Start Work
+→ Agent
+→ verification
+→ git guard
+→ submit
+→ receipt
+```
+
+### Không cần unit-test framework đã xoá
+
+Ví dụ:
+
+```text
+model router tests
+learning tests
+scheduler edge cases
+fallback chain tests
+unused backend tests
+```
+
+Delete cùng module.
+
+---
+
+# 20. E2E strategy: thi thử là source of truth
+
+Tôi đồng ý với mục tiêu:
+
+> E2E cuối cùng phải được đánh giá bằng thi thử thực tế, không phải simulator.
+
+CI chỉ chứng minh:
+
+```text
+code internally consistent
+```
+
+Nó không chứng minh:
+
+```text
+competition integration correct
+```
+
+Thậm chí pipeline hiện tại có trường hợp CI xanh nhưng live staging integration bị skip vì thiếu credential. 
+
+Do đó acceptance hierarchy nên là:
+
+```text
+Unit tests
+    ↓
+Integration tests
+    ↓
+Local dry run
+    ↓
+Official practice match
+    ↓
+1000 / 1000
+```
+
+### 1000/1000 mới là Final E2E Gate
+
+Không tuyên bố:
+
+```text
+PRODUCTION READY
+```
+
+chỉ vì:
+
+```text
+pytest = green
+```
+
+Final readiness chỉ khi:
+
+```text
+Practice Game Master
++
+real repository
++
+real task waves
++
+real commits
++
+real submissions
++
+official scoring
+=
+1000/1000
+```
+
+---
+
+# 21. Sau lần thi thử đầu tiên mới tối ưu reliability
+
+Điều này phù hợp chính xác với mục tiêu bạn đưa ra.
+
+Ở refactor hiện tại:
+
+```text
+Don't solve hypothetical failures.
+```
+
+Thi thử sẽ cho biết failure nào thực sự tồn tại.
+
+Ví dụ nếu phát hiện:
+
+```text
+Game Master occasionally timeout
+```
+
+lúc đó mới implement timeout handling.
+
+Nếu:
+
+```text
+Next.js match page changes
+```
+
+lúc đó mới fix parser.
+
+Nếu:
+
+```text
+submission occasionally returns transient 5xx
+```
+
+lúc đó mới quyết định có retry hay không.
+
+Không viết 500 LOC để bảo vệ một lỗi chưa từng xảy ra.
+
+---
+
+# 22. Phase 8 — Repo cleanup
+
+Sau khi runtime mới hoạt động, mới cleanup mạnh.
+
+Các nhóm cần kiểm tra để delete:
+
+```text
+old configs
+old release manifests
+deprecated docs
+legacy scripts
+unused adapters
+unused fixtures
+learning artifacts
+model routing artifacts
+old profiles
+duplicated skills
+unused simulator assets
+benchmark-only modules
+generated reports
+stale production readiness docs
+dead test fixtures
+```
+
+`AI-Arena/` nên đặc biệt xem xét.
+
+Nếu nó không tham gia:
+
+```text
+Start Work → Solve → Submit
+```
+
+thì không nên nằm trong production repository.
+
+Có thể:
+
+```text
+delete
+```
+
+hoặc chuyển thành repository benchmark riêng.
+
+---
+
+# 23. Docs cũng phải refactor
+
+Hiện tại repo có nhiều tài liệu mô tả architecture ở nhiều giai đoạn khác nhau.
+
+Sau refactor chỉ nên còn một số docs authoritative.
+
+### `README.md`
+
+Chỉ:
+
+```text
+what
+how install
+how run
+how test
+how practice
+```
+
+### `ARCHITECTURE.md`
+
+Mô tả architecture thực tế.
+
+Không roadmap lịch sử.
+
+### `COMPETITION_PROTOCOL.md`
+
+Chỉ chứa:
+
+```text
+Game Master contract
+Start Work
+Submit
+receipt
+branch/commit rules
+MVS
+```
+
+### `PRACTICE_RUNBOOK.md`
+
+Hướng dẫn thi thử.
+
+### `REFACTOR_REPORT.md`
+
+Report sau cùng.
+
+---
+
+# 24. Report cuối refactor
+
+Report cuối nên có các metric cụ thể:
+
+| Metric | Before | After |
+|---|---:|---:|
+| Python modules | X | Y |
+| Runtime packages | 7 | ~1 main package |
+| Agent types | X | 4 |
+| Model routing implementations | X | 0 |
+| Learning modules | X | 0 |
+| Production backends | X | 1 |
+| Fallback paths | X | 0 |
+| Runtime config files | X | 0 |
+| Competition orchestrators | X | 1 |
+| Production submit paths | X | 1 |
+| LOC | X | Y |
+| Test count | X | Y |
+| E2E score | — | 1000/1000 |
+
+Đồng thời report phải liệt kê:
+
+```text
+deleted files
+moved files
+renamed files
+retained modules
+known limitations
+practice discoveries
+remaining optimization opportunities
+```
+
+---
+
+# 25. Thứ tự PR / commit tôi khuyến nghị
+
+Tôi sẽ không làm một mega-commit duy nhất dù đây là refactor lớn.
+
+| PR | Scope |
+|---|---|
+| **R01** | Baseline + dependency/runtime inventory |
+| **R02** | Delete Learning System |
+| **R03** | Delete Model Router + model fallback |
+| **R04** | Collapse backend layer |
+| **R05** | Hardcode runtime constants, delete config system |
+| **R06** | Simplify Competition Bridge |
+| **R07** | Replace Orchestrator |
+| **R08** | Simplify Sub-Agents / Skills |
+| **R09** | Hard verification → git → submit pipeline |
+| **R10** | Simplify MCP server |
+| **R11** | Rewrite critical tests |
+| **R12** | Repository cleanup |
+| **R13** | Documentation cleanup + Refactor Report |
+| **R14** | Practice E2E fixes |
+| **R15** | 1000/1000 release candidate |
+
+Sau mỗi PR:
+
+```text
+tests green
+no broken imports
+no dead references
+no compatibility shim added
+```
+
+---
+
+# 26. Những thứ cố tình KHÔNG làm trong refactor này
+
+Để tránh scope creep, tôi sẽ đặt các mục này ngoài scope:
+
+```text
+multi-model optimization
+adaptive model selection
+learning from previous matches
+automatic fallback
+distributed workers
+complex concurrency
+dynamic configuration
+advanced retries
+self-healing
+generic competition framework
+generic provider framework
+production-grade observability
+automatic performance tuning
+```
+
+Chúng chỉ quay lại khi thi thử chứng minh có nhu cầu.
+
+---
+
+# 27. Definition of Done
+
+Refactor chỉ được coi là hoàn tất khi thỏa đồng thời:
+
+1. `mtm_training` không còn trong repo.
+2. Model Router không còn.
+3. Không có production model fallback.
+4. Không có backend fallback.
+5. Không còn runtime YAML config.
+6. Model/runtime policy được hardcode trong source.
+7. Chỉ còn một production orchestrator.
+8. Chỉ còn một official Game Master path.
+9. Chỉ còn một submission pipeline.
+10. Orchestrator dispatch trực tiếp sang 4 task agents.
+11. Verification bắt buộc trước submission.
+12. Git guard bắt buộc trước submission.
+13. Không submit nếu MVS fail.
+14. Agent không tự submit.
+15. MCP server chỉ còn thin bridge.
+16. Dead modules/tests/docs đã được xoá.
+17. Runtime structure được tổ chức lại rõ ràng.
+18. Có `REFACTOR_REPORT.md`.
+19. Có practice runbook.
+20. **Official practice E2E đạt 1000/1000.**
+
+---
+
+## Đích cuối cùng
+
+Từ kiến trúc hiện tại kiểu:
+
+```text
+Core
+Competition Engine
+Model Router
+Backends
+Agents
+Knowledge
+Arena
+Training
+Config
+Scheduler
+Supervisor
+Fallback
+MCP
+Game Master Adapter
+```
+
+đưa xuống:
+
+```text
+             ┌─────────────┐
+             │ Game Master │
+             └──────┬──────┘
+                    │
+           ┌────────▼────────┐
+           │ Competition     │
+           │ Bridge / MCP    │
+           └────────┬────────┘
+                    │
+             ┌──────▼──────┐
+             │ Orchestrator│
+             └──────┬──────┘
+                    │
+       ┌────────────┼────────────┐
+       │            │            │
+      BUG          TASK         CR          PI
+       │            │            │           │
+       └────────────┴──────┬─────┴───────────┘
+                           │
+                    ┌──────▼──────┐
+                    │ Verification│
+                    └──────┬──────┘
+                           │
+                    ┌──────▼──────┐
+                    │  Git Guard  │
+                    └──────┬──────┘
+                           │
+                    ┌──────▼──────┐
+                    │   Submit    │
+                    └──────┬──────┘
+                           │
+                       Receipt
+```
+
+Tôi xem đây là hướng refactor phù hợp nhất với giai đoạn hiện tại: **xóa complexity trước, làm cho đường thi thật có thể nhìn thấy toàn bộ từ đầu đến cuối, dùng thi thử để khám phá lỗi thực tế, rồi chỉ thêm reliability đúng vào những chỗ đã chứng minh là cần.**

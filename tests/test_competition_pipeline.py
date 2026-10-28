@@ -12,7 +12,6 @@ from mtm_competition.tasks.store import TaskStore
 from mtm_competition.tasks.state_machine import TaskStateMachine, InvalidStateTransitionError
 from mtm_competition.scheduling.scheduler import TournamentScheduler
 from mtm_competition.routing.skill_router import SkillRouter
-from mtm_competition.routing.model_router import ModelRouter
 from mtm_competition.routing.prompt_builder import PromptBuilder
 from mtm_competition.integration.git_guard import GitGuard
 from mtm_competition.integration.submission_guard import SubmissionGuard, SubmissionGateError

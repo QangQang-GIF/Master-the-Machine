@@ -125,10 +125,10 @@ def test_high_volume_stream_pause_resume_deadline_freeze():
     )
 
     pause_event = threading.Event()
-    # Nominal timeout budget is 0.7s (less than the child's active execution duration of 1.12s).
-    # Pause is held for 0.9s (longer than the entire 0.7s timeout budget).
-    nominal_timeout = 0.7
-    pause_hold_duration = 0.9
+    # Nominal timeout budget is 1.0s (less than total active time + pause hold).
+    # Pause is held for 1.3s (longer than the entire 1.0s timeout budget).
+    nominal_timeout = 1.0
+    pause_hold_duration = 1.3
 
     def _pause_controller():
         time.sleep(0.1)

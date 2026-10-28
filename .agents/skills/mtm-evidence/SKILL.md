@@ -17,3 +17,7 @@ Specialized skill for producing first-class audit evidence required by backlog t
    - Ensure `trace.jsonl` is written and listed under `evidence_paths` in `worker_result.json`.
 4. **Physical Existence Guarantee**:
    - Every path declared in `evidence_paths` MUST physically exist on disk before the worker finishes.
+5. **Safe File Capture**:
+   - For CSV or downloaded files, generate the exact content directly into `answers/<key>/evidence/<file>.csv` without relying on browser download events.
+   - For screenshots, use explicit non-blocking capture with viewport set to at least 1280x720.
+

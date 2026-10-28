@@ -356,16 +356,7 @@ class SubmissionGuard:
                 except Exception:
                     pass
 
-            try:
-                return game_master_submit_fn(**call_kwargs)
-            except TypeError:
-                call_kwargs.pop("serialized_body_bytes", None)
-                call_kwargs.pop("artifact_urls", None)
-                call_kwargs.pop("client_submission_id", None)
-                call_kwargs.pop("match_uuid", None)
-                call_kwargs.pop("idempotency_key", None)
-                call_kwargs.pop("answer", None)
-                return game_master_submit_fn(**call_kwargs)
+            return game_master_submit_fn(**call_kwargs)
 
         response = None
         last_error = None
@@ -444,12 +435,22 @@ class SubmissionGuard:
         status_code = getattr(e, "status_code", None)
         error_code = getattr(e, "error_code", None)
         if status_code is not None and 400 <= status_code < 500 and status_code != 429:
-            self.journal.record_rejection(
-                match_uuid=target_match_uuid,
-                backlog_item_key=task_id,
-                http_code=status_code,
-                error_code=str(error_code or e),
-            )
+            err_code_str = str(error_code or "").lower()
+            if status_code == 409 and ("already_submitted" in err_code_str or "already submitted" in str(e).lower()):
+                self.journal.record_already_submitted(
+                    match_uuid=target_match_uuid,
+                    backlog_item_key=task_id,
+                    http_code=status_code,
+                    error_code="ALREADY_SUBMITTED",
+                    error_message=str(e),
+                )
+            else:
+                self.journal.record_rejection(
+                    match_uuid=target_match_uuid,
+                    backlog_item_key=task_id,
+                    http_code=status_code,
+                    error_code=str(error_code or e),
+                )
             self.store.record_submission(
                 task_id=task_id,
                 status="REJECTED",

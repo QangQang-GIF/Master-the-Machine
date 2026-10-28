@@ -33,6 +33,7 @@ for _p in [str(_pack_root), str(_src_dir)]:
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
+from mtm.constants import DEFAULT_GAME_MASTER_ORIGIN
 from mtm_competition.adapters.base import validate_match_projection_schema
 from mtm_competition.adapters.official_game_master import (
     OfficialGameMasterAdapter,
@@ -198,7 +199,7 @@ class MCPHelperServer:
         if new_api_url:
             self.api_url = new_api_url
         elif not self.api_url:
-            self.api_url = "https://ai-fest-five.vercel.app"
+            self.api_url = DEFAULT_GAME_MASTER_ORIGIN
 
         # Update existing adapter instance WITHOUT replacing it (preserving cookies)
         if self.adapter is not None:
@@ -215,7 +216,7 @@ class MCPHelperServer:
                 base_url=self.api_url,
                 auth_token=self.bearer_token,
                 match_uuid=self.match_uuid,
-                max_retries=3,
+                max_retries=1,
             )
             if self.session_cookies:
                 self.adapter.session_cookies.update(self.session_cookies)

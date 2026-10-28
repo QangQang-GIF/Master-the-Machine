@@ -203,7 +203,7 @@ def verify_distribution(ws_dir: Path, pack_dir: Path | None = None) -> None:
     if not src_dir.exists():
         src_dir = ws_dir / "src"
     if src_dir.exists():
-        test_import_code = "import mtm_core; import mtm_competition; import mtm_knowledge; import runner.telemetry; print('OK')"
+        test_import_code = "import mtm; import mtm.constants; import mtm_core; from mtm_core import constants; import mtm_competition; import mtm_knowledge; import runner.telemetry; print('OK')"
         env = os.environ.copy()
         env["PYTHONPATH"] = f"{src_dir}{os.pathsep}{pack_dir}{os.pathsep}{ws_dir}{os.pathsep}{env.get('PYTHONPATH', '')}"
         res = subprocess.run([sys.executable, "-c", test_import_code], capture_output=True, text=True, env=env)

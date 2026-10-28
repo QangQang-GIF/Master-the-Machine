@@ -37,3 +37,9 @@ Write worker_result.json
    - Test edge cases (null inputs, boundary values, error responses).
    - If MVS tests are declared, verify all of them pass.
 5. **Report**: Write `worker_result.json` with status `READY_FOR_REVIEW`.
+
+## CR Verification & File Export Rules
+- **Non-blocking Downloads**: When testing file export features (CSV/PDF), never hang waiting for browser download events (`waitForEvent('download')`). Instead, evaluate the export generation directly or write the export data straight to the designated evidence path (`answers/<key>/evidence/<file>.csv`).
+- **Playwright Timeouts**: All browser operations must include an explicit timeout (max 5000ms).
+- **Audit Evidence**: Ensure all required evidence files (screenshots, logs, reports) exist before reporting completion.
+

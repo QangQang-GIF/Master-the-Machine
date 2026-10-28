@@ -53,4 +53,12 @@ bench_results.json
 *.db-shm
 team-sdlc-pack/
 
+# Match workspaces and tournament downloads
+matches/
+mtm-ban/
+mtm-player*/
+state/
+.DS_Store
+
+
 

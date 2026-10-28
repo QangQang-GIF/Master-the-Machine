@@ -48,12 +48,15 @@ def install_pack(source_dir: Path, workspace_dir: Path) -> None:
     files_to_copy = [
         "team-runtime.json",
         "team-pack-info.json",
+        "install.ps1",
+        "README.md",
     ]
     for f in files_to_copy:
         src_f = source_dir / f
         if src_f.exists():
             safe_copy2(src_f, target_pack_dir / f)
-            safe_copy2(src_f, ws / ".mtm" / f)
+            if f in ["team-runtime.json", "team-pack-info.json"]:
+                safe_copy2(src_f, ws / ".mtm" / f)
 
     # 1b. Install standard root package.json in TeamWorkspace and team-sdlc-pack (R3)
     pkg_json_src = source_dir / "package.json"
@@ -96,12 +99,27 @@ def install_pack(source_dir: Path, workspace_dir: Path) -> None:
         "scripts",
         "docs",
         "skills",
+        "bin",
+        "config",
+        "contracts",
     ]
     for d in dirs_to_copy:
         src_d = source_dir / d
         if src_d.exists():
             dst_d = target_pack_dir / d
             safe_copytree(src_d, dst_d)
+
+    # 2b. Mirror to target_pack_dir / "runtime" for MTM Player verification
+    runtime_dir = target_pack_dir / "runtime"
+    runtime_dir.mkdir(parents=True, exist_ok=True)
+    for f in ["package.json", "team-runtime.json", "team-pack-info.json", "README.md", "install.ps1"]:
+        src_f = source_dir / f
+        if src_f.exists():
+            safe_copy2(src_f, runtime_dir / f)
+    for d in ["agents", "bin", "config", "contracts", "docs", "scripts", "skills", "src", "profiles", "schemas", "runner"]:
+        src_d = source_dir / d
+        if src_d.exists():
+            safe_copytree(src_d, runtime_dir / d)
 
     # 3. Setup skills layout: .agents/skills/team-orchestrator/SKILL.md
     ws_agents_skills = ws / ".agents" / "skills"

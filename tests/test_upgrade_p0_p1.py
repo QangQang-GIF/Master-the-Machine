@@ -12,7 +12,6 @@ from mtm_core.git import git_init, get_head_sha, run_git
 from mtm_competition.tasks.store import TaskStore
 from mtm_competition.tasks.state_machine import TaskStateMachine
 from mtm_competition.scheduling.scheduler import TournamentScheduler
-from mtm_competition.routing.model_router import ModelRouter
 from mtm_competition.verification.qa_gate import validate_qa_gate, QAGateError
 from mtm_competition.integration.git_guard import GitGuard
 from mtm_competition.integration.integration_guard import IntegrationGuard
@@ -31,44 +30,50 @@ def test_official_game_master_adapter_mocked_http():
     """Verify OfficialGameMasterAdapter performs correct HTTP requests and parses responses."""
     adapter = OfficialGameMasterAdapter(api_base_url="http://test-server:9000", api_key="secret-token", team_id="team-shark")
 
-    fake_match_state = {"status": "RUNNING", "remaining_seconds": 1800, "server_epoch": 1700000000.0}
-    fake_backlog = [{"task_id": "BUG-1", "task_type": "BUG", "points": 100}]
+    fake_start_response = {
+        "backlogId": "BUG-1",
+        "replay": False,
+        "submitTemplate": {"status": "SUBMITTED"},
+        "minimumVerificationScenarios": [{"scenario": "test"}],
+    }
 
     with patch.object(adapter, "_request") as mock_req:
-        mock_req.side_effect = [fake_match_state, fake_backlog]
+        mock_req.return_value = fake_start_response
 
-        state = adapter.get_match_state()
-        assert state["status"] == "RUNNING"
-        assert state["server_epoch"] == 1700000000.0
-        mock_req.assert_called_with("GET", "/match/state")
-
-        backlog = adapter.list_backlog()
-        assert len(backlog) == 1
-        assert backlog[0]["task_id"] == "BUG-1"
-        mock_req.assert_called_with("GET", "/backlog")
+        res = adapter.start_working("8c0e1b22-1111-4222-8333-444444444444", "BUG-1")
+        assert res["backlogId"] == "BUG-1"
+        assert res["replay"] is False
+        mock_req.assert_called_with(
+            "POST",
+            "/api/v1/matches/8c0e1b22-1111-4222-8333-444444444444/backlogs/start",
+            data={"backlogItemKey": "BUG-1"},
+        )
 
 
 def test_official_game_master_adapter_client_error_no_retry():
     """4xx errors should immediately raise GameMasterAPIError without futile retries."""
-    adapter = OfficialGameMasterAdapter(api_base_url="http://test-server:9000")
+    adapter = OfficialGameMasterAdapter(
+        api_base_url="http://test-server:9000",
+        match_uuid="8c0e1b22-1111-4222-8333-444444444444",
+    )
 
     import urllib.error
     import io
 
     # Mock an HTTP 409 Conflict (e.g. duplicate submission)
     err = urllib.error.HTTPError(
-        url="http://test-server:9000/tasks/BUG-1/submit",
+        url="http://test-server:9000/api/v1/matches/8c0e1b22-1111-4222-8333-444444444444/submissions",
         code=409,
         msg="Conflict",
         hdrs={},
-        fp=io.BytesIO(b'{"error": "Task already submitted"}'),
+        fp=io.BytesIO(b'{"error": {"code": "ALREADY_SUBMITTED", "message": "Task already submitted"}}'),
     )
 
     with patch("urllib.request.urlopen", side_effect=err):
         with pytest.raises(GameMasterAPIError) as exc_info:
-            adapter.submit("BUG-1", "abc1234")
+            adapter.submit("BUG-1", "a" * 40, answer={"status": "SUBMITTED"})
         assert exc_info.value.status_code == 409
-        assert "already submitted" in exc_info.value.message
+        assert "already submitted" in exc_info.value.message.lower()
 
 
 def test_git_push_pipeline_in_integration_guard(tmp_path):
@@ -266,31 +271,6 @@ def test_submission_in_flight_timeout_recovery(tmp_path):
     assert sub_res.success is True
     assert sub_res.points_awarded == 200
     assert store.has_submitted("BUG-RECON") is True
-
-
-def test_backend_routing_synchronization():
-    """Verify backend selection switches model profile and effort according to Upgrade-mini.md."""
-    router = ModelRouter()
-
-    env_pi = {"task_id": "PI-1", "task_type": "PI", "points": 250}
-
-    # Codex backend -> deep_reasoning with gpt-6.1-sol and high effort
-    route_codex = router.route(env_pi, backend="codex")
-    assert route_codex.backend == "codex"
-    assert route_codex.model == "gpt-6.1-sol"
-    assert route_codex.reasoning_effort == "high"
-
-    # Antigravity backend -> deep_reasoning with claude-sonnet-4-6 and high effort
-    route_agy = router.route(env_pi, backend="antigravity")
-    assert route_agy.backend == "antigravity"
-    assert route_agy.model == "claude-sonnet-4-6"
-    assert route_agy.reasoning_effort == "high"
-
-    # Fast profile for minor task
-    env_task = {"task_id": "TASK-1", "task_type": "TASK", "points": 50}
-    route_agy_fast = router.route(env_task, backend="antigravity")
-    assert route_agy_fast.model in ("gemini-3.8-flash-low", "gemini-3.8-flash-high")
-    assert route_agy_fast.reasoning_effort == "low"
 
 
 def test_skill_checksum_verification():

@@ -64,10 +64,9 @@ def validate_match_projection_schema(data: Any) -> Dict[str, Any]:
 class GameMasterAdapter(ABC):
     """Interface defining contracts with the Tournament Game Master."""
 
-    @abstractmethod
     def get_match_state(self) -> Dict[str, Any]:
         """Fetch current match state (duration, remaining time, points, teams)."""
-        pass
+        raise NotImplementedError("Digital Cuder match state is accessed via get_match_projection().")
 
     def get_match_projection(self, match_id_or_code: Optional[str] = None) -> Dict[str, Any]:
         """Fetch match projection for spectator / match view."""
@@ -86,15 +85,13 @@ class GameMasterAdapter(ABC):
         """
         raise NotImplementedError("login_session must be implemented by adapter supporting session authentication")
 
-    @abstractmethod
     def list_backlog(self) -> List[Dict[str, Any]]:
         """List currently visible backlog items."""
-        pass
+        raise NotImplementedError("Digital Cuder does not provide /backlog. Use get_match_projection().")
 
-    @abstractmethod
     def get_task(self, task_id: str) -> Dict[str, Any]:
         """Fetch detailed description and metadata for a specific task."""
-        pass
+        raise NotImplementedError("Digital Cuder does not provide /tasks/{id}. Use get_match_projection().")
 
     @abstractmethod
     def start_working(
@@ -105,20 +102,24 @@ class GameMasterAdapter(ABC):
         """Signal to Game Master that the team has started working on this item."""
         pass
 
-    @abstractmethod
     def get_mvs(self, task_id: str) -> Optional[List[Dict[str, Any]]]:
         """Retrieve Minimum Viable Solution tests once unlocked."""
-        pass
+        raise NotImplementedError("Digital Cuder does not provide /tasks/{id}/mvs. MVS is in start_work().")
 
-    @abstractmethod
     def submit(
         self,
         task_id: str,
         git_revision: str,
         evidence: Optional[List[str]] = None,
+        idempotency_key: Optional[str] = None,
+        match_uuid: Optional[str] = None,
+        answer: Optional[Dict[str, Any]] = None,
+        client_submission_id: Optional[str] = None,
+        artifact_urls: Optional[List[str]] = None,
+        serialized_body_bytes: Optional[bytes] = None,
     ) -> Dict[str, Any]:
         """Submit the solution revision for scoring."""
-        pass
+        raise NotImplementedError("submit must be implemented or delegated to submit_work.")
 
     def submit_work(
         self,
@@ -137,10 +138,9 @@ class GameMasterAdapter(ABC):
         """
         raise NotImplementedError("submit_work must be implemented by adapter supporting Digital Cuder wire contract")
 
-    @abstractmethod
     def get_submission_status(self, task_id: str) -> Dict[str, Any]:
         """Check grading status (ACCEPTED, PASSED, FAILED)."""
-        pass
+        raise NotImplementedError("Digital Cuder does not provide /tasks/{id}/submission.")
 
 
 __all__ = [

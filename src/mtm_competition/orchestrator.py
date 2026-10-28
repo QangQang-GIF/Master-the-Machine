@@ -104,14 +104,17 @@ class CompetitionOrchestrator:
         self.verify_post_integration = verify_post_integration
         self.reverify_worker_tests = reverify_worker_tests
 
-        # Resolve backend configuration from argument, env var, or config file
-        from mtm_core.config.loader import load_environment_config
-        env_cfg = load_environment_config()
+        # Resolve backend configuration from centralized constants
+        from mtm.constants import (
+            DEFAULT_WORKER_BACKEND,
+            STRICT_BACKEND,
+            ALLOW_FALLBACK,
+        )
         self.worker_backend = (
             worker_backend
             or __import__("os").environ.get("MTM_WORKER_BACKEND")
             or __import__("os").environ.get("MTM_BACKEND")
-            or env_cfg.get("orchestrator", {}).get("worker_backend", "codex")
+            or DEFAULT_WORKER_BACKEND
         ).lower()
 
         if self.worker_backend not in ("codex", "antigravity", "auto"):
@@ -119,8 +122,8 @@ class CompetitionOrchestrator:
                 f"Invalid backend '{self.worker_backend}'. Explicit backend must be 'codex' or 'antigravity'"
             )
 
-        strict_backend = env_cfg.get("worker", {}).get("strict_backend", True)
-        allow_fallback = env_cfg.get("worker", {}).get("allow_fallback", False)
+        strict_backend = STRICT_BACKEND
+        allow_fallback = ALLOW_FALLBACK
 
         self.launcher = WorkerLauncher(
             self.scratch_dir,
@@ -141,11 +144,8 @@ class CompetitionOrchestrator:
         self.cumulative_billable_tokens: int = self.store.get_total_billable_tokens()
         self.token_budget = token_budget
 
-        mode = (
-            __import__("os").environ.get("MTM_ENV")
-            or env_cfg.get("mode")
-            or env_cfg.get("orchestrator", {}).get("mode", "development")
-        ).lower()
+        from mtm_core.config.loader import get_environment_mode
+        mode = get_environment_mode()
         if mode == "production":
             self.verify_skill_integrity = True
             self.reverify_worker_tests = True

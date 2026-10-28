@@ -24,8 +24,40 @@ def is_cross_platform_absolute_path(path_str: str) -> bool:
         pass
     return False
 
+import fnmatch
 from mtm_core.git import get_head_sha, is_repo_clean, run_git
-from mtm_competition.integration.integration_guard import is_forbidden_path
+from mtm.constants import FORBIDDEN_FILE_PATTERNS, FORBIDDEN_DIR_PREFIXES
+
+
+def is_forbidden_path(rel_path: Path | str) -> tuple[bool, str]:
+    """Check if a path matches forbidden file exclusions (GIT-04)."""
+    p = Path(rel_path)
+    posix_path = p.as_posix()
+    posix_lower = posix_path.lower()
+    name_lower = p.name.lower()
+
+    for pat in FORBIDDEN_FILE_PATTERNS:
+        if fnmatch.fnmatch(name_lower, pat.lower()):
+            return True, f"Forbidden file pattern '{pat}' matched by '{rel_path}'"
+
+    for prefix in FORBIDDEN_DIR_PREFIXES:
+        pref_lower = prefix.lower()
+        if (
+            posix_lower == pref_lower
+            or posix_lower.startswith(pref_lower + "/")
+            or f"/{pref_lower}/" in posix_lower
+            or posix_lower.endswith("/" + pref_lower)
+        ):
+            return True, f"Forbidden directory '{prefix}' matched by '{rel_path}'"
+
+    for part in p.parts:
+        part_lower = part.lower()
+        if part_lower in (".codex", ".agents"):
+            return True, f"Forbidden internal agent cache directory '{part}' in '{rel_path}'"
+        if fnmatch.fnmatch(part_lower, "*secret*") or fnmatch.fnmatch(part_lower, "*token*"):
+            return True, f"Forbidden secret/token directory '{part}' in '{rel_path}'"
+
+    return False, ""
 
 
 class SubmissionGateError(Exception):

@@ -162,8 +162,8 @@ class OfficialGameMasterAdapter(GameMasterAdapter):
         api_base_url: Optional[str] = None,
         api_key: Optional[str] = None,
         team_id: Optional[str] = None,
-        timeout: float = 8.0,
-        max_retries: int = 3,
+        timeout: float = 15.0,
+        max_retries: int = 1,
         base_url: Optional[str] = None,
         auth_token: Optional[str] = None,
         match_uuid: Optional[str] = None,
@@ -246,6 +246,71 @@ class OfficialGameMasterAdapter(GameMasterAdapter):
         self._validate_url_security(url)
         return url
 
+    def _extract_nextjs_projection(self, resp_body: str) -> Optional[Dict[str, Any]]:
+        """Extract embedded Next.js page state from spectator HTML (<script id="__NEXT_DATA__"> or initialProjection)."""
+        m = re.search(r'<script\s+id="__NEXT_DATA__"[^>]*>(.*?)</script>', resp_body, re.DOTALL)
+        if m:
+            try:
+                next_data = json.loads(m.group(1))
+                page_props = next_data.get("props", {}).get("pageProps", {})
+                match_obj = page_props.get("match") or page_props.get("matchData") or page_props.get("state") or {}
+                team_obj = page_props.get("team") or {}
+                repo_obj = page_props.get("repository") or page_props.get("assignment") or {}
+                items = match_obj.get("backlogItems") or page_props.get("backlogItems") or []
+                wave_timestamps = match_obj.get("waveTimestamps") or page_props.get("waveTimestamps") or {}
+
+                parsed = {
+                    "matchUuid": match_obj.get("matchUuid") or match_obj.get("id") or page_props.get("matchUuid") or page_props.get("id"),
+                    "matchCode": match_obj.get("matchCode") or page_props.get("matchCode") or next_data.get("query", {}).get("matchId") or next_data.get("query", {}).get("matchCode"),
+                    "status": match_obj.get("status") or page_props.get("status") or "IN_PROGRESS",
+                    "backlogItems": items if isinstance(items, list) else [],
+                    "waveTimestamps": wave_timestamps,
+                    "team": team_obj,
+                    "teamId": team_obj.get("id") or team_obj.get("teamId") or page_props.get("teamId"),
+                    "teamName": team_obj.get("name") or team_obj.get("teamName") or page_props.get("teamName"),
+                    "repository": repo_obj,
+                    "pageProps": page_props,
+                }
+                for k, v in page_props.items():
+                    parsed.setdefault(k, v)
+                for k, v in match_obj.items():
+                    parsed.setdefault(k, v)
+                return parsed
+            except Exception:
+                return None
+
+        if "initialProjection" in resp_body:
+            try:
+                idx = resp_body.find("initialProjection")
+                start_obj = resp_body.find("{", idx)
+                if start_obj != -1:
+                    cleaned = resp_body[start_obj:].replace('\\\\\"', '\"').replace('\\\"', '\"')
+                    proj_obj, _ = json.JSONDecoder().raw_decode(cleaned)
+                    match_obj = proj_obj.get("match") or {}
+                    team_obj = proj_obj.get("team") or {}
+                    repo_obj = proj_obj.get("repo") or proj_obj.get("repository") or {}
+                    items = proj_obj.get("backlog") or proj_obj.get("backlogItems") or []
+                    parsed = {
+                        "matchUuid": match_obj.get("id") or match_obj.get("matchUuid"),
+                        "matchCode": match_obj.get("publicId") or match_obj.get("matchCode"),
+                        "status": match_obj.get("status") or "IN_PROGRESS",
+                        "backlogItems": items if isinstance(items, list) else [],
+                        "team": team_obj,
+                        "teamId": team_obj.get("id") or team_obj.get("code"),
+                        "teamName": team_obj.get("name"),
+                        "repository": repo_obj,
+                        "projectContext": proj_obj.get("projectContext"),
+                        "api": proj_obj.get("api"),
+                    }
+                    for k, v in proj_obj.items():
+                        parsed.setdefault(k, v)
+                    for k, v in match_obj.items():
+                        parsed.setdefault(k, v)
+                    return parsed
+            except Exception:
+                return None
+        return None
+
     def _request(
         self,
         method: str,
@@ -323,68 +388,10 @@ class OfficialGameMasterAdapter(GameMasterAdapter):
                     try:
                         parsed = json.loads(resp_body)
                     except json.JSONDecodeError:
-                        # Attempt to extract embedded Next.js page state from HTML: <script id="__NEXT_DATA__" ...>
-                        m = re.search(r'<script\s+id="__NEXT_DATA__"[^>]*>(.*?)</script>', resp_body, re.DOTALL)
-                        if m:
-                            try:
-                                next_data = json.loads(m.group(1))
-                                page_props = next_data.get("props", {}).get("pageProps", {})
-                                match_obj = page_props.get("match") or page_props.get("matchData") or page_props.get("state") or {}
-                                team_obj = page_props.get("team") or {}
-                                repo_obj = page_props.get("repository") or page_props.get("assignment") or {}
-                                items = match_obj.get("backlogItems") or page_props.get("backlogItems") or []
-                                wave_timestamps = match_obj.get("waveTimestamps") or page_props.get("waveTimestamps") or {}
-
-                                parsed = {
-                                    "matchUuid": match_obj.get("matchUuid") or match_obj.get("id") or page_props.get("matchUuid") or page_props.get("id"),
-                                    "matchCode": match_obj.get("matchCode") or page_props.get("matchCode") or next_data.get("query", {}).get("matchId") or next_data.get("query", {}).get("matchCode"),
-                                    "status": match_obj.get("status") or page_props.get("status") or "IN_PROGRESS",
-                                    "backlogItems": items if isinstance(items, list) else [],
-                                    "waveTimestamps": wave_timestamps,
-                                    "team": team_obj,
-                                    "teamId": team_obj.get("id") or team_obj.get("teamId") or page_props.get("teamId"),
-                                    "teamName": team_obj.get("name") or team_obj.get("teamName") or page_props.get("teamName"),
-                                    "repository": repo_obj,
-                                    "pageProps": page_props,
-                                }
-                                for k, v in page_props.items():
-                                    parsed.setdefault(k, v)
-                                for k, v in match_obj.items():
-                                    parsed.setdefault(k, v)
-                            except Exception:
-                                parsed = None
-                        else:
-                            parsed = None
-
-                        if not parsed and "initialProjection" in resp_body:
-                            try:
-                                idx = resp_body.find("initialProjection")
-                                start_obj = resp_body.find("{", idx)
-                                if start_obj != -1:
-                                    cleaned = resp_body[start_obj:].replace('\\\\\"', '\"').replace('\\\"', '\"')
-                                    proj_obj, _ = json.JSONDecoder().raw_decode(cleaned)
-                                    match_obj = proj_obj.get("match") or {}
-                                    team_obj = proj_obj.get("team") or {}
-                                    repo_obj = proj_obj.get("repo") or proj_obj.get("repository") or {}
-                                    items = proj_obj.get("backlog") or proj_obj.get("backlogItems") or []
-                                    parsed = {
-                                        "matchUuid": match_obj.get("id") or match_obj.get("matchUuid"),
-                                        "matchCode": match_obj.get("publicId") or match_obj.get("matchCode"),
-                                        "status": match_obj.get("status") or "IN_PROGRESS",
-                                        "backlogItems": items if isinstance(items, list) else [],
-                                        "team": team_obj,
-                                        "teamId": team_obj.get("id") or team_obj.get("code"),
-                                        "teamName": team_obj.get("name"),
-                                        "repository": repo_obj,
-                                        "projectContext": proj_obj.get("projectContext"),
-                                        "api": proj_obj.get("api"),
-                                    }
-                                    for k, v in proj_obj.items():
-                                        parsed.setdefault(k, v)
-                                    for k, v in match_obj.items():
-                                        parsed.setdefault(k, v)
-                            except Exception:
-                                parsed = None
+                        # Only allow HTML spectator extraction on /match/ page requests
+                        parsed = None
+                        if "/match" in url:
+                            parsed = self._extract_nextjs_projection(resp_body)
                         if parsed is None or not isinstance(parsed, dict):
                             raise GameMasterError(f"Received non-JSON response from {url}")
 
@@ -594,47 +601,20 @@ class OfficialGameMasterAdapter(GameMasterAdapter):
                     f"SEC-01: matchPageUrl origin '{parsed_page.netloc}' not in allowedMatchOrigins: {allowed_origins}"
                 )
 
-        # 2. Authenticate against /api/v1/auth/login or /api/auth/login or /login
-        login_endpoints = [
-            f"{page_origin}/api/v1/auth/login",
-            f"{page_origin}/api/auth/login",
-            f"{page_origin}/login",
-        ]
-
+        # 2. Authenticate strictly against /api/v1/auth/login per Digital Cuder contract
+        login_url = f"{page_origin}/api/v1/auth/login"
         login_data = {
             "username": username.strip(),
             "password": password.strip(),
         }
 
-        last_auth_error: Optional[Exception] = None
-        auth_succeeded = False
-        login_response: Dict[str, Any] = {}
-
-        for ep in login_endpoints:
-            try:
-                res = self._request("POST", ep, data=login_data, retries=1, headers={"Origin": page_origin})
-                login_response = res if isinstance(res, dict) else {}
-                auth_succeeded = True
-                break
-            except GameMasterAPIError as e:
-                if e.status_code == 404:
-                    last_auth_error = e
-                    continue
-                # If 401, 403, etc., fail closed immediately
+        try:
+            res = self._request("POST", login_url, data=login_data, retries=1, headers={"Origin": page_origin})
+            login_response = res if isinstance(res, dict) else {}
+        except Exception as e:
+            if isinstance(e, GameMasterError):
                 raise
-            except Exception as e:
-                last_auth_error = e
-                continue
-
-        if not auth_succeeded:
-            if last_auth_error:
-                if isinstance(last_auth_error, GameMasterError):
-                    raise last_auth_error
-                raise GameMasterAuthError(
-                    401,
-                    f"Authentication failed across login endpoints: {last_auth_error}",
-                ) from last_auth_error
-            raise GameMasterAuthError(401, "Authentication failed: could not connect to login endpoint")
+            raise GameMasterAuthError(401, f"Authentication failed: {e}") from e
 
         # Extract session token from cookies or response body
         session_token = ""
@@ -703,29 +683,7 @@ class OfficialGameMasterAdapter(GameMasterAdapter):
         }
 
 
-    def get_match_state(self) -> Dict[str, Any]:
-        """Fetch current match state (duration, remaining time, status, clock)."""
-        res = self._request("GET", "/match/state")
-        if not isinstance(res, dict):
-            return {"server_epoch": None, "server_calibrated": False}
-        if "server_epoch" not in res:
-            res["server_epoch"] = None
-            res["server_calibrated"] = False
-        else:
-            res["server_calibrated"] = True
-        return res
 
-    def list_backlog(self) -> List[Dict[str, Any]]:
-        """List currently available backlog items."""
-        res = self._request("GET", "/backlog")
-        if isinstance(res, list):
-            return res
-        return res.get("tasks", []) if isinstance(res, dict) else []
-
-    def get_task(self, task_id: str) -> Dict[str, Any]:
-        """Fetch full metadata for a task."""
-        encoded_id = urllib.parse.quote(task_id)
-        return self._request("GET", f"/tasks/{encoded_id}")
 
     def start_working(
         self,
@@ -776,28 +734,7 @@ class OfficialGameMasterAdapter(GameMasterAdapter):
                     pass
         return res
 
-    def get_mvs(self, task_id: str) -> Optional[List[Dict[str, Any]]]:
-        """Retrieve Minimum Viable Solution test specifications (legacy compatibility).
-
-        Differentiates:
-        - 200 OK: Returns List of MVS items.
-        - 404 Not Found: Server has no MVS for this task -> returns None.
-        - 403 / 423 Locked: MVS not unlocked -> raises MVSLockedError.
-        """
-        encoded_id = urllib.parse.quote(task_id)
-        try:
-            res = self._request("GET", f"/tasks/{encoded_id}/mvs")
-            if isinstance(res, list):
-                return res
-            return res.get("mvs") if isinstance(res, dict) else None
-        except GameMasterAuthError as e:
-            raise MVSLockedError(e.status_code, f"MVS is locked or not unlocked: {e.message}", e.payload)
-        except GameMasterAPIError as e:
-            if e.status_code == 404:
-                return None
-            if e.status_code in (403, 423):
-                raise MVSLockedError(e.status_code, f"MVS is locked: {e.message}", e.payload)
-            raise
+    start_work = start_working
 
     def submit_work(
         self,
@@ -901,37 +838,25 @@ class OfficialGameMasterAdapter(GameMasterAdapter):
         POST /tasks/{id}/submit for backward test compatibility.
         """
         target_match = match_uuid or self.match_uuid
-        if target_match and answer is not None:
-            import uuid
-            sub_id = client_submission_id or str(uuid.uuid4())
-            idemp = idempotency_key or sub_id
-            return self.submit_work(
-                match_uuid=target_match,
-                client_submission_id=sub_id,
-                idempotency_key=idemp,
-                backlog_item_key=task_id,
-                git_revision=git_revision,
-                answer=answer,
-                artifact_urls=artifact_urls,
-                serialized_body_bytes=serialized_body_bytes,
+        if not target_match or answer is None:
+            raise ValueError(
+                "Digital Cuder wire contract requires 'match_uuid' and 'answer' dictionary. "
+                "Legacy endpoint POST /tasks/{id}/submit has been eliminated."
             )
 
-        encoded_id = urllib.parse.quote(task_id)
-        payload = {
-            "task_id": task_id,
-            "git_revision": git_revision,
-            "evidence": evidence or [],
-        }
-        if idempotency_key:
-            payload["idempotency_key"] = idempotency_key
-
-        retries = self.max_retries if idempotency_key else 1
-        return self._request("POST", f"/tasks/{encoded_id}/submit", data=payload, retries=retries)
-
-    def get_submission_status(self, task_id: str) -> Dict[str, Any]:
-        """Check grading status (ACCEPTED, GRADING, PASSED, FAILED)."""
-        encoded_id = urllib.parse.quote(task_id)
-        return self._request("GET", f"/tasks/{encoded_id}/submission")
+        import uuid
+        sub_id = client_submission_id or str(uuid.uuid4())
+        idemp = idempotency_key or sub_id
+        return self.submit_work(
+            match_uuid=target_match,
+            client_submission_id=sub_id,
+            idempotency_key=idemp,
+            backlog_item_key=task_id,
+            git_revision=git_revision,
+            answer=answer,
+            artifact_urls=artifact_urls,
+            serialized_body_bytes=serialized_body_bytes,
+        )
 
 
 __all__ = [

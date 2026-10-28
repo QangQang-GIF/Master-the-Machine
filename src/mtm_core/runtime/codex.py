@@ -1,6 +1,6 @@
-"""CodexRuntime: Unified execution engine for OpenAI Codex CLI (and Antigravity fallback).
+"""CodexRuntime: Deterministic execution engine for OpenAI Codex CLI (`codex exec`).
 
-Single canonical runtime for both Competition Orchestrator and Arena Subsystems.
+Single canonical runtime for Competition Orchestrator.
 Enforces deterministic timeout semantics, pause-aware deadlines, policy-aware sandboxing,
 native agent profile targeting, and trace harvesting.
 """
@@ -23,7 +23,7 @@ from typing import Any, Callable, Dict, List, Optional
 logger = logging.getLogger(__name__)
 
 from .process import terminate_process_tree
-from .trace import ExecutionTrace, parse_codex_trace, parse_agy_trace
+from .trace import ExecutionTrace, parse_codex_trace
 
 
 class DiskLogWriter:
@@ -311,31 +311,18 @@ _terminate_process_tree = terminate_process_tree
 
 
 class CodexRuntime:
-    """Manages spawning, sandboxing, timing, and harvesting of Codex / Antigravity runs."""
+    """Deterministic execution engine for OpenAI Codex CLI (`codex exec`)."""
 
     def __init__(
         self,
-        prefer_codex: bool = True,
-        allow_agy_fallback: bool = True,
         codex_path: Any = _DEFAULT,
-        agy_path: Any = _DEFAULT,
-        default_backend: str = "auto",
-        strict_backend: bool = False,
+        **kwargs: Any,
     ):
-        self.prefer_codex = prefer_codex
-        self.allow_agy_fallback = allow_agy_fallback
         self.codex_path = shutil.which("codex") if codex_path is _DEFAULT else codex_path
-        self.agy_path = shutil.which("agy") if agy_path is _DEFAULT else agy_path
-        self.default_backend = default_backend
-        self.strict_backend = strict_backend
 
     @property
     def has_codex(self) -> bool:
         return self.codex_path is not None
-
-    @property
-    def has_agy(self) -> bool:
-        return self.agy_path is not None
 
     def build_codex_cmd(
         self,
@@ -372,52 +359,6 @@ class CodexRuntime:
                 cmd += ["-c", f"{k}={json.dumps(v)}"]
 
         cmd.append(prompt)
-        return cmd
-
-    def build_agy_cmd(
-        self,
-        prompt: str,
-        effort: Optional[str] = None,
-        model: Optional[str] = None,
-        sandbox_policy: Optional[str] = None,
-        agent: Optional[str] = None,
-        dangerously_skip_permissions: Optional[bool] = None,
-        skip_permissions: Optional[bool] = None,
-    ) -> List[str]:
-        """Construct Antigravity CLI command with policy-aware sandbox decoupled from permission bypass."""
-        policy = (sandbox_policy or os.environ.get("MTM_AGY_SANDBOX_POLICY") or "").strip().lower()
-        cmd = ["agy", "-p", prompt]
-
-        is_sandboxed = policy in ("read-only", "sandbox", "restricted", "workspace-sandbox") or (
-            os.environ.get("MTM_AGY_SANDBOX") == "1"
-        )
-
-        # Apply sandbox mode flags
-        if policy == "read-only":
-            cmd += ["--sandbox", "--mode", "plan"]
-        elif is_sandboxed:
-            cmd += ["--sandbox", "--mode", "accept-edits"]
-
-        # Resolve permission bypass orthogonally: defaults to False across ALL modes
-        explicit_bypass = dangerously_skip_permissions if dangerously_skip_permissions is not None else skip_permissions
-        if explicit_bypass is None:
-            env_val = os.environ.get("MTM_AGY_DANGEROUSLY_SKIP_PERMISSIONS") or os.environ.get("MTM_AGY_SKIP_PERMISSIONS")
-            if env_val is not None and env_val.strip():
-                explicit_bypass = env_val.strip().lower() in ("1", "true", "yes")
-
-        should_skip = bool(explicit_bypass) if explicit_bypass is not None else False
-
-        if should_skip:
-            logger.warning("Antigravity execution with permission bypass enabled (--dangerously-skip-permissions).")
-            cmd += ["--dangerously-skip-permissions"]
-
-        cmd += ["--output-format", "json"]
-        if agent:
-            cmd += ["--agent", agent]
-        if model:
-            cmd += ["--model", model]
-        if effort:
-            cmd += ["--effort", effort]
         return cmd
 
     @staticmethod
@@ -684,9 +625,15 @@ class CodexRuntime:
             )
         ws.mkdir(parents=True, exist_ok=True)
 
-        target_backend = (backend or self.default_backend).lower()
-        if self.strict_backend and target_backend not in ("codex", "antigravity"):
-            target_backend = "codex"
+        if backend is not None and backend.lower() not in ("codex", "auto"):
+            raise RuntimeError(
+                f"Unsupported backend '{backend}'. Only Codex CLI ('codex') is supported; Antigravity fallback has been removed."
+            )
+
+        if not self.has_codex:
+            raise RuntimeError(
+                "Codex CLI binary (`codex`) is not available on PATH. Ensure Codex CLI is installed."
+            )
 
         timed_out = False
         exit_code = 0
@@ -694,192 +641,82 @@ class CodexRuntime:
         trace = ExecutionTrace()
         t0 = time.time()
 
-        effective_bypass = dangerously_skip_permissions if dangerously_skip_permissions is not None else skip_permissions
-        if effective_bypass is None and codex_config:
-            effective_bypass = codex_config.get(
-                "dangerously_skip_permissions",
-                codex_config.get("skip_permissions"),
-            )
-
-        if target_backend == "codex":
-            if not self.has_codex:
-                raise RuntimeError(
-                    "Backend 'codex' explicitly selected but `codex` CLI is not available on PATH."
-                )
-            use_codex = True
-        elif target_backend == "antigravity":
-            if not self.has_agy:
-                raise RuntimeError(
-                    "Backend 'antigravity' explicitly selected but `agy` CLI is not available on PATH."
-                )
-            use_codex = False
+        cmd = self.build_codex_cmd(
+            workspace=ws,
+            prompt=prompt,
+            model=model,
+            effort=effort,
+            sandbox_policy=sandbox_policy,
+            network_access=network_access,
+            codex_config=codex_config,
+            agent=agent,
+        )
+        if cancel_event is not None and cancel_event.is_set():
+            timed_out = True
+            exit_code = -1
+            stdout_text = ""
         else:
-            # Auto-detection with preference and fallback
-            if self.prefer_codex and self.has_codex:
-                use_codex = True
-            elif self.allow_agy_fallback and self.has_agy:
-                use_codex = False
-            else:
-                raise RuntimeError(
-                    "Neither `codex` nor `agy` CLI is available on PATH. "
-                    "Ensure Codex CLI is installed or configure fallback."
-                )
-
-        resolved_backend = "codex" if use_codex else "antigravity"
-
-        if use_codex:
-            cmd = self.build_codex_cmd(
-                workspace=ws,
-                prompt=prompt,
-                model=model,
-                effort=effort,
-                sandbox_policy=sandbox_policy,
-                network_access=network_access,
-                codex_config=codex_config,
-                agent=agent,
+            proc = subprocess.Popen(
+                cmd,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                cwd=str(ws),
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                shell=(sys.platform == "win32"),
+                start_new_session=True,
             )
+            if on_process_start is not None:
+                try:
+                    on_process_start(proc)
+                except Exception:
+                    pass
             if cancel_event is not None and cancel_event.is_set():
+                _terminate_process_tree(proc)
+                try:
+                    out, _ = proc.communicate(timeout=2)
+                    stdout_text = out or ""
+                except Exception:
+                    stdout_text = ""
                 timed_out = True
                 exit_code = -1
-                stdout_text = ""
             else:
-                proc = subprocess.Popen(
-                    cmd,
-                    stdin=subprocess.DEVNULL,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.STDOUT,
-                    cwd=str(ws),
-                    text=True,
-                    encoding="utf-8",
-                    errors="replace",
-                    shell=(sys.platform == "win32"),
-                    start_new_session=True,
-                )
-                if on_process_start is not None:
-                    try:
-                        on_process_start(proc)
-                    except Exception:
-                        pass
-                if cancel_event is not None and cancel_event.is_set():
-                    _terminate_process_tree(proc)
-                    try:
-                        out, _ = proc.communicate(timeout=2)
-                        stdout_text = out or ""
-                    except Exception:
-                        stdout_text = ""
+                stop_watcher = threading.Event()
+                if cancel_event is not None:
+                    def _watch_codex_cancel() -> None:
+                        while not stop_watcher.is_set():
+                            if cancel_event.is_set():
+                                _terminate_process_tree(proc)
+                                return
+                            stop_watcher.wait(0.02)
+
+                    threading.Thread(target=_watch_codex_cancel, daemon=True).start()
+                try:
+                    stdout_text, _ = self._communicate_with_pause(
+                        proc, timeout=timeout, pause_event=pause_event, log_file=log_file
+                    )
+                    exit_code = proc.returncode
+                except subprocess.TimeoutExpired as exc:
                     timed_out = True
-                    exit_code = -1
-                else:
-                    stop_watcher = threading.Event()
-                    if cancel_event is not None:
-                        def _watch_codex_cancel() -> None:
-                            while not stop_watcher.is_set():
-                                if cancel_event.is_set():
-                                    _terminate_process_tree(proc)
-                                    return
-                                stop_watcher.wait(0.02)
-
-                        threading.Thread(target=_watch_codex_cancel, daemon=True).start()
-                    try:
-                        stdout_text, _ = self._communicate_with_pause(
-                            proc, timeout=timeout, pause_event=pause_event, log_file=log_file
-                        )
-                        exit_code = proc.returncode
-                    except subprocess.TimeoutExpired as exc:
-                        timed_out = True
-                        _terminate_process_tree(proc)
-                        partial_out = getattr(exc, "output", "") or ""
-                        if partial_out:
-                            stdout_text = partial_out
-                        else:
-                            try:
-                                out, _ = proc.communicate(timeout=2)
-                                stdout_text = out or ""
-                            except Exception:
-                                stdout_text = ""
-                        exit_code = -1
-                    finally:
-                        stop_watcher.set()
-
-            trace = parse_codex_trace(stdout_text)
-
-        else:
-            agy_sandbox = sandbox_policy if sandbox_policy in ("read-only", "sandbox", "restricted", "workspace-sandbox") else None
-            cmd = self.build_agy_cmd(
-                prompt=prompt,
-                effort=effort,
-                model=model,
-                sandbox_policy=agy_sandbox,
-                agent=agent,
-                dangerously_skip_permissions=effective_bypass,
-            )
-            if cancel_event is not None and cancel_event.is_set():
-                timed_out = True
-                exit_code = -1
-                stdout_text = ""
-            else:
-                proc = subprocess.Popen(
-                    cmd,
-                    stdin=subprocess.DEVNULL,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.STDOUT,
-                    cwd=str(ws),
-                    text=True,
-                    encoding="utf-8",
-                    errors="replace",
-                    shell=(sys.platform == "win32"),
-                    start_new_session=True,
-                )
-                if on_process_start is not None:
-                    try:
-                        on_process_start(proc)
-                    except Exception:
-                        pass
-                if cancel_event is not None and cancel_event.is_set():
                     _terminate_process_tree(proc)
-                    try:
-                        out, _ = proc.communicate(timeout=2)
-                        stdout_text = out or ""
-                    except Exception:
-                        stdout_text = ""
-                    timed_out = True
+                    partial_out = getattr(exc, "output", "") or ""
+                    if partial_out:
+                        stdout_text = partial_out
+                    else:
+                        try:
+                            out, _ = proc.communicate(timeout=2)
+                            stdout_text = out or ""
+                        except Exception:
+                            stdout_text = ""
                     exit_code = -1
-                else:
-                    stop_watcher = threading.Event()
-                    if cancel_event is not None:
-                        def _watch_agy_cancel() -> None:
-                            while not stop_watcher.is_set():
-                                if cancel_event.is_set():
-                                    _terminate_process_tree(proc)
-                                    return
-                                stop_watcher.wait(0.02)
+                finally:
+                    stop_watcher.set()
 
-                        threading.Thread(target=_watch_agy_cancel, daemon=True).start()
-                    try:
-                        stdout_text, _ = self._communicate_with_pause(
-                            proc, timeout=timeout, pause_event=pause_event, log_file=log_file
-                        )
-                        exit_code = proc.returncode
-                    except subprocess.TimeoutExpired as exc:
-                        timed_out = True
-                        _terminate_process_tree(proc)
-                        partial_out = getattr(exc, "output", "") or ""
-                        if partial_out:
-                            stdout_text = partial_out
-                        else:
-                            try:
-                                out, _ = proc.communicate(timeout=2)
-                                stdout_text = out or ""
-                            except Exception:
-                                stdout_text = ""
-                        exit_code = -1
-                    finally:
-                        stop_watcher.set()
-
-            trace = parse_agy_trace(stdout_text)
-
+        trace = parse_codex_trace(stdout_text)
         trace.model = model or ""
-        trace.backend = resolved_backend
+        trace.backend = "codex"
         elapsed = round(time.time() - t0, 2)
 
         if cancel_event is not None and cancel_event.is_set():

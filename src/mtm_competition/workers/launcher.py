@@ -13,8 +13,14 @@ from mtm_core.runtime import CodexRuntime, RuntimeResult, ExecutionTrace
 from mtm_core.git import git_status
 from mtm_competition.routing.prompt_builder import PromptBuilder
 from mtm_competition.routing.skill_router import SkillRouter
-from mtm_competition.routing.model_router import ModelRouter
 from mtm_competition.workers.workspace import WorkspaceManager
+
+from mtm.constants import (
+    MODEL as DEFAULT_TOURNAMENT_MODEL,
+    MODEL_EFFORT as DEFAULT_REASONING_EFFORT,
+    DEFAULT_TASK_TIMEOUT_SECONDS,
+)
+DEFAULT_TIMEOUT_SECONDS = int(DEFAULT_TASK_TIMEOUT_SECONDS)
 
 
 def _write_task_file_guarded(target: Path, content: str, cancel_event: Optional[Any]) -> bool:
@@ -76,9 +82,7 @@ class WorkerLauncher:
             prefer_codex=(backend != "antigravity"),
             allow_agy_fallback=allow_fallback,
             default_backend=backend,
-            strict_backend=strict_backend,
         )
-        self.model_router = ModelRouter(default_backend=backend)
 
     def launch(
         self,
@@ -96,12 +100,11 @@ class WorkerLauncher:
         env_dict = envelope.to_dict() if isinstance(envelope, TaskEnvelope) else dict(envelope)
         target_backend = backend or env_dict.get("backend") or self.backend
 
-        # Route model, effort, skills
-        routing = self.model_router.route(env_dict, attempt_number=attempt_number, backend=target_backend)
-        model = env_dict.get("model") or routing.model
-        effort = env_dict.get("reasoning_effort") or routing.reasoning_effort
-        timeout = int(env_dict.get("time_budget_seconds") or routing.timeout_seconds)
-        skills = routing.selected_skills
+        # Fixed tournament model configuration with optional envelope overrides
+        model = env_dict.get("model") or DEFAULT_TOURNAMENT_MODEL
+        effort = env_dict.get("reasoning_effort") or DEFAULT_REASONING_EFFORT
+        timeout = int(env_dict.get("time_budget_seconds") or DEFAULT_TIMEOUT_SECONDS)
+        skills = SkillRouter.route_skills(env_dict)
 
         repo_path = Path(env_dict["repository_path"]).resolve()
         if cancel_event is not None and cancel_event.is_set():
@@ -176,7 +179,7 @@ class WorkerLauncher:
                 envelope=env_dict,
                 prompt=kickoff,
                 workspace=ws_path,
-                backend=routing.backend,
+                backend=target_backend,
                 model=model,
                 effort=effort,
                 timeout=timeout,
@@ -186,7 +189,7 @@ class WorkerLauncher:
                 pause_event=pause_event,
             )
         else:
-            if self.production_mode and routing.backend == "codex" and not os.environ.get("MTM_TEST_MOCK_RUNTIME"):
+            if self.production_mode and target_backend == "codex" and not os.environ.get("MTM_TEST_MOCK_RUNTIME"):
                 # RUNTIME-01: Prohibit secondary 'codex exec' spawns in production execution path
                 raise RuntimeError(
                     "RUNTIME-01 Invariant: Prohibited secondary 'codex exec' subprocess in production execution path. "
@@ -200,7 +203,7 @@ class WorkerLauncher:
                 "effort": effort,
                 "timeout": timeout,
                 "log_file": trace_log,
-                "backend": routing.backend,
+                "backend": target_backend,
                 "on_process_start": on_process_start,
             }
             try:

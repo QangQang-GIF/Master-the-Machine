@@ -38,7 +38,11 @@ When `descriptor.type == "START_GAME"`:
 2. Call `refresh_match()` to synchronize with `/match/<matchId>`.
 3. Discover open backlog items; emit `BACKLOG_STATUS` `DISCOVERED` for every new item.
 4. Monitor waves: Wave 1 (minute 0), Wave 2 (minute 14), Wave 3 (minute 29).
-5. Prioritize items based on type, difficulty, and scoring weight.
+5. **Priority Order**:
+   - **TIER 1 (IMMEDIATE PRIORITY)**: Any item with an active deadline (e.g. `BUG-02` 18-minute deadline from reveal, or any `PI` Production Incident).
+   - **TIER 2**: Regular Bugs (e.g. `BUG-01`).
+   - **TIER 3**: Change Requests (e.g. `CR-01`).
+   - **TIER 4**: Tasks & Chores (e.g. `TASK-02`, `TASK-01`).
 
 ## 5. Three-Phase Execution Cycle (Investigation → Implementation → Verification)
 For each selected backlog item:
@@ -66,6 +70,25 @@ Before submitting, ensure:
    - Dispatches `POST /api/v1/matches/{UUID}/submissions` with `Idempotency-Key`.
    - Records real server submission receipt (`ACCEPTED`, `201`). Dummy receipts are rejected.
 
-## 7. Match State Transitions & Completion
-- **PAUSED**: When spectator signals `PAUSED`, halt submission dispatches until resumed.
-- **FINISHED**: When match reaches `FINISHED` or TIME OVER, finalize logs and stop all active agent loops immediately.
+## 7. Immediate Pipeline Delivery for Timed Items (Production Incidents)
+- For any timed item or Production Incident (`PI`):
+  - **NEVER** wait to batch multiple backlog items together in Git.
+  - Implement the fix $\rightarrow$ run minimal verification $\rightarrow$ `git add` $\rightarrow$ `git commit` $\rightarrow$ `git push origin <branch>` $\rightarrow$ `submit_work` **IMMEDIATELY**!
+  - Target total turnaround time for PI tasks is $\le 3$ minutes.
+
+## 8. Handling Terminal States & 409 Errors
+- If `submit_work` returns HTTP 409 `BACKLOG_ITEM_CLOSED`:
+  - The deadline has passed; Game Master has closed this item permanently.
+  - DO NOT retry submission or enter recovery/browser loops.
+  - Append `{"type": "BACKLOG_STATUS", "backlogId": "<key>", "status": "CLOSED", "summary": "Item closed by deadline."}`.
+  - **PROCEED IMMEDIATELY to the next OPEN backlog item** (`CR-01`, `TASK-02`, `TASK-01`).
+
+## 9. Token Discipline & Safe Tool Execution
+1. **Token Conservation**:
+   - Never run unbounded commands that dump megabytes of output into the conversation.
+   - Pipe or filter large outputs: `head -n 30`, `tail -n 30`, `grep`.
+   - Never print full schemas or entire repository file trees into context.
+2. **Never Hang on Browser/Playwright Events**:
+   - NEVER call `waitForEvent('download')` without a strict timeout (max 3000ms).
+   - For CSV / file export evidence: ALWAYS generate and save the file directly (e.g. write CSV string from export function or fetch endpoint directly to `answers/<key>/evidence/<file>.csv`). Do not wait for browser download events.
+   - All async browser actions in `cua_repl` or playwright MUST have explicit short timeouts (max 5000ms).

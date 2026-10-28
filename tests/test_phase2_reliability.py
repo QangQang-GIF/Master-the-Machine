@@ -1216,8 +1216,8 @@ def test_codex_runtime_cancellation_before_and_after_popen_has_no_unbound_local(
     assert res_pre.last_message == ""
     assert res_pre.raw_stdout == ""
 
-    # Case 2: cancel_event set immediately AFTER Popen (inside on_process_start) for both backends
-    for backend_name in ("codex", "antigravity"):
+    # Case 2: cancel_event set immediately AFTER Popen (inside on_process_start) for codex backend
+    for backend_name in ("codex",):
         post_cancel = threading.Event()
         log_file = tmp_path / f"trace_{backend_name}.jsonl"
         spawned = []

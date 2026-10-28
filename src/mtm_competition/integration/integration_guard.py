@@ -15,25 +15,10 @@ from mtm_core.git import git_diff, git_status, run_git, get_head_sha
 from mtm_competition.verification.command_safety import run_verification_command
 
 
-FORBIDDEN_FILE_PATTERNS = [
-    # Immutable practice challenge file
-    "exam-info.json",
-    # Environment secrets
-    ".env",
-    ".env.*",
-    "*.env",
-    "*secret*",
-    "*token*",
-    # Runtime knowledge cache files
-    "project_map.md",
-    "index-meta.json",
-]
-
-FORBIDDEN_DIR_PREFIXES = [
-    ".codex",
-    ".agents",
-    "team-sdlc-pack/state",
-]
+from mtm.constants import (
+    FORBIDDEN_FILE_PATTERNS,
+    FORBIDDEN_DIR_PREFIXES,
+)
 
 
 def is_cross_platform_absolute_path(path_str: str) -> bool:

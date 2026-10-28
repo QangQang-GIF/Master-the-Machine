@@ -1,1 +1,0 @@
-"""AI Arena benchmark suite."""

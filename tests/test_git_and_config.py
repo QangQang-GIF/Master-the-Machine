@@ -67,6 +67,27 @@ def test_config_loader():
     assert "fast" in profiles["profiles"]
     assert "standard" in profiles["profiles"]
     assert "deep_reasoning" in profiles["profiles"]
+    from mtm.constants import MODEL, MODEL_EFFORT, CONCURRENCY, DEFAULT_GAME_MASTER_ORIGIN
+    assert profiles["profiles"]["standard"]["codex_model"] == MODEL
+
+
+def test_mtm_runtime_constants():
+    from mtm.constants import (
+        MODEL,
+        MODEL_EFFORT,
+        CONCURRENCY,
+        DEFAULT_GAME_MASTER_ORIGIN,
+        DEFAULT_TASK_TIMEOUT_SECONDS,
+        START_WORK_PATH,
+        SUBMISSION_PATH,
+    )
+    assert MODEL == "gpt-6.1-sol"
+    assert MODEL_EFFORT == "medium"
+    assert CONCURRENCY == 1
+    assert DEFAULT_GAME_MASTER_ORIGIN == "https://masterthemachine.tech"
+    assert DEFAULT_TASK_TIMEOUT_SECONDS == 420.0
+    assert START_WORK_PATH == "/api/v1/matches/{match_id}/backlogs/start"
+    assert SUBMISSION_PATH == "/api/v1/matches/{match_id}/submissions"
 
 
 def test_clone_empty_repo_and_head_nonexistent(tmp_path):

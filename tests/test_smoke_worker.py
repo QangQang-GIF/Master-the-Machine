@@ -21,11 +21,10 @@ def test_smoke_worker_run(tmp_path, pytestconfig):
         pytest.skip("Smoke test requires real CLI execution. Skipped in default test run (run with -m live_cli).")
 
     has_codex = shutil.which("codex") is not None
-    has_agy = shutil.which("agy") is not None
-    if not has_codex and not has_agy:
-        pytest.skip("BLOCKED: Neither codex nor agy CLI available on PATH for live smoke execution.")
+    if not has_codex:
+        pytest.skip("BLOCKED: codex CLI not available on PATH for live smoke execution.")
 
-    chosen_backend = "codex" if has_codex else "antigravity"
+    chosen_backend = "codex"
 
     # 1. Prepare temporary isolated fixture repo
     work_repo = tmp_path / "work_repo"
@@ -48,7 +47,7 @@ def test_smoke_worker_run(tmp_path, pytestconfig):
         "mvs": [{"id": "MVS-1", "description": "test_discount_exact_threshold"}],
         "evidence_required": [],
         "selected_skills": ["mtm-bug-worker@0.1.0"],
-        "model": "gemini-3.8-flash-low" if chosen_backend == "antigravity" else "gpt-6.1-sol",
+        "model": "gpt-6.1-sol",
         "reasoning_effort": "low",
         "time_budget_seconds": 180,
         "limits": {"network": "none", "allowed_paths": [str(work_repo)]},
@@ -88,16 +87,15 @@ def test_smoke_worker_run(tmp_path, pytestconfig):
 
 
 @pytest.mark.live_cli
-@pytest.mark.parametrize("pinned_backend", ["codex", "antigravity"])
+@pytest.mark.parametrize("pinned_backend", ["codex"])
 def test_smoke_worker_pinned_backend(tmp_path, pytestconfig, pinned_backend):
     """Backend-pinned functional smoke test (SV-02 / SV-04 / R-03): never substitutes one CLI for the other."""
     mark_expr = pytestconfig.getoption("-m", default="")
     if "live_cli" not in mark_expr and os.environ.get("MTM_LIVE_CLI") != "1":
         pytest.skip("Smoke test requires real CLI execution. Skipped in default test run (run with -m live_cli).")
 
-    binary = "codex" if pinned_backend == "codex" else "agy"
-    if shutil.which(binary) is None:
-        pytest.skip(f"BLOCKED: Pinned backend '{pinned_backend}' ({binary}) is not installed on PATH.")
+    if shutil.which("codex") is None:
+        pytest.skip("BLOCKED: Pinned backend 'codex' is not installed on PATH.")
 
     work_repo = tmp_path / f"work_repo_{pinned_backend}"
     shutil.copytree(FIXTURES / "sample_repo", work_repo)
@@ -116,7 +114,7 @@ def test_smoke_worker_pinned_backend(tmp_path, pytestconfig, pinned_backend):
         "mvs": [{"id": "MVS-1", "description": "test_discount_exact_threshold"}],
         "evidence_required": [],
         "selected_skills": ["mtm-bug-worker@1.0.0"],
-        "model": "gemini-3.8-flash-low" if pinned_backend == "antigravity" else "gpt-6.1-sol",
+        "model": "gpt-6.1-sol",
         "reasoning_effort": "low",
         "time_budget_seconds": 180,
         "backend": pinned_backend,
@@ -145,11 +143,10 @@ def test_smoke_worker_timeout_behavior(tmp_path, pytestconfig):
         pytest.skip("Timeout smoke test requires real CLI execution. Skipped in default test run (run with -m live_cli).")
 
     has_codex = shutil.which("codex") is not None
-    has_agy = shutil.which("agy") is not None
-    if not has_codex and not has_agy:
-        pytest.skip("BLOCKED: Neither codex nor agy CLI available on PATH.")
+    if not has_codex:
+        pytest.skip("BLOCKED: codex CLI not available on PATH.")
 
-    chosen_backend = "codex" if has_codex else "antigravity"
+    chosen_backend = "codex"
 
     work_repo = tmp_path / "work_repo"
     shutil.copytree(FIXTURES / "sample_repo", work_repo)
