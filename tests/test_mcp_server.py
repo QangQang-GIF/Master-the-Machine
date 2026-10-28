@@ -878,3 +878,39 @@ def test_verify_assigned_repository_folder_alias_dotdot_rejection(offline_git_en
     res_dot_slash = verify_assigned_repository(checkout_dir, {"url": remote_url, "branch": "main", "folder": "./"})
     assert res_dot_slash["match_folder"] == checkout_dir
 
+
+def test_start_game_resolves_stored_credentials_and_authenticates(tmp_path, mock_gm_server):
+    """Verify that START_GAME restores session credentials from .mtm and successfully authenticates."""
+    from runner.mcp_server import MCPHelperServer, save_stored_session_credentials
+
+    match_code = mock_gm_server.match_code
+    match_uuid = mock_gm_server.match_uuid
+    token = "test-session-token"
+    mock_gm_server.active_sessions.add(token)
+
+    # Seed stored session credentials
+    save_stored_session_credentials(tmp_path, match_code, {
+        "matchCode": match_code,
+        "matchUuid": match_uuid,
+        "username": "example-account",
+        "password": "fake-password-for-example",
+        "cookies": {"session_token": token},
+        "matchPageUrl": f"{mock_gm_server.base_url}/match/{match_code}",
+    })
+
+    server = MCPHelperServer(workspace_root=tmp_path)
+    server.configure_session({
+        "type": "START_GAME",
+        "matchId": match_code,
+        "gameMasterApiUrl": mock_gm_server.base_url,
+        "teamWorkspace": str(tmp_path),
+    })
+
+    assert server.username == "example-account"
+    assert server.password == "fake-password-for-example"
+    assert server.match_uuid == match_uuid
+
+    login_res = server.login_match()
+    assert login_res["status"] == "AUTHENTICATED"
+
+

@@ -189,6 +189,9 @@ class OfficialGameMasterAdapter(GameMasterAdapter):
         self.max_retries = max_retries
         self.match_uuid = match_uuid or os.environ.get("MTM_MATCH_UUID", "")
         self.session_cookies: Dict[str, str] = {}
+        self.username: Optional[str] = None
+        self.password: Optional[str] = None
+        self.match_page_url: Optional[str] = None
 
         # Pre-validate base URL for SEC-01 security compliance
         self._validate_url_security(self.api_base_url)
@@ -530,7 +533,22 @@ class OfficialGameMasterAdapter(GameMasterAdapter):
         except Exception as e:
             last_error = e
 
-        # 2. Official API: /api/v1/matches/<matchUuid>
+        # 2. If endpoint failed, attempt session auto-login if credentials exist
+        if last_error and self.username and self.password and not self.session_cookies:
+            try:
+                self.login_session(
+                    username=self.username,
+                    password=self.password,
+                    match_page_url=self.match_page_url or f"{self.api_base_url}/match/{clean_ident}",
+                    match_id=clean_ident,
+                )
+                res = self._request("GET", f"/match/{clean_ident}")
+                if isinstance(res, dict):
+                    return validate_match_projection_schema(res)
+            except Exception:
+                pass
+
+        # 3. Official API fallback: /api/v1/matches/<matchUuid>
         try:
             res = self._request("GET", f"/api/v1/matches/{clean_ident}")
             if isinstance(res, dict):
@@ -540,7 +558,7 @@ class OfficialGameMasterAdapter(GameMasterAdapter):
         except Exception as e:
             last_error = e
 
-        # 3. If endpoints failed, raise rather than returning unverified default
+        # 4. If endpoints failed, raise rather than returning unverified default
         if last_error:
             if isinstance(last_error, (GameMasterError, ValueError)):
                 raise last_error

@@ -49,6 +49,85 @@ from runner.telemetry import (
 )
 
 
+def resolve_stored_session_credentials(workspace_root: Path, match_code: Optional[str]) -> Dict[str, Any]:
+    """Retrieve persisted match session credentials and cookies if omitted from descriptor."""
+    result: Dict[str, Any] = {}
+    if not match_code:
+        return result
+
+    # 1. Check workspace .mtm/<match_code>.session.json
+    for base in [workspace_root, workspace_root / "team-sdlc-pack"]:
+        session_file = base / ".mtm" / f"{match_code}.session.json"
+        if session_file.exists():
+            try:
+                saved = json.loads(session_file.read_text(encoding="utf-8"))
+                if isinstance(saved, dict):
+                    return saved
+            except Exception:
+                pass
+
+    # 2. Check general .mtm/session.json
+    for base in [workspace_root, workspace_root / "team-sdlc-pack"]:
+        gen_file = base / ".mtm" / "session.json"
+        if gen_file.exists():
+            try:
+                saved = json.loads(gen_file.read_text(encoding="utf-8"))
+                if isinstance(saved, dict) and saved.get("matchCode") == match_code:
+                    return saved
+            except Exception:
+                pass
+
+    # 3. Check MTM Player Application Support directories (macOS / Linux / Windows)
+    user_home = Path.home()
+    app_dirs = [
+        user_home / "Library" / "Application Support" / "MTM Player" / "applications",
+        user_home / ".local" / "share" / "mtm-player" / "applications",
+    ]
+    if os.environ.get("XDG_DATA_HOME"):
+        app_dirs.append(Path(os.environ["XDG_DATA_HOME"]) / "mtm-player" / "applications")
+    if os.environ.get("LOCALAPPDATA"):
+        app_dirs.append(Path(os.environ["LOCALAPPDATA"]) / "MTM Player" / "applications")
+
+    for app_dir in app_dirs:
+        if not app_dir.exists():
+            continue
+        for priv_file in app_dir.glob("*/private/*.json"):
+            try:
+                data = json.loads(priv_file.read_text(encoding="utf-8"))
+                sess = data.get("state", {}).get("match", {}).get("session", {})
+                if sess.get("matchId") == match_code or sess.get("matchCode") == match_code:
+                    res = {
+                        "username": sess.get("username"),
+                        "password": sess.get("password"),
+                        "apiKeySecret": sess.get("apiKeySecret"),
+                        "matchPageUrl": sess.get("matchPageUrl"),
+                        "matchUuid": sess.get("teamUuid") or sess.get("matchUuid"),
+                    }
+                    return {k: v for k, v in res.items() if v}
+            except Exception:
+                continue
+
+    return result
+
+
+def save_stored_session_credentials(workspace_root: Path, match_code: str, data: Dict[str, Any]) -> None:
+    """Safely persist session credentials and cookies to .mtm/<match_code>.session.json."""
+    if not match_code:
+        return
+    for base in [workspace_root, workspace_root / "team-sdlc-pack"]:
+        try:
+            mtm_dir = base / ".mtm"
+            mtm_dir.mkdir(parents=True, exist_ok=True)
+            session_file = mtm_dir / f"{match_code}.session.json"
+            session_file.write_text(json.dumps(data, indent=2), encoding="utf-8")
+            try:
+                os.chmod(session_file, 0o600)
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+
 class MCPHelperServer:
     def __init__(self, workspace_root: Optional[Path | str] = None):
         raw_root = Path(workspace_root).resolve() if workspace_root is not None else Path.cwd().resolve()
@@ -104,14 +183,31 @@ class MCPHelperServer:
             self.player_session_id = str(session_id)
 
         # Store session credentials and match page URL from descriptor (retaining prior if omitted)
-        if descriptor.get("username"):
-            self.username = descriptor.get("username")
-        if descriptor.get("password"):
-            self.password = descriptor.get("password")
+        if descriptor.get("username") or descriptor.get("teamLoginAccount"):
+            self.username = descriptor.get("username") or descriptor.get("teamLoginAccount")
+        if descriptor.get("password") or descriptor.get("teamPassword"):
+            self.password = descriptor.get("password") or descriptor.get("teamPassword")
         if descriptor.get("matchPageUrl") or descriptor.get("match_page_url"):
             self.match_page_url = descriptor.get("matchPageUrl") or descriptor.get("match_page_url")
         if descriptor.get("allowedMatchOrigins") or descriptor.get("allowed_origins") or descriptor.get("allowedOrigins"):
             self.allowed_match_origins = descriptor.get("allowedMatchOrigins") or descriptor.get("allowed_origins") or descriptor.get("allowedOrigins")
+
+        # Fallback to stored session credentials if username/password/cookies/matchUuid are missing
+        if not (self.username and self.password) or not self.match_uuid or not self.session_cookies:
+            stored = resolve_stored_session_credentials(self.workspace_root, self.match_code)
+            if stored:
+                if not self.username and stored.get("username"):
+                    self.username = stored["username"]
+                if not self.password and stored.get("password"):
+                    self.password = stored["password"]
+                if not self.match_page_url and stored.get("matchPageUrl"):
+                    self.match_page_url = stored["matchPageUrl"]
+                if not self.match_uuid and stored.get("matchUuid"):
+                    self.match_uuid = stored["matchUuid"]
+                if not self.session_cookies and stored.get("cookies"):
+                    self.session_cookies.update(stored["cookies"])
+                if not self.bearer_token and stored.get("apiKeySecret") and descriptor.get("type") != "PREPARE_GAME":
+                    self.bearer_token = stored["apiKeySecret"]
 
         # Repository descriptor: retain from prior PREPARE_GAME if START_GAME omits repository
         if descriptor.get("repository"):
@@ -220,6 +316,35 @@ class MCPHelperServer:
             )
             if self.session_cookies:
                 self.adapter.session_cookies.update(self.session_cookies)
+
+        # Auto-login to establish session cookies and resolve match UUID if credentials exist
+        if (not self.session_cookies or not (self.adapter and self.adapter.session_cookies)) and self.username and self.password and self.adapter:
+            try:
+                auth_res = self.adapter.login_session(
+                    username=self.username,
+                    password=self.password,
+                    match_page_url=self.match_page_url or "https://masterthemachine.tech/match",
+                    allowed_origins=self.allowed_match_origins,
+                    match_id=self.match_code,
+                )
+                if auth_res.get("cookies"):
+                    self.session_cookies.update(auth_res["cookies"])
+                    self.adapter.session_cookies.update(auth_res["cookies"])
+                proj = auth_res.get("projection") or {}
+                if proj.get("matchUuid"):
+                    self.match_uuid = str(proj["matchUuid"])
+                    self.adapter.match_uuid = self.match_uuid
+                save_stored_session_credentials(self.workspace_root, self.match_code, {
+                    "matchCode": self.match_code,
+                    "matchUuid": self.match_uuid,
+                    "username": self.username,
+                    "password": self.password,
+                    "cookies": self.session_cookies,
+                    "matchPageUrl": self.match_page_url,
+                    "apiKeySecret": self.bearer_token,
+                })
+            except Exception as e:
+                sys.stderr.write(f"Warning: auto-login in configure_session: {e}\n")
 
         # Attempt to resolve match UUID from public projection if missing
         if not self.match_uuid and self.match_code and self.adapter:
@@ -500,8 +625,54 @@ class MCPHelperServer:
         if not self.adapter:
             raise RuntimeError("Session not configured. Call configure_session first.")
 
+        # Ensure credentials resolved if missing
+        if not (self.username and self.password) or not self.session_cookies:
+            stored = resolve_stored_session_credentials(self.workspace_root, self.match_code)
+            if stored:
+                if not self.username and stored.get("username"):
+                    self.username = stored["username"]
+                if not self.password and stored.get("password"):
+                    self.password = stored["password"]
+                if not self.match_page_url and stored.get("matchPageUrl"):
+                    self.match_page_url = stored["matchPageUrl"]
+                if not self.match_uuid and stored.get("matchUuid"):
+                    self.match_uuid = stored["matchUuid"]
+                    self.adapter.match_uuid = self.match_uuid
+                if not self.session_cookies and stored.get("cookies"):
+                    self.session_cookies.update(stored["cookies"])
+                    self.adapter.session_cookies.update(stored["cookies"])
+
+        # Ensure session authentication with Game Master
+        if (not self.session_cookies or not self.adapter.session_cookies) and self.username and self.password:
+            try:
+                auth_res = self.adapter.login_session(
+                    username=self.username,
+                    password=self.password,
+                    match_page_url=self.match_page_url or "https://masterthemachine.tech/match",
+                    allowed_origins=self.allowed_match_origins,
+                    match_id=self.match_code,
+                )
+                if auth_res.get("cookies"):
+                    self.session_cookies.update(auth_res["cookies"])
+                    self.adapter.session_cookies.update(auth_res["cookies"])
+                proj = auth_res.get("projection") or {}
+                if proj.get("matchUuid"):
+                    self.match_uuid = str(proj["matchUuid"])
+                    self.adapter.match_uuid = self.match_uuid
+                save_stored_session_credentials(self.workspace_root, self.match_code, {
+                    "matchCode": self.match_code,
+                    "matchUuid": self.match_uuid,
+                    "username": self.username,
+                    "password": self.password,
+                    "cookies": self.session_cookies,
+                    "matchPageUrl": self.match_page_url,
+                    "apiKeySecret": self.bearer_token,
+                })
+            except Exception as e:
+                sys.stderr.write(f"Warning: login_session in login_match: {e}\n")
+
         # Actually verify connection and match access against Game Master (fail closed on failure)
-        has_credentials = bool(self.bearer_token or self.descriptor.get("apiKeySecret") or self.descriptor.get("gameMasterApiUrl") or self.descriptor.get("baseUrl"))
+        has_credentials = bool(self.bearer_token or self.descriptor.get("apiKeySecret") or self.descriptor.get("gameMasterApiUrl") or self.descriptor.get("baseUrl") or self.session_cookies)
         is_offline = bool(self.descriptor.get("offline") or not has_credentials)
 
         try:
@@ -530,8 +701,54 @@ class MCPHelperServer:
         if not self.adapter:
             raise RuntimeError("Session not configured. Call configure_session first.")
 
+        # Ensure credentials resolved if missing
+        if not (self.username and self.password) or not self.session_cookies:
+            stored = resolve_stored_session_credentials(self.workspace_root, self.match_code)
+            if stored:
+                if not self.username and stored.get("username"):
+                    self.username = stored["username"]
+                if not self.password and stored.get("password"):
+                    self.password = stored["password"]
+                if not self.match_page_url and stored.get("matchPageUrl"):
+                    self.match_page_url = stored["matchPageUrl"]
+                if not self.match_uuid and stored.get("matchUuid"):
+                    self.match_uuid = stored["matchUuid"]
+                    self.adapter.match_uuid = self.match_uuid
+                if not self.session_cookies and stored.get("cookies"):
+                    self.session_cookies.update(stored["cookies"])
+                    self.adapter.session_cookies.update(stored["cookies"])
+
+        # Ensure session authentication with Game Master
+        if (not self.session_cookies or not self.adapter.session_cookies) and self.username and self.password:
+            try:
+                auth_res = self.adapter.login_session(
+                    username=self.username,
+                    password=self.password,
+                    match_page_url=self.match_page_url or "https://masterthemachine.tech/match",
+                    allowed_origins=self.allowed_match_origins,
+                    match_id=self.match_code,
+                )
+                if auth_res.get("cookies"):
+                    self.session_cookies.update(auth_res["cookies"])
+                    self.adapter.session_cookies.update(auth_res["cookies"])
+                proj = auth_res.get("projection") or {}
+                if proj.get("matchUuid"):
+                    self.match_uuid = str(proj["matchUuid"])
+                    self.adapter.match_uuid = self.match_uuid
+                save_stored_session_credentials(self.workspace_root, self.match_code, {
+                    "matchCode": self.match_code,
+                    "matchUuid": self.match_uuid,
+                    "username": self.username,
+                    "password": self.password,
+                    "cookies": self.session_cookies,
+                    "matchPageUrl": self.match_page_url,
+                    "apiKeySecret": self.bearer_token,
+                })
+            except Exception as e:
+                sys.stderr.write(f"Warning: login_session in refresh_match: {e}\n")
+
         newly_discovered: List[str] = []
-        has_credentials = bool(self.bearer_token or self.descriptor.get("apiKeySecret") or self.descriptor.get("gameMasterApiUrl") or self.descriptor.get("baseUrl") or self.match_page_url)
+        has_credentials = bool(self.bearer_token or self.descriptor.get("apiKeySecret") or self.descriptor.get("gameMasterApiUrl") or self.descriptor.get("baseUrl") or self.match_page_url or self.session_cookies)
         is_offline = bool(self.descriptor.get("offline") or not has_credentials)
 
         try:

@@ -60,6 +60,59 @@ def is_forbidden_path(rel_path: Path | str) -> tuple[bool, str]:
     return False, ""
 
 
+def extract_required_evidence(text: str) -> set[str]:
+    """Dynamically parse scenario markdown or task text to extract expected evidence filenames."""
+    import re
+    found: set[str] = set()
+    ignored_patterns = [
+        r"-submit\.(?:json|schema\.json)$",
+        r"-(?:seed|run-checks|report)\.(?:ts|js|mjs|py)$",
+    ]
+
+    # 1. "before ... as <filename>" (e.g. before fixing as dashboard_before_fixing.png)
+    for m in re.finditer(r"before\s+[\w\s]+\s+as\s+`?([A-Za-z0-9_.-]+\.[A-Za-z0-9]+)`?", text, re.IGNORECASE):
+        found.add(m.group(1))
+
+    # 2. "answers/.../evidence/<filename>" or "evidence/<filename>"
+    for m in re.finditer(r"evidence/`?([A-Za-z0-9_.-]+\.(?:png|jpg|csv|txt|log|json))`?", text, re.IGNORECASE):
+        found.add(m.group(1))
+
+    # 3. Evidence table rows
+    in_evidence_section = False
+    for line in text.splitlines():
+        if any(h in line.lower() for h in ["general evidence", "required evidence", "evidence rules"]):
+            in_evidence_section = True
+        elif line.startswith("# ") or (line.startswith("## ") and "evidence" not in line.lower()):
+            in_evidence_section = False
+
+        if in_evidence_section:
+            for m in re.finditer(r"\|\s*`?([A-Za-z0-9_.-]+\.(?:png|jpg|csv|txt|log|json))`?\s*\|", line):
+                found.add(m.group(1))
+
+    # 4. Required evidence lines and bullet points
+    in_required_evidence = False
+    for line in text.splitlines():
+        if re.search(r"Required evidence", line, re.IGNORECASE):
+            in_required_evidence = True
+            for file_m in re.finditer(r"([A-Za-z0-9_.-]+\.(?:png|jpg|csv|txt|log|json))", line):
+                found.add(file_m.group(1))
+        elif in_required_evidence and re.search(r"^\s*-\s*", line):
+            for file_m in re.finditer(r"([A-Za-z0-9_.-]+\.(?:png|jpg|csv|txt|log|json))", line):
+                found.add(file_m.group(1))
+        elif line.startswith("# ") or (line.startswith("## ") and "evidence" not in line.lower()):
+            in_required_evidence = False
+        elif re.search(r"^\s*-\s*`?[A-Za-z0-9_.-]+\.(?:png|jpg|csv|txt|log|json)", line):
+            for file_m in re.finditer(r"([A-Za-z0-9_.-]+\.(?:png|jpg|csv|txt|log|json))", line):
+                found.add(file_m.group(1))
+
+    filtered: set[str] = set()
+    for f in found:
+        if any(re.search(pat, f) for pat in ignored_patterns):
+            continue
+        filtered.add(f)
+    return filtered
+
+
 class SubmissionGateError(Exception):
     """Raised when pre-submission gate or git tree validation fails."""
     pass
@@ -302,15 +355,91 @@ class PreSubmissionGitGuard:
                         raise SubmissionGateError(msg)
                     return ValidationResult(valid=False, error_message=msg)
 
-        # 4. Relative Evidence Containment (GIT-02)
+            # 3a. Submission Gate Hard Rule: Test results must not be NOT_RUN or FAIL
+            if isinstance(committed_answer, dict):
+                overall_status = committed_answer.get("status")
+                if overall_status in ("NOT_RUN", "FAIL", "FAILED", "PARTIAL", "BLOCKED"):
+                    msg = (
+                        f"Submission Gate Hard Rule: Cannot submit task {backlog_item_key} with status '{overall_status}'. "
+                        f"All requirements must be resolved (DONE) before submitting to Game Master."
+                    )
+                    if raise_on_error:
+                        raise SubmissionGateError(msg)
+                    return ValidationResult(valid=False, error_message=msg)
+
+                test_results = committed_answer.get("testResults")
+                if isinstance(test_results, list) and len(test_results) > 0:
+                    for tr in test_results:
+                        if isinstance(tr, dict):
+                            tr_id = tr.get("id", "UNKNOWN")
+                            tr_res = tr.get("result")
+                            if tr_res != "PASS":
+                                msg = (
+                                    f"Submission Gate Hard Rule: Test case '{tr_id}' has result '{tr_res}'. "
+                                    f"Every test case must evaluate to 'PASS' before submission! "
+                                    f"(Never submit NOT_RUN or FAIL to Game Master)."
+                                )
+                                if raise_on_error:
+                                    raise SubmissionGateError(msg)
+                                return ValidationResult(valid=False, error_message=msg)
+
+        # 4. Relative Evidence Containment & Dynamic Requirement Extraction (GIT-02)
         if backlog_item_key:
             all_evidence = list(evidence_files or [])
-            if answer_payload and isinstance(answer_payload, dict):
-                ev_in_ans = answer_payload.get("evidence")
-                if isinstance(ev_in_ans, list):
-                    for ev_item in ev_in_ans:
-                        if ev_item not in all_evidence:
-                            all_evidence.append(ev_item)
+            for payload_source in (committed_answer if "committed_answer" in locals() and isinstance(committed_answer, dict) else None, answer_payload):
+                if payload_source and isinstance(payload_source, dict):
+                    for k in ("evidence", "evidenceFiles"):
+                        ev_list = payload_source.get(k)
+                        if isinstance(ev_list, list):
+                            for ev_item in ev_list:
+                                if ev_item and str(ev_item) not in all_evidence:
+                                    all_evidence.append(str(ev_item))
+                    tr_list = payload_source.get("testResults")
+                    if isinstance(tr_list, list):
+                        for tr in tr_list:
+                            if isinstance(tr, dict):
+                                sub_ev = tr.get("evidence")
+                                if isinstance(sub_ev, list):
+                                    for ev_item in sub_ev:
+                                        if ev_item and str(ev_item) not in all_evidence:
+                                            all_evidence.append(str(ev_item))
+
+            # Dynamic requirement check against challenge scenario requirements
+            scenario_candidates = []
+            if match_root:
+                mr = Path(match_root)
+                scenario_candidates.extend([
+                    mr / "challenge" / f"{backlog_item_key}-minimum-verification-scenarios.md",
+                    mr / "challenge" / f"{backlog_item_key}.md",
+                    mr / f"{backlog_item_key}-minimum-verification-scenarios.md",
+                ])
+            if r_path:
+                scenario_candidates.extend([
+                    r_path / prefix / "challenge" / f"{backlog_item_key}-minimum-verification-scenarios.md",
+                    r_path / "challenge" / f"{backlog_item_key}-minimum-verification-scenarios.md",
+                ])
+
+            expected_scenario_ev: set[str] = set()
+            for sc_file in scenario_candidates:
+                try:
+                    if sc_file.is_file():
+                        sc_text = sc_file.read_text(encoding="utf-8")
+                        expected_scenario_ev.update(extract_required_evidence(sc_text))
+                except Exception:
+                    pass
+
+            if expected_scenario_ev:
+                declared_basenames = {Path(ev).name for ev in all_evidence}
+                for req_ev in sorted(expected_scenario_ev):
+                    if req_ev not in declared_basenames:
+                        msg = (
+                            f"Submission Gate: Missing required evidence file '{req_ev}' "
+                            f"specified in challenge requirements for task {backlog_item_key}! "
+                            f"Expected in answers/{backlog_item_key}/evidence/ and declared in submit.json."
+                        )
+                        if raise_on_error:
+                            raise SubmissionGateError(msg)
+                        return ValidationResult(valid=False, error_message=msg)
 
             for ev in all_evidence:
                 ev_str = str(ev)
@@ -353,6 +482,13 @@ class PreSubmissionGitGuard:
 
                 if cat_ev.returncode != 0:
                     msg = f"Evidence file '{ev_str}' missing from commit {full_sha} (checked '{tree_ev_path}')"
+                    if raise_on_error:
+                        raise SubmissionGateError(msg)
+                    return ValidationResult(valid=False, error_message=msg)
+
+                local_ev_path = r_path / tree_ev_path
+                if not local_ev_path.is_file():
+                    msg = f"Evidence file '{ev_str}' does not exist on disk at '{local_ev_path}'"
                     if raise_on_error:
                         raise SubmissionGateError(msg)
                     return ValidationResult(valid=False, error_message=msg)
