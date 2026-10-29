@@ -42,9 +42,12 @@ rewrite .env, install host services, alter supplied doctor scripts, or fake READ
 `runner.training_loop` stores only match ID, source revision, statuses, score
 metrics and timing in `state/dev-cycle/supervisor.db`. Its atomic reservation gate
 allows one observation every 600 seconds, including when multiple wakeups overlap.
-During an active round, the supervisor observes; it does not edit skills, inject
-answers, bypass approvals or submit on the CLI's behalf. A failed preparation or
-finished round enters DEV review before another fresh round.
+The human has authorized immediate retry on errors. On detecting a runtime/input/
+evidence failure, the supervisor requests an official Player stop immediately,
+verifies STOPPED/no live process, then enters DEV review without waiting for the
+old match clock to finish. Skills are never edited while that CLI is running;
+answers are never injected and approvals are never bypassed. The next attempt
+gets a fresh match and context. Host approval blocks still require the organizer.
 
 Only FINISHED plus finite Game Master awarded points equal to the positive
 official maximum sets TARGET_REACHED. Local PASS, ACCEPTED receipts and apparent
@@ -52,6 +55,12 @@ task completion are insufficient. Missing official score means the target remain
 unconfirmed. Host approval and account limits are reported honestly; no reset or
 purchase is automatic.
 
-Current fresh practice match created through BAN self-service: **90NN77H3**.
-Each later round must use a fresh Player session/context and freshly supplied
+Read the current match identity from the supervisor ledger rather than a static
+ID in documentation. Each later round must use a fresh Player session/context and freshly supplied
 assignment, with no previous task patches/answers carried into the prompt.
+
+The next DEV correction resolves only publicly announced release files pushed
+after clone, derives deadlines from the server's pause-adjusted elapsed counters,
+and runs web evidence in one bounded server/check session with shared ephemeral
+configuration and process-group cleanup. No past task solution is part of these
+generic fixes.

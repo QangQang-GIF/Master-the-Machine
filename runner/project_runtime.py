@@ -348,6 +348,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     run_parser.add_argument("--cwd")
     run_parser.add_argument("--timeout", type=float, default=300)
     run_parser.add_argument("command", nargs=argparse.REMAINDER)
+    session_parser = sub.add_parser("session", help="Run one local server and evidence/check command with shared ephemeral config")
+    session_parser.add_argument("--server-script", default="dev")
+    session_parser.add_argument("--url")
+    session_parser.add_argument("--timeout", type=float, default=300)
+    session_parser.add_argument("command", nargs=argparse.REMAINDER)
     args = parser.parse_args(argv)
     runtime = ProjectRuntime(args.match_root, args.match_id, args.worker_id)
     if args.action == "prepare":
@@ -360,7 +365,21 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 0
     command = list(args.command)
     if command[:1] == ["--"]: command = command[1:]
-    result = runtime.run(command, args.cwd, args.timeout)
+    if args.action == "session":
+        scripts = runtime._manifest().get("scripts", {})
+        if args.server_script not in scripts:
+            raise ValueError("Server script must be declared by the current project")
+        server = runtime._package_cmd("run", args.server_script)
+        manifest = runtime._manifest()
+        if "next" in {**manifest.get("dependencies", {}), **manifest.get("devDependencies", {})}:
+            if runtime._package_manager() == "npm":
+                server.append("--")
+            server.extend(["--hostname", "127.0.0.1", "--port", runtime.env["PORT"]])
+        sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+        from runner.web_session import run_web_session
+        result = run_web_session(runtime, server, command, readiness_url=args.url, timeout=args.timeout)
+    else:
+        result = runtime.run(command, args.cwd, args.timeout)
     print(result.stdout, end="")
     print(result.stderr, file=sys.stderr, end="")
     return result.returncode or (124 if result.timed_out else 0)

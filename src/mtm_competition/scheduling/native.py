@@ -318,9 +318,10 @@ class NativeTaskCoordinator:
                     db.commit()
                 raise
             task_type = eligible["type"]
+            specification = details.get("files", {}).get(f"challenge/{key}.md")
             budget = min(max(10, int(estimated_seconds)), int(eligible["slackSeconds"] - self.reserve))
             envelope = {"task_id": key, "task_type": task_type, "title": eligible.get("title", key),
-                        "description": eligible.get("description", ""), "repository_path": str(target),
+                        "description": specification or eligible.get("description") or eligible.get("descriptionMd", ""), "repository_path": str(target),
                         "match_root": str(worker_match), "base_revision": base, "points": int(eligible.get("points", 0)),
                         "deadline_epoch": eligible.get("deadline_epoch"),
                         "selected_skills": ["mtm-init", f"mtm-{task_type.lower()}-worker", "mtm-verification", "mtm-evidence"],
@@ -378,7 +379,7 @@ class NativeTaskCoordinator:
             return
         source_challenge = self.match_root / "challenge"
         if source_challenge.is_dir() and source_challenge.resolve().is_relative_to(self.match_root):
-            for source in source_challenge.glob(key + "-*"):
+            for source in [source_challenge / f"{key}.md", *source_challenge.glob(key + "-*")]:
                 if not source.is_file() or source.is_symlink() or source.stat().st_size > 10_000_000:
                     continue
                 target = destination("challenge/" + source.name)

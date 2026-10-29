@@ -14,15 +14,52 @@ import time
 from typing import Any
 
 
+def classify_runtime_failure(snapshot: dict[str, Any], cli: dict[str, Any]) -> dict[str, Any]:
+    """Classify terminal run failures, not expected pre-fix test/grep exits."""
+    if cli.get("approvals") or cli.get("status") == "WAITING_APPROVAL":
+        return {"runtimeFailed": False, "hostApprovalRequired": True, "category": "HOST_APPROVAL"}
+    if cli.get("status") in ("FAILED", "INTERRUPTED"):
+        return {"runtimeFailed": True, "hostApprovalRequired": False, "category": "CLI_FAILURE"}
+    if any(row.get("status") in ("BLOCKED", "FAILED", "TIMED_OUT") and not row.get("receiptId")
+           for row in snapshot.get("backlogs", [])):
+        return {"runtimeFailed": True, "hostApprovalRequired": False, "category": "UNSUBMITTED_ITEM_FAILURE"}
+    if any(row.get("status") in ("FAILED", "BLOCKED") for row in (snapshot.get("preparation") or {}).values()):
+        return {"runtimeFailed": True, "hostApprovalRequired": False, "category": "PREPARATION_FAILURE"}
+    return {"runtimeFailed": False, "hostApprovalRequired": False, "category": "NONE"}
+
+
 class TrainingLoop:
     def __init__(self, path: Path):
         path.parent.mkdir(parents=True, exist_ok=True)
         self.path = path
         with self._db() as db:
             db.execute("CREATE TABLE IF NOT EXISTS cycle (id INTEGER PRIMARY KEY CHECK(id=1), data TEXT NOT NULL)")
+            db.execute("CREATE TABLE IF NOT EXISTS policy (id INTEGER PRIMARY KEY CHECK(id=1), abort_on_error INTEGER NOT NULL)")
 
     def _db(self):
         return sqlite3.connect(self.path, timeout=10)
+
+    def authorize_abort_on_error(self, enabled: bool = True) -> None:
+        """Call only after the human authorizes abandoning failed practice runs."""
+        with self._db() as db:
+            db.execute("INSERT INTO policy VALUES(1,?) ON CONFLICT(id) DO UPDATE SET abort_on_error=excluded.abort_on_error", (int(enabled),))
+
+    def abort_on_error(self) -> bool:
+        with self._db() as db:
+            row = db.execute("SELECT abort_on_error FROM policy WHERE id=1").fetchone()
+        return bool(row and row[0])
+
+    def confirm_stopped_for_dev(self, cli_status: dict[str, Any]) -> dict[str, Any]:
+        if not self.abort_on_error():
+            raise ValueError("Human authorization to abandon failed rounds is required")
+        if cli_status.get("status") != "STOPPED" or cli_status.get("pid"):
+            raise ValueError("Player must confirm STOPPED with no live process before DEV changes")
+        state = self.state()
+        state["phase"], state["abandoned"] = "DEV_REVIEW_REQUIRED", True
+        state["cliStatus"] = "STOPPED"
+        with self._db() as db:
+            db.execute("UPDATE cycle SET data=? WHERE id=1", (json.dumps(state),))
+        return state
 
     def start_round(self, match_id: str, revision: str, now: float | None = None) -> dict[str, Any]:
         if not re.fullmatch(r"[A-Z0-9]{8}", match_id) or not re.fullmatch(r"[0-9a-f]{7,40}", revision):
@@ -56,14 +93,14 @@ class TrainingLoop:
         return {"readAllowed": True, "state": state}
 
     def record(self, observation: dict[str, Any]) -> dict[str, Any]:
-        allowed = {"matchId", "officialStatus", "cliStatus", "preparationFailed", "hostApprovalRequired",
+        allowed = {"matchId", "officialStatus", "cliStatus", "preparationFailed", "hostApprovalRequired", "runtimeFailed",
                    "awardedPoints", "totalPoints", "scoreSource"}
         if not isinstance(observation, dict) or set(observation) - allowed:
             raise ValueError("Only scalar public status/score metrics may enter the cycle ledger")
         for key in ("officialStatus", "cliStatus"):
             if key in observation and (not isinstance(observation[key], str) or not re.fullmatch(r"[A-Z_]{1,64}", observation[key])):
                 raise ValueError("Status must be a compact public enum")
-        for key in ("preparationFailed", "hostApprovalRequired"):
+        for key in ("preparationFailed", "hostApprovalRequired", "runtimeFailed"):
             if key in observation and not isinstance(observation[key], bool):
                 raise ValueError("Flags must be booleans")
         state = self.state()
@@ -83,6 +120,8 @@ class TrainingLoop:
             state["phase"] = "TARGET_REACHED"
         elif observation.get("hostApprovalRequired"):
             state["phase"] = "HOST_APPROVAL_REQUIRED"
+        elif observation.get("runtimeFailed") and self.abort_on_error():
+            state["phase"] = "STOP_FOR_DEV"
         elif status in ("FINISHED", "CANCELLED") or (status == "PREPARING" and observation.get("preparationFailed")):
             state["phase"] = "DEV_REVIEW_REQUIRED"
         else:
@@ -95,7 +134,7 @@ class TrainingLoop:
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--db", type=Path, default=Path("state/dev-cycle/supervisor.db"))
-    parser.add_argument("action", choices=["start", "reserve", "record", "status"])
+    parser.add_argument("action", choices=["start", "reserve", "record", "status", "authorize-abort"])
     parser.add_argument("--match-id")
     parser.add_argument("--revision")
     args = parser.parse_args()
@@ -107,6 +146,9 @@ def main():
     elif args.action == "record":
         import sys
         result = loop.record(json.load(sys.stdin))
+    elif args.action == "authorize-abort":
+        loop.authorize_abort_on_error()
+        result = {"abortOnError": True, "requiresStoppedBeforeDev": True}
     else:
         result = loop.state()
     print(json.dumps(result))

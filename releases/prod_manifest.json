@@ -1,6 +1,6 @@
 {
   "release_version": "1.0.0",
-  "frozen_at": "2026-10-29T12:43:02.921925+00:00",
+  "frozen_at": "2026-10-29T13:34:27.706564+00:00",
   "active_skills": [
     "game-preparation@1.0.0",
     "mtm-bug-worker@1.0.0",
@@ -26,6 +26,8 @@
     "observer_interval_seconds": 600,
     "target": "OFFICIAL_FULL_SCORE",
     "transport_fallback": "GUARDED_STDIO",
-    "environment": "EPHEMERAL_SCOPED"
+    "environment": "EPHEMERAL_SCOPED",
+    "abort_on_error_authorized": true,
+    "stop_before_dev_required": true
   }
 }

@@ -74,6 +74,7 @@ def normalize_native_projection(projection: Dict[str, Any], adapter: Any) -> Dic
     if server is None and getattr(adapter, "server_epoch", None) is not None:
         server = adapter.server_epoch + max(0, time.monotonic() - adapter.server_clock_monotonic)
     remaining = next((source[k] for source in (projection, match) for k in ("remaining_seconds", "remainingSec", "remainingSeconds") if source.get(k) is not None), None)
+    elapsed = next((source[k] for source in (projection, match) for k in ("elapsedSec", "elapsedSeconds", "elapsed_seconds") if source.get(k) is not None), None)
     items = []
     for item in projection.get("backlogItems", projection.get("backlog", [])):
         key = item.get("key") or item.get("backlogItemKey") or item.get("backlogId")
@@ -84,8 +85,15 @@ def normalize_native_projection(projection: Dict[str, Any], adapter: Any) -> Dic
         left = next((item[k] for k in ("remainingSec", "remainingSeconds", "deadlineRemainingSec") if item.get(k) is not None), None)
         if left is not None and server is not None:
             deadline = server + max(0, float(left))
+        # Official reveal/deadline counters exclude PAUSED time; a host wall-clock
+        # reveal timestamp does not. Public board uses these elapsed counters.
+        if (server is not None and elapsed is not None
+                and item.get("deadlineMinutes") is not None
+                and item.get("revealedElapsedSec") is not None):
+            deadline = server + float(item["deadlineMinutes"]) * 60 - (float(elapsed) - float(item["revealedElapsedSec"]))
         items.append({**item, "key": str(key), "type": item.get("type") or item.get("taskType") or str(key).split("-")[0],
-                      "status": item.get("status") or item.get("state") or "VISIBLE", "deadline_epoch": deadline})
+                      "status": item.get("status") or item.get("state") or "VISIBLE", "deadline_epoch": deadline,
+                      "description": item.get("description") or item.get("descriptionMd") or ""})
     return {"status": status, "server_epoch": server, "remaining_seconds": remaining, "items": items}
 
 
@@ -910,6 +918,25 @@ class MCPHelperServer:
                 match_uuid_or_task_id=self.match_uuid,
                 backlog_item_key=backlog_item_key,
             )
+
+            # Release documents can be pushed after the preparation clone, while
+            # Start Work returns only on-start assets. Read only paths the public
+            # board has announced for this item; do not checkout a fetched tree.
+            public_item = self.known_backlog_items.get(backlog_item_key, {})
+            public_paths = []
+            for field in ("releaseFiles", "onStartFiles"):
+                if isinstance(public_item.get(field), list):
+                    public_paths.extend(p for p in public_item[field] if isinstance(p, str))
+            delivered = result.get("files") or {}
+            if public_paths:
+                from runner.announced_inputs import resolve_announced_files
+                unavailable = []
+                result["files"] = resolve_announced_files(
+                    self.checkout_root, self.match_root, self.assigned_branch,
+                    backlog_item_key, [*public_paths, *delivered], delivered,
+                    missing_paths=unavailable)
+                if unavailable:
+                    result["unavailableAnnouncedFiles"] = unavailable
 
             if self.native:
                 self.native.register_started(backlog_item_key, result)

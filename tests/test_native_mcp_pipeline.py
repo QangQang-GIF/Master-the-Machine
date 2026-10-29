@@ -141,6 +141,16 @@ def test_projection_uses_server_duration_and_countdown():
     assert result["items"][0]["deadline_epoch"] == pytest.approx(result["server_epoch"] + 80)
 
 
+def test_public_elapsed_deadline_counters_reserve_urgent_lane():
+    board = Board()
+    projection = {"match": {"status": "RUNNING", "remainingSec": 3000, "elapsedSec": 600},
+                  "backlogItems": [{"key": "BUG-02", "status": "OPEN", "deadlineMinutes": 15,
+                                    "revealedElapsedSec": 0, "descriptionMd": "Public specification"}]}
+    result = normalize_native_projection(projection, board)
+    assert result["items"][0]["deadline_epoch"] == pytest.approx(result["server_epoch"] + 300)
+    assert result["items"][0]["description"] == "Public specification"
+
+
 def test_inventory_includes_nested_and_markdown_announced_scenarios():
     assert announced_test_ids({"submitTemplate": {"testResults": [{"id": "TC-01"}]},
                               "minimumVerificationScenarios": {"scenarios": [{"id": "TC-02"}]}}) == ["TC-01", "TC-02"]
