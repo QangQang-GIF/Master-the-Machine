@@ -414,6 +414,7 @@ class MCPHelperServer:
             if env_example.exists() and not env_file.exists():
                 try:
                     content = env_example.read_text(encoding="utf-8")
+                    content = content.replace('AUTH_SECRET="CHANGE_ME"', 'AUTH_SECRET="f6c8d7e9a0b1c2d3e4f5a6b7c8d9e0f1a2b3c4d5"')
                     content = content.replace("CHANGE_ME", "freelanceos")
                     env_file.write_text(content, encoding="utf-8")
                 except Exception:
@@ -813,7 +814,8 @@ class MCPHelperServer:
                     except (ValueError, TypeError):
                         pass
 
-                key = item.get("id") or item.get("backlogItemKey") or item.get("key")
+                # Always prioritize clean business key (BUG-01, CR-01) over internal server UUID
+                key = item.get("key") or item.get("backlogItemKey") or item.get("backlogId") or item.get("id")
                 if key and str(key) not in self.known_backlog_items:
                     key_str = str(key)
                     self.known_backlog_items[key_str] = item
@@ -897,6 +899,20 @@ class MCPHelperServer:
                 template_path = ans_dir / "submit.json"
                 if not template_path.exists():
                     template_path.write_text(json.dumps(submit_template, indent=2), encoding="utf-8")
+
+            # Write any challenge files delivered with start_work
+            delivered_files = result.get("files")
+            if isinstance(delivered_files, dict):
+                for rel_path, file_content in delivered_files.items():
+                    try:
+                        target_file = self.match_root / rel_path
+                        target_file.parent.mkdir(parents=True, exist_ok=True)
+                        if isinstance(file_content, str):
+                            target_file.write_text(file_content, encoding="utf-8")
+                        elif isinstance(file_content, bytes):
+                            target_file.write_bytes(file_content)
+                    except Exception as file_err:
+                        sys.stderr.write(f"Warning: could not write delivered file {rel_path}: {file_err}\n")
 
             return result
 

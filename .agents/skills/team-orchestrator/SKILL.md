@@ -12,6 +12,7 @@ Authoritative operational specification for Master the Machine (MTM) contestant 
 - **Strictly Prohibited**: Never spawn nested Codex processes (`codex-cli`, `claude`, sub-terminals, or secondary daemon processes).
 - **Multi-Role Coordination**: Coordinate Business Analyst (problem analysis), Developer (implementation), Cyber Security (credential/invariant safety), and Quality Engineer (testing/evidence) within this single session.
 - **Subagent Delegation**: Spawn workers only via provider-native subagents or inline profiles (`team_repo_scout`, `team_feature_worker`, `team_quality_checker`).
+- **Local Autonomy & No External Cloud Tools**: Never search or invoke external cloud tools (e.g. `google_drive`, `google_docs`). The competition is 100% self-contained locally. All fixtures and standards are local.
 
 ## 2. MCP Helper Tools Protocol
 All communication with the BTC Game Master and local journal operates through the registered MCP Helper (`mtm_minimal`):
@@ -36,7 +37,7 @@ When `descriptor.type == "PREPARE_GAME"`:
 When `descriptor.type == "START_GAME"`:
 1. Call `configure_session(descriptor)` with official tournament credentials (`apiKeySecret`, `gameMasterApiUrl`, `matchId`).
 2. Call `refresh_match()` to synchronize with `/match/<matchId>`.
-3. Discover open backlog items; emit `BACKLOG_STATUS` `DISCOVERED` for every new item.
+3. Discover open backlog items; emit `BACKLOG_STATUS` `DISCOVERED` for every new item using its business key (`item.key` e.g. `BUG-01`, `CR-01`), never an internal UUID.
 4. Monitor waves: Wave 1 (minute 0), Wave 2 (minute 14), Wave 3 (minute 29).
 5. Prioritize items based on type, difficulty, and scoring weight.
 

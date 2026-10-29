@@ -32,7 +32,9 @@ This skill establishes the baseline operational policy for all autonomous Codex 
    - When evidence is declared in `evidence_required` (e.g. before/after screenshots, test logs), produce and save the artifact in the workspace.
    - Add the artifact path to `evidence_paths` in `worker_result.json`.
 
-6. **Forbidden Actions**:
+6. **Forbidden Actions & Local Autonomy**:
    - Never modify hidden benchmark tests or grading fixtures.
    - Never attempt to escape the designated workspace directory.
    - Never modify `.git/` internals directly or commit broken code to production branches.
+   - **No External Cloud Lookups**: Never search or query external tools (e.g. Google Drive, Google Docs, external cloud stores) for test fixtures or specifications. The competition runtime is 100% self-contained locally.
+   - **No QA Fixture Hallucination**: Never report a task as `BLOCKED` due to "missing QA test data store" or "external fixture". When a task scenario mentions obtaining data from a QA store, create or load the local fixture directly using the seed scripts provided in `challenge/` and standard specifications (e.g. RFC 4180).
