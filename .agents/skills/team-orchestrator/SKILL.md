@@ -60,7 +60,12 @@ Before submitting, ensure:
 3. The commit has been pushed to the remote repository: `git push origin <assigned_branch>` (GIT-03).
 4. Verify remote ref parity via `git ls-remote origin refs/heads/<assigned_branch>`.
 5. No immutable files (`exam-info.json`), secret files (`.env`), or cache directories are modified (GIT-04).
-6. Call `submit_work(clientSubmissionId, backlogItemKey, gitRevision, answer)`:
+6. **Submission Obligation & Baseline Isolation Rule**:
+   - The Submission Gate evaluates ONLY the tests and evidence declared for the CURRENT backlog item in `answers/<key>/submit.json`.
+   - Never block or withhold submission because of pre-existing, unrelated test failures in the repository (e.g. baseline failures noted in `PROJECT_MAP.md`).
+   - If the code change is implemented, the task's verification scenarios pass, and evidence files are committed/pushed, **CALL `submit_work` IMMEDIATELY**.
+   - The MCP Helper `mtm_minimal` ONLY handles contest API calls; all test fixtures, browser captures, and data inputs must be executed locally by the worker.
+7. Call `submit_work(clientSubmissionId, backlogItemKey, gitRevision, answer)`:
    - MCP Helper verifies Git invariants.
    - Saves canonical request body bytes to SQLite WAL `SubmissionJournal` (`IN_FLIGHT`).
    - Dispatches `POST /api/v1/matches/{UUID}/submissions` with `Idempotency-Key`.

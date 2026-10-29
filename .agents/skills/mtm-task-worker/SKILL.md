@@ -27,5 +27,5 @@ Write worker_result.json
 
 1. **Definition of Done**: Review explicit requirements in `TASK.md`.
 2. **Execute**: Perform the requested refactor, dependency upgrade, configuration update, or documentation sync.
-3. **Verify**: Ensure the codebase builds, linters/tests pass, and no unintended side effects were introduced.
-4. **Report**: Output `worker_result.json` with status `READY_FOR_REVIEW`.
+3. **Verify**: Ensure the codebase builds, linters/task checks pass, and no unintended side effects were introduced. Do NOT block on pre-existing baseline test failures in unrelated modules.
+4. **Report**: Output `submit.json` and `worker_result.json` with status `READY_FOR_REVIEW`. Submit the task solution via `submit_work`.

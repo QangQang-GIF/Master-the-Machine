@@ -1,5 +1,5 @@
-666f261772f38c80ad51f1f36ebe6c3c88296d5ca8586ae6259d7f6a0e223822  .agents/skills/mtm-bug-worker/SKILL.md
-38ebdc31031e4070a89e0ae00bb777420f5cb2ed24226a86b9b201cc2cfc83cf  .agents/skills/mtm-cr-worker/SKILL.md
+f17af9b46b3f2f55f350ba4ceb63f5bc57c88d60e8eb8863874b57154260bab1  .agents/skills/mtm-bug-worker/SKILL.md
+a0bf6fe976cc27a7a45e6d2bbd7307bea35c7a3964674981b2734fcc2fc63033  .agents/skills/mtm-cr-worker/SKILL.md
 3290615fde2a720ea9aa897ab7ffa195945d5cf8edcc918614239246a3ef4ea3  .agents/skills/mtm-evidence/SKILL.md
 9453bea637fbd784a492c8905ba88215799c6ed44d9a3d9f55f7fce8a31d82a3  .agents/skills/mtm-init/SKILL.md
 9af94d0c8ad4b7a3ea639b8af4697e0f91ecdd609d61ee2e479bd6c9b1874829  .agents/skills/mtm-init/references/competition-rules.md
@@ -9,8 +9,8 @@ f552e27e1966878d76fdc9bec03e0136532981c044f9d04197eca5b7f8e9186d  .agents/skills
 b2a89c4c97a33b1bf28fc48d2ee94dddf8124b2099325f54733270cdb16513a4  .agents/skills/mtm-init/tests/negative.md
 038ff1f7a826472017e5010e6e131e5cc78b0a11b8b0c93451ef7fa396864f69  .agents/skills/mtm-init/tests/positive.md
 44f2ea2a1d1ee445a2a842b898d24dec97f480d7bf6c8620ffa9dba1f749f4e3  .agents/skills/mtm-pi-worker/SKILL.md
-4a9d352b24aadd6bb2212b88e79bb0811113420458d096d392635e6f61fc169c  .agents/skills/mtm-task-worker/SKILL.md
-ad29b2e2c23eeb8bf43d8d96cd0dad87365d759735dd449e85b581f176e0ef90  .agents/skills/mtm-verification/SKILL.md
+99abd1f9bf491cf92b9e26cf58808441379e866e88353d403d275f2b4fc04c7a  .agents/skills/mtm-task-worker/SKILL.md
+6113ba6e3afe0e6a03e5ad6e3ede026fd1b175e15815050be733bc6551b5b24d  .agents/skills/mtm-verification/SKILL.md
 eae8513c2080609ef80b2ef079486a49b74abad5888a4a345f62c0cc76d4b435  profiles/agents/bug-fixer.yaml
 37b49dbdbb5ec6e646d02d036145f8f456783b696bc865f75e16f5dc32c4be6c  profiles/agents/feature-implementer.yaml
 d8903c8045ebb29f71cfec2bb72de5306c87a559503dc10c93aac3b503235307  profiles/agents/general-task-worker.yaml

@@ -33,10 +33,11 @@ Write submit.json & worker_result.json
    - Inspect the task description and verification scenario files in `challenge/`.
    - Extract all input/output contracts, API schema changes, CLI flags, and required evidence files.
    - **PRE-MODIFICATION EVIDENCE RULE**: If the scenario requires pre-change evidence (e.g. UI state before adding a new control, baseline data state), **CAPTURE THIS EVIDENCE BEFORE IMPLEMENTING ANY CODE CHANGES**.
-2. **Local Test Data & Fixtures**:
-   - In competition runtime, no external third-party cloud drives or external QA tools exist.
-   - If the task references fixtures, seed data, or test loaders, locate them within the challenge directory or local workspace assets.
-   - **NEVER REPORT BLOCKED**: Load, seed, or generate required test fixtures locally as instructed by the challenge scripts.
+2. **Local Test Data & Fixtures (Autonomy Rule)**:
+   - In competition runtime, no external third-party cloud drives, fixture services, or external QA tools exist.
+   - The MCP Helper `mtm_minimal` ONLY handles contest communication; it DOES NOT provide fixture loaders or UI tools.
+   - If the task references fixtures, seed data, or test loaders, locate them within the challenge directory, seed them via project scripts (`pnpm db:seed`), or generate them locally following standard specifications (e.g. RFC 4180 for CSV).
+   - **NEVER REPORT BLOCKED**: Load, seed, or generate required test fixtures locally.
 3. **Locate Architecture**: Identify the correct module, router, or class to extend without creating duplicate or divergent code paths.
 4. **Implement**:
    - Implement the required functionality adhering strictly to existing project conventions and relevant open standards.
@@ -44,11 +45,13 @@ Write submit.json & worker_result.json
 5. **Verify All Scenarios**:
    - Run the task's check runners and test scripts provided with the challenge.
    - Verify positive paths, edge cases (empty states, special characters), and negative paths (unauthorized access, boundary limits).
-   - Run full unit tests and typechecks to guarantee zero regression.
+   - **Baseline Test Isolation**: Pre-existing test failures in unrelated modules (e.g. recorded in `PROJECT_MAP.md`) MUST NOT block submission. Only verify zero regressions in the modified modules.
 6. **Submission Validation Gate (HARD RULES)**:
+   - **Scope of Gate**: The Zero `NOT_RUN`, Zero `FAIL` rule applies STRICTLY to the test cases defined in `submit.json` for the current backlog item. If all test cases for this item in `submit.json` pass and evidence files are captured, THE WORKER MUST SUBMIT.
    - **Status MUST be `DONE`**: Submissions marked `PARTIAL`, `BLOCKED`, or `FAIL` score 0 and are blocked by the submission gate.
-   - **Zero `NOT_RUN`, Zero `FAIL`**: Every test case in `submit.json` must evaluate to `PASS`. If any check fails, resolve it before submitting.
+   - **Zero `NOT_RUN`, Zero `FAIL` in submit.json**: Every test case declared in `submit.json` must evaluate to `PASS`. If any check fails, resolve it before submitting.
    - **Physical Evidence Verification**: Verify that every evidence file declared in `evidenceFiles` and `testResults[].evidence` physically exists on disk under `answers/<key>/evidence/` and is committed in Git.
+   - **MANDATORY SUBMISSION**: Never leave a solved, committed task unsubmitted or marked BLOCKED. Call `submit_work` as soon as requirements are fulfilled.
 7. **Report**: Write `submit.json` and `worker_result.json` with status `READY_FOR_REVIEW`.
 
 ## CR Execution Rules

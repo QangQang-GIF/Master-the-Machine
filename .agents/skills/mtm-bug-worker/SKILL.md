@@ -38,11 +38,13 @@ Write submit.json & worker_result.json
 4. **Minimal Surgical Patch**: Edit only the affected logic. Never introduce cosmetic changes, formatting rewrites, or unrelated refactoring.
 5. **Verify & Ensure Passing Test Suite**:
    - Run the reproduction test and confirm it passes (exit code 0).
-   - Run all provided scenario check runners and module test suites.
-   - If there is any baseline test failure or regression, diagnose and resolve the issue so that all required tests pass 100%.
-   - If test fixtures or seed data are required, load them according to the challenge instructions. Never leave any test case unexecuted.
+   - Run all provided scenario check runners and module test suites for the changed feature.
+   - **Pre-existing Baseline Failures**: Do NOT block submission on pre-existing failing tests in unrelated modules that were already failing before work began (e.g. baseline issues recorded in `PROJECT_MAP.md`). Only test failures introduced as regressions in the modified modules must be resolved.
+   - **Local Fixture & Data Autonomy**: The MCP Helper `mtm_minimal` ONLY provides contest protocol APIs (`start_work`, `submit_work`, `report_progress`, etc.); it DOES NOT provide QA fixtures, database seeders, or UI drivers. All test fixtures, database seed records (`pnpm db:seed`, SQL insert), Playwright/curl scripts, and evidence captures MUST be created and executed LOCALLY by the worker. Never block or wait for external fixture tools.
 6. **Submission Validation Gate (HARD RULES)**:
+   - **Scope of Gate**: The Zero `NOT_RUN`, Zero `FAIL` rule applies STRICTLY to the test cases defined in `submit.json` for the current backlog item. If all test cases for this item in `submit.json` pass and evidence files are captured, THE WORKER MUST SUBMIT.
    - **Status MUST be `DONE`**: Submissions marked `PARTIAL`, `BLOCKED`, or `FAIL` score 0 and are blocked by the submission gate.
-   - **Zero `NOT_RUN`, Zero `FAIL`**: Every test case in `submit.json` must evaluate to `PASS`. If any test does not pass, continue debugging until all criteria are met.
+   - **Zero `NOT_RUN`, Zero `FAIL` in submit.json**: Every test case declared in `submit.json` must evaluate to `PASS`. If any check fails, resolve it before submitting.
    - **Physical Evidence Verification**: Ensure every evidence file declared in `evidenceFiles` and `testResults[].evidence` physically exists on disk under `answers/<key>/evidence/` and is committed in Git.
+   - **MANDATORY SUBMISSION (NEVER ABANDON A FIXED TASK)**: If the fix is implemented, relevant scenarios pass, and evidence is committed and pushed, the orchestrator MUST call `submit_work` to bank points before deadline or match end. Never leave a solved task unsubmitted or marked BLOCKED.
 7. **Report**: Output `worker_result.json` with status `READY_FOR_REVIEW`, list of changed files, and verified test results.
