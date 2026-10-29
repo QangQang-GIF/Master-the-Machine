@@ -71,6 +71,20 @@ def test_requires_start_and_does_not_duplicate_claim(coordinator):
         c.claim_task('BUG-01', 'other')
 
 
+def test_worker_sparse_checkout_excludes_prior_round_material(coordinator):
+    c = coordinator
+    old = c.checkout_root / 'old-round' / 'answers'
+    old.mkdir(parents=True)
+    (old / 'synthetic.txt').write_text('offline contamination sentinel')
+    git(c.checkout_root, 'add', 'old-round')
+    git(c.checkout_root, 'commit', '-m', 'offline history isolation fixture')
+    projection(c, item())
+    start(c, 'BUG-01')
+    claim = c.claim_task('BUG-01', 'worker')
+    assert Path(claim['matchRoot'], 'main.py').is_file()
+    assert not Path(claim['worktreeRoot'], 'old-round').exists()
+
+
 def test_two_coordinators_cannot_oversubscribe(coordinator):
     c = coordinator
     projection(c, item(), item('TASK-01'))

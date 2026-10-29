@@ -1,6 +1,6 @@
 {
   "release_version": "1.0.0",
-  "frozen_at": "2026-10-29T08:09:19.732504+00:00",
+  "frozen_at": "2026-10-29T12:43:02.921925+00:00",
   "active_skills": [
     "game-preparation@1.0.0",
     "mtm-bug-worker@1.0.0",
@@ -20,5 +20,12 @@
     "urgent_reserved_workers": 1,
     "model": "gpt-6-luna",
     "effort": "low"
+  },
+  "dev_cycle": {
+    "isolated_rounds": true,
+    "observer_interval_seconds": 600,
+    "target": "OFFICIAL_FULL_SCORE",
+    "transport_fallback": "GUARDED_STDIO",
+    "environment": "EPHEMERAL_SCOPED"
   }
 }

@@ -157,6 +157,7 @@ class NativeTaskCoordinator:
         return task["type"] == "PI" or (deadline is not None and float(deadline) - now <= estimate + 2 * self.reserve)
 
     def _plan(self, db) -> dict:
+        planning_time = time.monotonic()
         status, now, remaining = self._clock(db)
         rows = db.execute("SELECT * FROM tasks ORDER BY key").fetchall()
         active = [dict(r) for r in rows if r["phase"] == "RUNNING"]
@@ -247,7 +248,7 @@ class NativeTaskCoordinator:
             if slack <= self.reserve + 10:
                 continue
             urgent = self._urgent(task, now)
-            age = max(0, time.monotonic() - row["discovered"])
+            age = max(0, planning_time - row["discovered"])
             estimate = max(10, float(task.get("estimated_seconds", 420)))
             score = float(task.get("points", 0)) / estimate + age / 600
             candidates.append(((0 if task["type"] == "PI" else 1 if urgent else 2,
@@ -300,7 +301,10 @@ class NativeTaskCoordinator:
             if self._git("cat-file", "-t", f"{base}:{self.repository_folder}") != "tree":
                 raise NativeCoordinationError("Assigned repository folder is not a tracked directory")
             try:
-                self._git("worktree", "add", "--detach", str(target), base)
+                # Materialize only this match, excluding old round source/answers.
+                self._git("worktree", "add", "--detach", "--no-checkout", str(target), base)
+                self._git("sparse-checkout", "set", "--cone", self.repository_folder, cwd=target)
+                self._git("checkout", "--detach", base, cwd=target)
                 worker_match = target / self.repository_folder
                 if not worker_match.resolve().is_relative_to(target) or not worker_match.is_dir():
                     raise NativeCoordinationError("Assigned repository folder missing in worker worktree")
@@ -326,6 +330,8 @@ class NativeTaskCoordinator:
                         "submit_template": details.get("submitTemplate"), "allowed_paths": [str(worker_match)],
                         "worker_id": worker_id,
                         "metadata": {"match_root": str(worker_match), "start_details": details,
+                                     "project_runtime_path": str(Path(__file__).resolve().parents[3] / "runner" / "project_runtime.py"),
+                                     "match_id": self.match_id, "worker_id": worker_id,
                                      "submit_template": details.get("submitTemplate"),
                                      "worker_result_path": str(worker_match / "worker_result.json")}}
             stored = json.loads(row["data"])

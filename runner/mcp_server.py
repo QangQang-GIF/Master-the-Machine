@@ -158,6 +158,7 @@ class MCPHelperServer:
         self.running: bool = True
         self.native: Optional[NativeTaskCoordinator] = None
         self.latest_projection: Dict[str, Any] = {}
+        self.project_runtime = None
 
     def _get_backlog_title(self, key: str) -> str:
         item = self.known_backlog_items.get(key, {})
@@ -364,7 +365,7 @@ class MCPHelperServer:
                 pass
 
         # Journal & Git Guard
-        db_path = descriptor.get("journalDbPath") or (self.workspace_root / ".mtm" / "submissions.db")
+        db_path = descriptor.get("journalDbPath") or (self.workspace_root / "team-sdlc-pack" / "state" / str(self.match_code or "active") / "submissions.db")
         Path(db_path).parent.mkdir(parents=True, exist_ok=True)
         if self.journal is None or str(getattr(self.journal, "db_path", "")) != str(db_path):
             if self.journal is not None:
@@ -398,13 +399,27 @@ class MCPHelperServer:
         # PREPARE_GAME Pipeline (R1 & R5)
         if descriptor.get("type") == "PREPARE_GAME":
             is_offline = bool(descriptor.get("offline"))
-            self.telemetry.emit_orchestrator_started("Team Orchestrator started in preparation phase.")
+            # Player already owns ORCHESTRATOR_STARTED. Retain compatibility for
+            # standalone tests without duplicating an existing session milestone.
+            existing_started = False
+            if self.progress_log_file and self.progress_log_file.exists():
+                for line in self.progress_log_file.read_text(encoding="utf-8").splitlines():
+                    try:
+                        event = json.loads(line)
+                        if event.get("type") == "ORCHESTRATOR_STARTED" and event.get("playerSessionId") == self.player_session_id:
+                            existing_started = True
+                            break
+                    except ValueError:
+                        continue
+            if not existing_started:
+                self.telemetry.emit_orchestrator_started("Team Orchestrator started in preparation phase.")
 
             # 1. Genuine Git Invariants Verification (R2)
             try:
                 from mtm_core.git import verify_assigned_repository
                 repo_res = verify_assigned_repository(self.checkout_root, repo_info or descriptor)
                 head_sha = repo_res.get("head_sha", "0" * 40)
+                self.telemetry.emit_preparation_status("GIT_AUTH", "COMPLETED", "Assigned repository access and origin verified.")
                 self.telemetry.emit_preparation_status("REPOSITORY", "COMPLETED", "Assigned repository and branch verified.")
             except Exception as exc:
                 self.telemetry.emit_preparation_status("REPOSITORY", "FAILED", f"Git repository verification failed: {exc}")
@@ -426,6 +441,9 @@ class MCPHelperServer:
 
             # Resolve 3-tier layout: checkoutRoot -> matchRoot -> appRoot (R5)
             app_root = (self.match_root / "src") if (self.match_root / "src" / "package.json").exists() else self.match_root
+            from runner.project_runtime import ProjectRuntime
+            self.project_runtime = ProjectRuntime(self.match_root, str(self.match_code or "prepare"))
+            project_env = self.project_runtime.env
 
             bootstrap = KnowledgeBootstrap(
                 repo_path=self.checkout_root,
@@ -482,32 +500,26 @@ class MCPHelperServer:
 
             if doc_file:
                 cwd_run = doc_file.parent.parent if doc_file.parent.name == "env-require" else doc_file.parent
+                if not cwd_run.resolve().is_relative_to(self.match_root):
+                    cwd_run = self.match_root
                 if doc_file.suffix == ".ps1":
                     if sys.platform.startswith("win"):
-                        cmd_run = f'powershell.exe -ExecutionPolicy Bypass -File "{doc_file}"'
+                        cmd_run = ["powershell.exe", "-NoProfile", "-File", str(doc_file)]
                     else:
                         pwsh_bin = shutil.which("pwsh") or shutil.which("powershell")
                         if pwsh_bin:
-                            cmd_run = f'"{pwsh_bin}" -File "{doc_file}"'
+                            cmd_run = [pwsh_bin, "-NoProfile", "-File", str(doc_file)]
                         else:
                             sh_companion = doc_file.with_suffix(".sh")
                             if sh_companion.exists():
                                 doc_file = sh_companion
-                                cmd_run = f'bash "{doc_file}"'
+                                cmd_run = ["bash", str(doc_file)]
                             else:
-                                cmd_run = f'bash "{doc_file}"'
+                                raise RuntimeError("PowerShell doctor requires pwsh or a documented shell companion; never run .ps1 with bash")
                 else:
-                    cmd_run = f'bash "{doc_file}"' if not sys.platform.startswith("win") else f'sh "{doc_file}"'
+                    cmd_run = ["bash" if not sys.platform.startswith("win") else "sh", str(doc_file)]
                 try:
-                    res = subprocess.run(
-                        cmd_run,
-                        cwd=str(cwd_run),
-                        shell=True,
-                        capture_output=True,
-                        text=True,
-                        timeout=60,
-                        check=False,
-                    )
+                    res = self.project_runtime.run(cmd_run, cwd=cwd_run, timeout=120)
                     build_exit_code = res.returncode
                     doc_output = (res.stdout or "") + "\n" + (res.stderr or "")
                     has_ready = "Environment status: READY" in doc_output
@@ -534,6 +546,7 @@ class MCPHelperServer:
                             text=True,
                             timeout=60,
                             check=False,
+                            env=project_env,
                         )
                         build_exit_code = res.returncode
                         if res.returncode == 0:
@@ -550,6 +563,12 @@ class MCPHelperServer:
                     fail_reason = "No doctor script (doctor.ps1/doctor.sh) or valid build command found in repository"
 
             # Record verified status in PROJECT_MAP.md
+            if build_pass and doc_file and self.project_runtime.build_command():
+                actual_build = self.project_runtime.run(self.project_runtime.build_command(), cwd=app_root, timeout=300)
+                build_pass = actual_build.ok
+                build_exit_code = actual_build.returncode
+                if not build_pass:
+                    fail_reason = f"Declared app build failed with exit {build_exit_code}: {actual_build.stderr[-500:]}"
             bootstrap.generate_project_map(
                 output_path=kb_output_path,
                 verification_result={"passed": build_pass, "exit_code": build_exit_code},
@@ -561,6 +580,7 @@ class MCPHelperServer:
                 raise RuntimeError(f"PREPARE_GAME failed: Environment verification failed: {fail_reason}")
 
             self.telemetry.emit_preparation_status("BUILD", "COMPLETED", "Environment build verified.")
+            self.telemetry.emit_preparation_status("ENVIRONMENT", "COMPLETED", "Project toolchain and doctor checks verified.")
 
             # 4. Genuine Session Match Authentication (R1)
             username = self.username or descriptor.get("username")
