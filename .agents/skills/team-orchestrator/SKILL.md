@@ -62,10 +62,10 @@ Before submitting, ensure:
 4. Verify remote ref parity via `git ls-remote origin refs/heads/<assigned_branch>`.
 5. No immutable files (`exam-info.json`), secret files (`.env`), or cache directories are modified (GIT-04).
 6. **Submission Obligation & Baseline Isolation Rule**:
-   - The Submission Gate evaluates ONLY the tests and evidence declared for the CURRENT backlog item in `answers/<key>/submit.json`.
-   - Never block or withhold submission because of pre-existing, unrelated test failures in the repository (e.g. baseline failures noted in `PROJECT_MAP.md`).
+   - The Submission Gate evaluates ONLY the tests and evidence declared for the CURRENT backlog item in `answers/<key>/submit.json` (Zero `NOT_RUN`, Zero `FAIL` for that item's tests).
+   - Pre-existing, unrelated test failures in the repository (e.g. baseline failures noted in `PROJECT_MAP.md` like `cascade.test.ts`) MUST NEVER block or withhold submission.
    - If the code change is implemented, the task's verification scenarios pass, and evidence files are committed/pushed, **CALL `submit_work` IMMEDIATELY**.
-   - The MCP Helper `mtm_minimal` ONLY handles contest API calls; all test fixtures, browser captures, and data inputs must be executed locally by the worker.
+   - Local Autonomy: All test fixtures, seed loaders (`seed-cr01.ts`, `BUG-02-seed.ts`), browser captures, and data inputs must be executed locally by the worker. Never search Google Drive or report BLOCKED on missing external fixtures.
 7. Call `submit_work(clientSubmissionId, backlogItemKey, gitRevision, answer)`:
    - MCP Helper verifies Git invariants.
    - Saves canonical request body bytes to SQLite WAL `SubmissionJournal` (`IN_FLIGHT`).

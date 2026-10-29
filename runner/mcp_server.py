@@ -819,6 +819,9 @@ class MCPHelperServer:
                 if key and str(key) not in self.known_backlog_items:
                     key_str = str(key)
                     self.known_backlog_items[key_str] = item
+                    # Also alias by server UUID so lookups by UUID resolve to the same item
+                    if item.get("id") and str(item.get("id")) != key_str:
+                        self.known_backlog_items[str(item.get("id"))] = item
                     newly_discovered.append(key_str)
                     # Technical Guide Step 9: MUST emit DISCOVERED for every new item
                     if self.telemetry:
@@ -844,6 +847,13 @@ class MCPHelperServer:
         """Start work on an open backlog item with automatic telemetry."""
         if not self.adapter or not self.match_uuid:
             raise RuntimeError("Session not configured. Call configure_session first.")
+
+        # Translate UUID to clean business key if needed
+        if backlog_item_key in self.known_backlog_items:
+            item = self.known_backlog_items[backlog_item_key]
+            clean_key = item.get("key") or item.get("backlogItemKey") or item.get("backlogId")
+            if clean_key:
+                backlog_item_key = str(clean_key)
 
         origin = self.adapter.api_base_url
         path = f"/api/v1/matches/{self.match_uuid}/backlogs/start"
@@ -943,6 +953,13 @@ class MCPHelperServer:
         """Guard, journal, submit with exact body bytes, and emit automatic telemetry."""
         if not self.adapter or not self.match_uuid or not self.git_guard or not self.journal:
             raise RuntimeError("Session not configured. Call configure_session first.")
+
+        # Translate UUID to clean business key if needed
+        if backlog_item_key in self.known_backlog_items:
+            item = self.known_backlog_items[backlog_item_key]
+            clean_key = item.get("key") or item.get("backlogItemKey") or item.get("backlogId")
+            if clean_key:
+                backlog_item_key = str(clean_key)
 
         assigned_branch = self.assigned_branch or self.descriptor.get("assignedBranch")
         if not assigned_branch:
@@ -1095,6 +1112,14 @@ class MCPHelperServer:
         if not self.telemetry:
             log_path = self.progress_log_file or (self.workspace_root / "logs" / "progress.ndjson")
             self.telemetry = get_telemetry_logger(log_path, self.player_session_id)
+
+        # Translate UUID in backlogId if known
+        raw_bid = event.get("backlogId")
+        if raw_bid and str(raw_bid) in self.known_backlog_items:
+            item = self.known_backlog_items[str(raw_bid)]
+            clean_key = item.get("key") or item.get("backlogItemKey") or item.get("backlogId")
+            if clean_key:
+                event["backlogId"] = str(clean_key)
 
         # Ensure envelope fields
         if "schemaVersion" not in event:

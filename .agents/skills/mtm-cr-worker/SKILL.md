@@ -33,10 +33,11 @@ Write submit.json & worker_result.json
    - Inspect the task description and verification scenario files in `challenge/`.
    - Extract all input/output contracts, API schema changes, CLI flags, and required evidence files.
    - **PRE-MODIFICATION EVIDENCE RULE**: If the scenario requires pre-change evidence (e.g. UI state before adding a new control, baseline data state), **CAPTURE THIS EVIDENCE BEFORE IMPLEMENTING ANY CODE CHANGES**.
-2. **Local Test Data & Fixtures (Autonomy Rule)**:
-   - In competition runtime, no external third-party cloud drives, fixture services, or external QA tools exist.
+2. **Local Test Data & Fixtures (Autonomy Rule - No External Lookups)**:
+   - **No External Cloud Lookups**: External cloud storage, Google Drive, and external QA portals DO NOT exist in competition runtime. NEVER invoke tools like `google_drive` or search external clouds for fixtures.
    - The MCP Helper `mtm_minimal` ONLY handles contest communication; it DOES NOT provide fixture loaders or UI tools.
-   - If the task references fixtures, seed data, or test loaders, locate them within the challenge directory, seed them via project scripts (`pnpm db:seed`), or generate them locally following standard specifications (e.g. RFC 4180 for CSV).
+   - **Narrative Phrasing Clarification**: Phrasing in task scenarios such as "Obtain official test data from QA test data store" or "internal standard" is purely narrative context. The fixture data structure is defined by the seed scripts in `challenge/` (e.g. `challenge/CR-01-seed.ts`).
+   - Create or load the required fixture file directly under `answers/<key>/evidence/<key>-test-data.json` matching the scenario requirements, run the seed script locally (`pnpm tsx prisma/seed-cr01.ts ...`), and proceed with verification.
    - **NEVER REPORT BLOCKED**: Load, seed, or generate required test fixtures locally.
 3. **Locate Architecture**: Identify the correct module, router, or class to extend without creating duplicate or divergent code paths.
 4. **Implement**:
