@@ -1,40 +1,14 @@
 ---
 name: mtm-init
-description: Master the Machine foundational operating principles, token discipline, repo exploration rules, and worker contract boundaries.
+description: Shared MTM worker boundaries, TaskEnvelope/WorkerResult contract, and economical repository inspection.
 ---
 
-# MTM-INIT: Foundational Agent Operating Policy
+# MTM worker contract
 
-This skill establishes the baseline operational policy for all autonomous Codex workers participating in Master The Machine (MTM) 2026.
-
-## 1. Core Operating Principles
-
-1. **Deterministic Contracts**:
-   - Every task execution is bounded by a `TaskEnvelope` and must conclude with a compliant `worker_result.json`.
-   - Never replace deterministic test verification or git checks with natural language affirmations.
-
-2. **Token & Context Economy (Lean2 Rules)**:
-   - **Do not dump entire directory trees**: Use targeted `ripgrep` (`rg`) and file path lookups.
-   - **Bounded reads**: Read only relevant function slices, never dump thousands of lines into context.
-   - **Cap tool output**: Limit command outputs to ~2,000 tokens. If a test suite produces large logs, capture summary or tail output.
-   - **Low verbosity**: Provide zero chit-chat or introductory narration. Execute the task directly.
-
-3. **Minimal Surgical Changes**:
-   - Implement the smallest, cleanest change that completely solves the issue and satisfies the acceptance criteria.
-   - Do not refactor unrelated code, reformat styles, or update unrequested dependencies.
-
-4. **Mandatory Verification**:
-   - Run tests before concluding.
-   - Check against Minimum Viable Solution (MVS) criteria when declared.
-   - Record test outputs and exit codes.
-
-5. **Strict Evidence Gathering**:
-   - When evidence is declared in `evidence_required` (e.g. before/after screenshots, test logs), produce and save the artifact in the workspace.
-   - Add the artifact path to `evidence_paths` in `worker_result.json`.
-
-6. **Forbidden Actions & Local Autonomy**:
-   - Never modify hidden benchmark tests or grading fixtures.
-   - Never attempt to escape the designated workspace directory.
-   - Never modify `.git/` internals directly or commit broken code to production branches.
-   - **No External Cloud Lookups**: Never search or query external tools (e.g. Google Drive, Google Docs, external cloud stores) for test fixtures or specifications. The competition runtime is 100% self-contained locally.
-   - **No QA Fixture Hallucination**: Never report a task as `BLOCKED` due to "missing QA test data store" or "external fixture". When a task scenario mentions obtaining data from a QA store, create or load the local fixture directly using the seed scripts provided in `challenge/` and standard specifications (e.g. RFC 4180).
+- Work only on the announced item in its `TaskEnvelope`, within assigned paths, model/effort, skills, and resource limits. Use the envelope's `match_root` rather than reconstructing paths. In a worktree, source and answers belong in `worktreeRoot/repository.folder`; Git paths retain that folder prefix.
+- Other workers may run concurrently. Use your isolated worktree and local test resources; never overwrite another worker's edits, shared database, or assigned branch. The root owns integration, push, Start Work, and Submit. Do not launch another Codex/agent CLI or delegate unless the envelope authorizes native subagents.
+- Read only the relevant skill and code slices. Prefer `rg`, bounded output, and full logs saved to files. Implement the smallest complete change; avoid unrelated refactors and dependency updates.
+- Read the received template, announced MVS, and evidence requirements before editing. Capture requested before-change evidence first. Run actual verification and record `test_results` with `command`, `passed`, and `exit_code` (zero for PASS); never invent outcomes or omit required scenarios to obtain PASS.
+- Use provided local fixtures/loaders and documented schemas. Generate data only where the specification permits; report genuinely missing required inputs accurately. Do not seek hidden tasks, grading tests, gold patches, other teams' data, or external cloud fixtures.
+- Do not modify immutable challenge assets, secret files, agent configuration, or Git internals; never log credentials. Production skills are frozen. Host approval blocks require `HOST_APPROVAL_REQUIRED` with the exact reason; preserve progress and stop the blocked action.
+- Always write schema-compliant `worker_result.json` at the envelope's result location (default worktree root): task ID, status, changed files, tests, evidence paths, elapsed time, and available usage. Use `READY_FOR_REVIEW` only after complete verified work; otherwise report `BLOCKED`, `FAILED`, `TIMED_OUT`, or `ESCALATE` honestly. Evidence paths are relative to matchRoot, under `answers/<key>/evidence/`. Missing usage stays unknown.

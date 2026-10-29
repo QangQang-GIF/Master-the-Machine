@@ -102,6 +102,7 @@ def install_pack(source_dir: Path, workspace_dir: Path) -> None:
         "bin",
         "config",
         "contracts",
+        "releases",
     ]
     for d in dirs_to_copy:
         src_d = source_dir / d
@@ -116,7 +117,7 @@ def install_pack(source_dir: Path, workspace_dir: Path) -> None:
         src_f = source_dir / f
         if src_f.exists():
             safe_copy2(src_f, runtime_dir / f)
-    for d in ["agents", "bin", "config", "contracts", "docs", "scripts", "skills", "src", "profiles", "schemas", "runner"]:
+    for d in ["agents", "bin", "config", "contracts", "docs", "scripts", "skills", "src", "profiles", "schemas", "runner", "releases"]:
         src_d = source_dir / d
         if src_d.exists():
             safe_copytree(src_d, runtime_dir / d)
@@ -187,7 +188,17 @@ def install_pack(source_dir: Path, workspace_dir: Path) -> None:
     src_posix = (target_pack_dir / "src").as_posix()
     sep = ";" if sys.platform.startswith("win") else ":"
 
-    codex_toml = f"""[mcp_servers.mtm_minimal]
+    codex_toml = f"""[features]
+multi_agent = true
+multi_agent_v2 = true
+
+[agents]
+enabled = true
+max_concurrent_threads_per_session = 2
+default_subagent_model = "gpt-6-luna"
+default_subagent_reasoning_effort = "low"
+
+[mcp_servers.mtm_minimal]
 command = "{python_exe}"
 args = ["-m", "runner.mcp_server"]
 cwd = "{target_posix}"
@@ -196,6 +207,10 @@ tool_timeout_sec = 120
 
 [mcp_servers.mtm_minimal.env]
 PYTHONPATH = "{src_posix}{sep}{target_posix}"
+MTM_NATIVE_COORDINATION = "1"
+MTM_NATIVE_MAX_WORKERS = "2"
+MTM_NATIVE_NORMAL_WORKERS = "1"
+MTM_ENV = "production"
 """
     (codex_dir / "config.toml").write_text(codex_toml, encoding="utf-8")
     (target_pack_dir / ".codex").mkdir(parents=True, exist_ok=True)

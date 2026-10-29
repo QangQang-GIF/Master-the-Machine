@@ -81,9 +81,9 @@ def test_mtm_runtime_constants():
         START_WORK_PATH,
         SUBMISSION_PATH,
     )
-    assert MODEL == "gpt-6.1-sol"
-    assert MODEL_EFFORT == "medium"
-    assert CONCURRENCY == 1
+    assert MODEL == "gpt-6-luna"
+    assert MODEL_EFFORT == "low"
+    assert CONCURRENCY == 2
     assert DEFAULT_GAME_MASTER_ORIGIN == "https://masterthemachine.tech"
     assert DEFAULT_TASK_TIMEOUT_SECONDS == 420.0
     assert START_WORK_PATH == "/api/v1/matches/{match_id}/backlogs/start"

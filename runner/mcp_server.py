@@ -16,12 +16,14 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
 import time
 import urllib.parse
 import uuid
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -41,6 +43,7 @@ from mtm_competition.adapters.official_game_master import (
 )
 from mtm_competition.integration.git_guard import PreSubmissionGitGuard
 from mtm_competition.tasks.journal import SubmissionJournal
+from mtm_competition.scheduling.native import NativeTaskCoordinator
 from mtm_knowledge.bootstrap import KnowledgeBootstrap, detect_tech_stack
 from runner.telemetry import (
     TelemetryLogger,
@@ -49,83 +52,78 @@ from runner.telemetry import (
 )
 
 
-def resolve_stored_session_credentials(workspace_root: Path, match_code: Optional[str]) -> Dict[str, Any]:
-    """Retrieve persisted match session credentials and cookies if omitted from descriptor."""
-    result: Dict[str, Any] = {}
-    if not match_code:
-        return result
+_SESSION_MEMORY: Dict[tuple[str, str], Dict[str, Any]] = {}
 
-    # 1. Check workspace .mtm/<match_code>.session.json
-    for base in [workspace_root, workspace_root / "team-sdlc-pack"]:
-        session_file = base / ".mtm" / f"{match_code}.session.json"
-        if session_file.exists():
-            try:
-                saved = json.loads(session_file.read_text(encoding="utf-8"))
-                if isinstance(saved, dict):
-                    return saved
-            except Exception:
-                pass
 
-    # 2. Check general .mtm/session.json
-    for base in [workspace_root, workspace_root / "team-sdlc-pack"]:
-        gen_file = base / ".mtm" / "session.json"
-        if gen_file.exists():
-            try:
-                saved = json.loads(gen_file.read_text(encoding="utf-8"))
-                if isinstance(saved, dict) and saved.get("matchCode") == match_code:
-                    return saved
-            except Exception:
-                pass
+def _epoch(value: Any) -> Optional[float]:
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return float(value) / 1000 if value > 1e12 else float(value)
+    if isinstance(value, str):
+        try:
+            return datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
+        except ValueError:
+            return None
+    return None
 
-    # 3. Check MTM Player Application Support directories (macOS / Linux / Windows)
-    user_home = Path.home()
-    app_dirs = [
-        user_home / "Library" / "Application Support" / "MTM Player" / "applications",
-        user_home / ".local" / "share" / "mtm-player" / "applications",
-    ]
-    if os.environ.get("XDG_DATA_HOME"):
-        app_dirs.append(Path(os.environ["XDG_DATA_HOME"]) / "mtm-player" / "applications")
-    if os.environ.get("LOCALAPPDATA"):
-        app_dirs.append(Path(os.environ["LOCALAPPDATA"]) / "MTM Player" / "applications")
 
-    for app_dir in app_dirs:
-        if not app_dir.exists():
+def normalize_native_projection(projection: Dict[str, Any], adapter: Any) -> Dict[str, Any]:
+    """Translate public board aliases without assuming duration or reveal schedules."""
+    match = projection.get("match") or {}
+    status = projection.get("status") or match.get("status") or "UNKNOWN"
+    server = next((_epoch(projection[k]) for k in ("server_epoch", "serverNow", "serverTime") if projection.get(k) is not None), None)
+    if server is None and getattr(adapter, "server_epoch", None) is not None:
+        server = adapter.server_epoch + max(0, time.monotonic() - adapter.server_clock_monotonic)
+    remaining = next((source[k] for source in (projection, match) for k in ("remaining_seconds", "remainingSec", "remainingSeconds") if source.get(k) is not None), None)
+    items = []
+    for item in projection.get("backlogItems", projection.get("backlog", [])):
+        key = item.get("key") or item.get("backlogItemKey") or item.get("backlogId")
+        if not key:
             continue
-        for priv_file in app_dir.glob("*/private/*.json"):
-            try:
-                data = json.loads(priv_file.read_text(encoding="utf-8"))
-                sess = data.get("state", {}).get("match", {}).get("session", {})
-                if sess.get("matchId") == match_code or sess.get("matchCode") == match_code:
-                    res = {
-                        "username": sess.get("username"),
-                        "password": sess.get("password"),
-                        "apiKeySecret": sess.get("apiKeySecret"),
-                        "matchPageUrl": sess.get("matchPageUrl"),
-                        "matchUuid": sess.get("teamUuid") or sess.get("matchUuid"),
-                    }
-                    return {k: v for k, v in res.items() if v}
-            except Exception:
-                continue
+        deadline = next((_epoch(item[k]) for k in ("deadline_epoch", "deadlineEpoch", "deadlineAt", "closesAt", "closeAt", "dueAt") if item.get(k) is not None), None)
+        # Explicit server countdown is pause-adjusted and preferable to wall-clock dates.
+        left = next((item[k] for k in ("remainingSec", "remainingSeconds", "deadlineRemainingSec") if item.get(k) is not None), None)
+        if left is not None and server is not None:
+            deadline = server + max(0, float(left))
+        items.append({**item, "key": str(key), "type": item.get("type") or item.get("taskType") or str(key).split("-")[0],
+                      "status": item.get("status") or item.get("state") or "VISIBLE", "deadline_epoch": deadline})
+    return {"status": status, "server_epoch": server, "remaining_seconds": remaining, "items": items}
 
-    return result
+
+def announced_test_ids(details: Dict[str, Any]) -> List[str]:
+    """Inventory explicit public scenario IDs, independent of a worker's answer."""
+    ids: set[str] = set()
+    def walk(value: Any, rows: bool = False) -> None:
+        if isinstance(value, list):
+            for row in value:
+                walk(row, True)
+        elif isinstance(value, dict):
+            if rows:
+                identifier = value.get("id") or value.get("testCaseId") or value.get("scenarioId")
+                if isinstance(identifier, str) and identifier.strip():
+                    ids.add(identifier.strip())
+            for name in ("testResults", "scenarios", "testCases", "cases", "tests", "minimumVerificationScenarios", "mvs"):
+                if name in value:
+                    walk(value[name], True)
+        elif isinstance(value, str):
+            ids.update(re.findall(r"\b(?:[A-Z0-9]+-)*(?:TC|MVS|SCENARIO|TEST)-\d+(?:-[A-Za-z0-9]+)*\b", value))
+    walk(details.get("submitTemplate", {}))
+    walk(details.get("minimumVerificationScenarios", details.get("mvs")), True)
+    return sorted(ids)
+
+
+def resolve_stored_session_credentials(workspace_root: Path, match_code: Optional[str]) -> Dict[str, Any]:
+    """Retain credentials only in this MCP process, scoped to the exact match/workspace.
+
+    Recovery receives a fresh trusted Player descriptor; never scan host private
+    directories or write competition credentials to disk.
+    """
+    return dict(_SESSION_MEMORY.get((str(workspace_root.resolve()), str(match_code)), {}))
 
 
 def save_stored_session_credentials(workspace_root: Path, match_code: str, data: Dict[str, Any]) -> None:
-    """Safely persist session credentials and cookies to .mtm/<match_code>.session.json."""
-    if not match_code:
-        return
-    for base in [workspace_root, workspace_root / "team-sdlc-pack"]:
-        try:
-            mtm_dir = base / ".mtm"
-            mtm_dir.mkdir(parents=True, exist_ok=True)
-            session_file = mtm_dir / f"{match_code}.session.json"
-            session_file.write_text(json.dumps(data, indent=2), encoding="utf-8")
-            try:
-                os.chmod(session_file, 0o600)
-            except Exception:
-                pass
-        except Exception:
-            pass
+    """Compatibility name for memory-only retention; nothing is persisted."""
+    if match_code:
+        _SESSION_MEMORY[(str(workspace_root.resolve()), str(match_code))] = dict(data)
 
 
 class MCPHelperServer:
@@ -158,6 +156,8 @@ class MCPHelperServer:
         self.known_backlog_items: Dict[str, Dict[str, Any]] = {}
         self.match_state: str = "IN_PROGRESS"
         self.running: bool = True
+        self.native: Optional[NativeTaskCoordinator] = None
+        self.latest_projection: Dict[str, Any] = {}
 
     def _get_backlog_title(self, key: str) -> str:
         item = self.known_backlog_items.get(key, {})
@@ -166,6 +166,12 @@ class MCPHelperServer:
 
     def configure_session(self, descriptor: Dict[str, Any]) -> Dict[str, Any]:
         """Configure trusted session from MTM Player descriptor."""
+        if os.environ.get("MTM_ENV") == "production":
+            from mtm_core.config.loader import verify_skill_checksums
+            verify_skill_checksums(_pack_root)
+        incoming = descriptor.get("matchId") or descriptor.get("matchCode") or descriptor.get("match_code")
+        if self.match_code and incoming and self.match_code != str(incoming).strip():
+            raise ValueError("A new match requires a fresh MCP session; do not reuse credentials or leases")
         merged = dict(self.descriptor)
         merged.update(descriptor)
         self.descriptor = merged
@@ -369,6 +375,19 @@ class MCPHelperServer:
             self.journal = SubmissionJournal(db_path=db_path)
         self.git_guard = PreSubmissionGitGuard(repo_path=self.checkout_root)
 
+        if descriptor.get("type") in ("START_GAME", "RESUME_GAME") and (
+            descriptor.get("nativeScheduling") or os.environ.get("MTM_NATIVE_COORDINATION") == "1"
+        ):
+            folder = self.repo_descriptor.get("folder") or self.match_root.relative_to(self.checkout_root).as_posix()
+            self.native = NativeTaskCoordinator(
+                state_dir=self.workspace_root / "team-sdlc-pack" / "state" / str(self.match_code) / "native",
+                checkout_root=self.checkout_root, match_root=self.match_root,
+                repository_folder=folder, match_id=str(self.match_code),
+                max_workers=int(os.environ.get("MTM_NATIVE_MAX_WORKERS", "2")),
+                normal_workers=int(os.environ.get("MTM_NATIVE_NORMAL_WORKERS", "1")),
+            )
+            self._reconcile_native_receipts()
+
         # Record initial items from descriptor
         for item in descriptor.get("backlogItems", []):
             if isinstance(item, dict):
@@ -407,18 +426,6 @@ class MCPHelperServer:
 
             # Resolve 3-tier layout: checkoutRoot -> matchRoot -> appRoot (R5)
             app_root = (self.match_root / "src") if (self.match_root / "src" / "package.json").exists() else self.match_root
-
-            # Pre-flight: Ensure .env is populated from .env.example with local credentials if missing
-            env_example = app_root / ".env.example"
-            env_file = app_root / ".env"
-            if env_example.exists() and not env_file.exists():
-                try:
-                    content = env_example.read_text(encoding="utf-8")
-                    content = content.replace('AUTH_SECRET="CHANGE_ME"', 'AUTH_SECRET="f6c8d7e9a0b1c2d3e4f5a6b7c8d9e0f1a2b3c4d5"')
-                    content = content.replace("CHANGE_ME", "freelanceos")
-                    env_file.write_text(content, encoding="utf-8")
-                except Exception:
-                    pass
 
             bootstrap = KnowledgeBootstrap(
                 repo_path=self.checkout_root,
@@ -785,23 +792,17 @@ class MCPHelperServer:
             self.match_uuid = projection.get("matchUuid")
             self.adapter.match_uuid = self.match_uuid
 
-        # Track waves: Wave 2 at min 14 (840s), Wave 3 at min 29 (1740s)
+        self.latest_projection = projection
+        if self.native:
+            self.native.register_projection(normalize_native_projection(projection, self.adapter))
+            self._reconcile_native_receipts()
+
+        # Release schedules belong to the server; never infer them from elapsed time.
         proj_wave = projection.get("wave")
         if proj_wave is not None:
             try:
                 self.current_wave = max(self.current_wave, int(proj_wave))
             except (ValueError, TypeError):
-                pass
-        else:
-            try:
-                state = self.adapter.get_match_state()
-                elapsed_sec = state.get("elapsedSeconds") or state.get("elapsed_seconds") or state.get("duration")
-                if elapsed_sec is not None:
-                    if elapsed_sec >= 1740:
-                        self.current_wave = max(self.current_wave, 3)
-                    elif elapsed_sec >= 840:
-                        self.current_wave = max(self.current_wave, 2)
-            except Exception:
                 pass
 
         items = projection.get("backlogItems", [])
@@ -833,20 +834,32 @@ class MCPHelperServer:
                             revision=None,
                             receipt_id=None,
                         )
+                elif key:
+                    # Status/deadline/grading transitions must replace stale discovery data.
+                    key_str = str(key)
+                    self.known_backlog_items[key_str] = item
+                    if item.get("id") and str(item["id"]) != key_str:
+                        self.known_backlog_items[str(item["id"])] = item
 
         return {
             "status": self.match_state,
             "matchUuid": self.match_uuid,
             "matchCode": self.match_code,
             "wave": self.current_wave,
-            "backlogItems": list(self.known_backlog_items.values()),
+            "backlogItems": list({str(i.get("key") or i.get("backlogItemKey") or i.get("backlogId") or i.get("id")): i for i in self.known_backlog_items.values()}.values()),
             "newlyDiscovered": newly_discovered,
+            "scheduling": normalize_native_projection(projection, self.adapter),
         }
 
     def start_work(self, backlog_item_key: str) -> Dict[str, Any]:
         """Start work on an open backlog item with automatic telemetry."""
         if not self.adapter or not self.match_uuid:
             raise RuntimeError("Session not configured. Call configure_session first.")
+
+        if self.native:
+            self.refresh_match()
+            if backlog_item_key not in [t["key"] for t in self.native.plan_tasks()["selected"]]:
+                raise ValueError("Item is not eligible under current server state/capacity/deadline")
 
         # Translate UUID to clean business key if needed
         if backlog_item_key in self.known_backlog_items:
@@ -878,6 +891,9 @@ class MCPHelperServer:
                 backlog_item_key=backlog_item_key,
             )
 
+            if self.native:
+                self.native.register_started(backlog_item_key, result)
+
             req_id = result.get("requestId") or result.get("request_id")
             # 2. Automatic telemetry: SUCCEEDED & IN_PROGRESS
             if self.telemetry:
@@ -903,7 +919,7 @@ class MCPHelperServer:
 
             # Write template to answers/<key>/submit.json
             submit_template = result.get("submitTemplate")
-            if submit_template is not None:
+            if submit_template is not None and not self.native:
                 ans_dir = self.match_root / "answers" / backlog_item_key
                 ans_dir.mkdir(parents=True, exist_ok=True)
                 template_path = ans_dir / "submit.json"
@@ -916,6 +932,9 @@ class MCPHelperServer:
                 for rel_path, file_content in delivered_files.items():
                     try:
                         target_file = self.match_root / rel_path
+                        from mtm_competition.integration.git_guard import is_forbidden_path
+                        if not target_file.resolve().is_relative_to(self.match_root.resolve()) or is_forbidden_path(rel_path)[0]:
+                            raise ValueError("Delivered path escapes match workspace or is immutable")
                         target_file.parent.mkdir(parents=True, exist_ok=True)
                         if isinstance(file_content, str):
                             target_file.write_text(file_content, encoding="utf-8")
@@ -965,6 +984,15 @@ class MCPHelperServer:
         if not assigned_branch:
             raise ValueError("No assigned branch configured for submission")
 
+        required_test_ids: List[str] = []
+        if self.native:
+            self.refresh_match()
+            self.native.assert_can_submit(backlog_item_key)
+            # Rechecking an existing lock is idempotent; another item cannot push in between.
+            self.native.begin_integration(backlog_item_key)
+            details = self.native.task_details(backlog_item_key)["data"].get("start_details", {})
+            required_test_ids = announced_test_ids(details)
+
         # 1. Pre-submission Git Invariant Verification (GIT-01..05)
         self.git_guard.validate_pre_submission(
             target_commit_sha=git_revision,
@@ -975,6 +1003,7 @@ class MCPHelperServer:
             checkout_root=self.checkout_root,
             require_remote=False if self.descriptor.get("offline") else True,
             raise_on_error=True,
+            required_test_ids=required_test_ids,
         )
 
         # 2. Record In-Flight Submission Journal with canonical serialized bytes (API-06, API-07)
@@ -1040,6 +1069,9 @@ class MCPHelperServer:
                 receipt_id=str(server_sub_id),
                 http_code=201,
             )
+
+            if self.native:
+                self.native.mark_submitted(backlog_item_key, str(server_sub_id))
 
             req_id = receipt.get("requestId") or submission_obj.get("requestId")
 
@@ -1131,6 +1163,50 @@ class MCPHelperServer:
         self.telemetry.log_event(event)
         return {"status": "RECORDED"}
 
+    def _native_coordinator(self) -> NativeTaskCoordinator:
+        if not self.native:
+            raise RuntimeError("Native scheduling requires START_GAME with MTM_NATIVE_COORDINATION=1")
+        return self.native
+
+    def _reconcile_native_receipts(self) -> None:
+        if not self.native or not self.journal or not self.match_uuid:
+            return
+        # Bridge the durable receipt/coordinator crash window; never resend accepted work.
+        rows = self.journal.conn.execute(
+            "SELECT backlog_item_key,receipt_id FROM submission_journal WHERE match_uuid=? AND state='ACCEPTED' AND receipt_id IS NOT NULL",
+            (self.match_uuid,),
+        ).fetchall()
+        for row in rows:
+            try:
+                phase = self.native.task_details(row["backlog_item_key"])["phase"]
+            except ValueError:
+                continue
+            if phase in ("INTEGRATING", "INTEGRATED", "SUBMITTED"):
+                self.native.mark_submitted(row["backlog_item_key"], row["receipt_id"])
+
+    def plan_tasks(self) -> Dict[str, Any]:
+        self.refresh_match()
+        return self._native_coordinator().plan_tasks()
+
+    def claim_task(self, backlog_item_key: str, worker_id: str, estimated_seconds: int = 420) -> Dict[str, Any]:
+        return self._native_coordinator().claim_task(backlog_item_key, worker_id, estimated_seconds)
+
+    def record_worker_result(self, backlog_item_key: str, worker_result: Dict[str, Any]) -> Dict[str, Any]:
+        return self._native_coordinator().record_worker_result(backlog_item_key, worker_result)
+
+    def integration_gate(self, backlog_item_key: str, action: str = "begin") -> Dict[str, Any]:
+        native = self._native_coordinator()
+        if action == "begin":
+            self.refresh_match()
+            return native.begin_integration(backlog_item_key)
+        if action == "failed":
+            return native.end_integration(backlog_item_key, success=False)
+        raise ValueError("integration_gate action must be begin or failed")
+
+    def reconcile_worker(self, backlog_item_key: str, confirmed_stopped: bool, reason: str, requeue: bool = True) -> Dict[str, Any]:
+        return self._native_coordinator().reconcile_worker(
+            backlog_item_key, confirmed_stopped=confirmed_stopped, reason=reason, requeue=requeue)
+
     def wait_for_update(self, timeout_ms: int = 5000) -> Dict[str, Any]:
         """Bounded serial polling detecting wave releases and match status transitions."""
         bounded_ms = min(max(100, timeout_ms), 55000)
@@ -1175,7 +1251,19 @@ class MCPHelperServer:
 
 
 def get_tool_definitions() -> List[Dict[str, Any]]:
-    return [
+    native_tools = [
+        ("plan_tasks", "Refresh server board and return eligible native tasks, reserved urgent capacity, and ready integrations.", {}, []),
+        ("claim_task", "Reserve an eligible task after Start Work; return isolated worktree and sanitized TaskEnvelope for native spawn.",
+         {"backlogItemKey": {"type": "string"}, "workerId": {"type": "string"}, "estimatedSeconds": {"type": "integer", "minimum": 10, "default": 420}}, ["backlogItemKey", "workerId"]),
+        ("record_worker_result", "Validate completed native WorkerResult and required local artifacts before root integration.",
+         {"backlogItemKey": {"type": "string"}, "workerResult": {"type": "object"}}, ["backlogItemKey", "workerResult"]),
+        ("integration_gate", "Root-only exclusive integration/push/submit lock. Begin before Git mutation; failed releases after reconciliation. Submit receipt releases success.",
+         {"backlogItemKey": {"type": "string"}, "action": {"type": "string", "enum": ["begin", "failed"], "default": "begin"}}, ["backlogItemKey"]),
+        ("reconcile_worker", "Reconcile a stopped/completed failed native worker. Never confirm stopped while it is still writing.",
+         {"backlogItemKey": {"type": "string"}, "confirmedStopped": {"type": "boolean"}, "reason": {"type": "string"}, "requeue": {"type": "boolean", "default": True}}, ["backlogItemKey", "confirmedStopped", "reason"]),
+    ]
+    return [{"name": name, "description": description, "inputSchema": {"type": "object", "properties": props, "required": required, "additionalProperties": False}}
+            for name, description, props, required in native_tools] + [
         {
             "name": "configure_session",
             "description": "Initialize match session credentials, paths, and telemetry logger.",
@@ -1311,6 +1399,16 @@ def run_mcp_stdio_server():
                     val = server.report_progress(tool_args.get("event", {}))
                 elif tool_name == "wait_for_update":
                     val = server.wait_for_update(tool_args.get("timeoutMs", 5000))
+                elif tool_name == "plan_tasks":
+                    val = server.plan_tasks()
+                elif tool_name == "claim_task":
+                    val = server.claim_task(tool_args["backlogItemKey"], tool_args["workerId"], tool_args.get("estimatedSeconds", 420))
+                elif tool_name == "record_worker_result":
+                    val = server.record_worker_result(tool_args["backlogItemKey"], tool_args["workerResult"])
+                elif tool_name == "integration_gate":
+                    val = server.integration_gate(tool_args["backlogItemKey"], tool_args.get("action", "begin"))
+                elif tool_name == "reconcile_worker":
+                    val = server.reconcile_worker(tool_args["backlogItemKey"], tool_args["confirmedStopped"], tool_args["reason"], tool_args.get("requeue", True))
                 else:
                     raise ValueError(f"Unknown tool: {tool_name}")
 

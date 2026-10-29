@@ -10,12 +10,13 @@ import urllib.request
 import urllib.error
 import sys
 import subprocess
+import os
 
 ORIGIN = "https://masterthemachine.tech"
 COOKIES_FILE = "/tmp/gm_cookies.txt"
-CURRENT_MATCH_ID = "6B63SHDX"
-TEAM_ID = "BAN"
-API_KEY = "gm_live_31d1d4bf_PpDc0QWh9V88FfbVoTtZxE57X92rI-0L"
+CURRENT_MATCH_ID = os.environ.get("MTM_MATCH_ID", "")
+TEAM_ID = os.environ.get("MTM_TEAM_ID", "")
+API_KEY = os.environ.get("MTM_API_KEY", "")
 LOCAL_PLAYER_URL = "http://127.0.0.1:54321"
 
 def log(msg):
@@ -58,8 +59,8 @@ def initialize_player(new_match_id):
         "matchId": new_match_id,
         "gameMasterApiUrl": ORIGIN,
         "gameMasterSecretKey": API_KEY,
-        "teamLoginAccount": "BAN_digital_cuder",
-        "teamPassword": "=hxEg7H!",
+        "teamLoginAccount": os.environ.get("MTM_USERNAME", ""),
+        "teamPassword": os.environ.get("MTM_PASSWORD", ""),
         "allowedModels": ["gpt-6-luna"],
         "orchestratorModel": "gpt-6-luna",
         "orchestratorReasoningEffort": "low",
@@ -80,6 +81,8 @@ def initialize_player(new_match_id):
         log(f"MTM Player response: {resp_data}")
 
 def main():
+    if not all((CURRENT_MATCH_ID, TEAM_ID, API_KEY, os.environ.get("MTM_USERNAME"), os.environ.get("MTM_PASSWORD"))):
+        raise SystemExit("Explicit MTM_* environment credentials and match assignment required; nothing started.")
     log(f"Monitoring match {CURRENT_MATCH_ID} for rematch readiness...")
     poll_count = 0
     while True:

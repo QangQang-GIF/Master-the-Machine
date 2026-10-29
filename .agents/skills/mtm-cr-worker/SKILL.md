@@ -1,61 +1,14 @@
 ---
 name: mtm-cr-worker
-description: Specialized worker skill for implementing Change Requests (CR), new features, API additions, and schema extensions.
+description: Implement and verify an announced MTM change request against its specification and MVS.
 ---
 
-# MTM Change Request (CR) Worker Skill
+# CR
 
-Specialized workflow for implementing feature enhancements and change requests (`CR`) in competition environments.
+Follow `mtm-init` and the TaskEnvelope. The root has already called Start Work.
 
-## CR Pipeline
-
-```text
-Parse Requirements & Extract Dynamic Evidence Requirements
-      ↓
-Mandatory Pre-Change Baseline Evidence Capture (if required by spec)
-      ↓
-Prepare Local Test Data Fixtures (Never block on external cloud tools)
-      ↓
-Locate Affected Architecture / Entrypoints
-      ↓
-Implement Change Adhering to Standards & Existing Conventions
-      ↓
-Positive, Negative & Regression Test Validation
-      ↓
-Submission Validation Gate (All Tests PASS, Zero NOT_RUN / FAIL)
-      ↓
-Write submit.json & worker_result.json
-```
-
-## Step-by-Step Instructions
-
-1. **Parse Requirements & Dynamic Evidence Extraction**:
-   - Inspect the task description and verification scenario files in `challenge/`.
-   - Extract all input/output contracts, API schema changes, CLI flags, and required evidence files.
-   - **PRE-MODIFICATION EVIDENCE RULE**: If the scenario requires pre-change evidence (e.g. UI state before adding a new control, baseline data state), **CAPTURE THIS EVIDENCE BEFORE IMPLEMENTING ANY CODE CHANGES**.
-2. **Local Test Data & Fixtures (Autonomy Rule - No External Lookups)**:
-   - **No External Cloud Lookups**: External cloud storage, Google Drive, and external QA portals DO NOT exist in competition runtime. NEVER invoke tools like `google_drive` or search external clouds for fixtures.
-   - The MCP Helper `mtm_minimal` ONLY handles contest communication; it DOES NOT provide fixture loaders or UI tools.
-   - **Narrative Phrasing Clarification**: Phrasing in task scenarios such as "Obtain official test data from QA test data store" or "internal standard" is purely narrative context. The fixture data structure is defined by the seed scripts in `challenge/` (e.g. `challenge/CR-01-seed.ts`).
-   - Create or load the required fixture file directly under `answers/<key>/evidence/<key>-test-data.json` matching the scenario requirements, run the seed script locally (`pnpm tsx prisma/seed-cr01.ts ...`), and proceed with verification.
-   - **NEVER REPORT BLOCKED**: Load, seed, or generate required test fixtures locally.
-3. **Locate Architecture**: Identify the correct module, router, or class to extend without creating duplicate or divergent code paths.
-4. **Implement**:
-   - Implement the required functionality adhering strictly to existing project conventions and relevant open standards.
-   - Handle data formatting, character encodings, edge cases, and internationalization as specified in the requirements.
-5. **Verify All Scenarios**:
-   - Run the task's check runners and test scripts provided with the challenge.
-   - Verify positive paths, edge cases (empty states, special characters), and negative paths (unauthorized access, boundary limits).
-   - **Baseline Test Isolation**: Pre-existing test failures in unrelated modules (e.g. recorded in `PROJECT_MAP.md`) MUST NOT block submission. Only verify zero regressions in the modified modules.
-6. **Submission Validation Gate (HARD RULES)**:
-   - **Scope of Gate**: The Zero `NOT_RUN`, Zero `FAIL` rule applies STRICTLY to the test cases defined in `submit.json` for the current backlog item. If all test cases for this item in `submit.json` pass and evidence files are captured, THE WORKER MUST SUBMIT.
-   - **Status MUST be `DONE`**: Submissions marked `PARTIAL`, `BLOCKED`, or `FAIL` score 0 and are blocked by the submission gate.
-   - **Zero `NOT_RUN`, Zero `FAIL` in submit.json**: Every test case declared in `submit.json` must evaluate to `PASS`. If any check fails, resolve it before submitting.
-   - **Physical Evidence Verification**: Verify that every evidence file declared in `evidenceFiles` and `testResults[].evidence` physically exists on disk under `answers/<key>/evidence/` and is committed in Git.
-   - **MANDATORY SUBMISSION**: Never leave a solved, committed task unsubmitted or marked BLOCKED. Call `submit_work` as soon as requirements are fulfilled.
-7. **Report**: Write `submit.json` and `worker_result.json` with status `READY_FOR_REVIEW`.
-
-## CR Execution Rules
-- **Non-blocking Operations**: When testing file exports or downloads, avoid indefinite waits for browser download events. Evaluate output data directly or write to the designated evidence path (`answers/<key>/evidence/<file>`).
-- **Timeouts**: All browser and network operations must include an explicit timeout (e.g. max 5000ms).
-- **Evidence Containment**: All generated files must be stored under `answers/<key>/evidence/` with relative paths.
+1. Extract input/output contracts, acceptance criteria, every announced MVS, and artifact requirements from the specification and returned template. Capture any requested before-change evidence now.
+2. Locate the existing implementation and extend its conventions. Handle required boundaries, permissions, encodings, and compatibility without unrelated refactoring.
+3. Use provided local fixtures/loaders and schemas. Verify positive, negative, boundary, and relevant regression behavior; save real command outputs and requested UI/export artifacts under `answers/<key>/evidence/`. Preserve specified screenshot conditions and file formats.
+4. Fill `answers/<key>/submit.json` exactly from the received template. Cover every required scenario; do not remove failing or unrun cases. Declare PASS only from actual verification. Unrelated demonstrated baseline failures do not block a solved item; new regressions do.
+5. Write schema-compliant `worker_result.json` and return immediately for root integration/submission. The root alone pushes and calls Submit. Report genuine missing inputs accurately; never invent official data or evidence.

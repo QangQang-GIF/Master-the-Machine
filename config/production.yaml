@@ -15,7 +15,9 @@ skills:
   verify_checksums: true
 runtime:
   default_timeout_seconds: 420
-  concurrency_limit: 1
+  concurrency_limit: 2
+  normal_workers: 1
+  urgent_reserved_workers: 1
   log_level: INFO
   trace_logging: true
   submission:

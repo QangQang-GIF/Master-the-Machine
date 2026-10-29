@@ -1,26 +1,12 @@
 ---
 name: mtm-evidence
-description: Procedural skill for capturing, formatting, and verifying audit evidence (logs, diffs, execution traces, test outputs).
+description: Capture and validate the actual screenshots, logs, reports, and exports required by an MTM item.
 ---
 
-# MTM Evidence Skill
+# Evidence
 
-Specialized skill for producing first-class audit evidence required by backlog tickets or tournament rules.
+Read the task, received template, and announced scenarios to inventory exact artifact names, formats, and capture conditions. Capture requested pre-change state before editing; never reconstruct it from a modified application.
 
-## Evidence Artifacts
+Save real artifacts under `matchRoot/answers/<key>/evidence/` (the worktree's matchRoot for workers). Record commands, exit codes, scenario IDs, and relevant context in logs. Screenshots must show the requested UI at the required viewport; exported data must come from the behavior under test. Use bounded waits and verify file completion. Never fabricate logs, images, or PASS results.
 
-1. **Dynamic Requirement Extraction**:
-   - Parse `challenge/<key>-minimum-verification-scenarios.md` and task descriptions dynamically to discover all required evidence files (screenshots, reports, test logs).
-   - If any baseline evidence is requested before changes are made, capture it immediately BEFORE modifying code.
-2. **Test Logs**:
-   - Save full output of passing verification commands to workspace artifact files under `answers/<key>/evidence/`.
-3. **Git Diff Evidence**:
-   - Capture clean diffs when required to verify only intended files were modified.
-4. **Trace Log**:
-   - Ensure execution traces are recorded and listed under `evidence_paths` when required.
-5. **Physical Existence Guarantee & Submission Gate**:
-   - Every path declared in `evidenceFiles` and `testResults[].evidence` MUST physically exist on disk under `answers/<key>/evidence/` and in the Git commit before submitting.
-   - The Submission Gate will reject submissions if any declared evidence file is missing.
-6. **Safe File Capture**:
-   - For downloaded files or data exports, write the exact content directly into `answers/<key>/evidence/<file>` without relying on browser download events.
-   - For screenshots, use explicit non-blocking capture with viewport set to at least 1280x720.
+Every reference in `evidenceFiles`, test results, and WorkerResult must resolve to a nonempty file within this item's directory; reject absolute paths, traversal, and escaping symlinks. Keep secrets out of evidence. Root verifies required coverage and committed contents at the exact revision being pushed/submitted, rather than merely checking working-tree existence.

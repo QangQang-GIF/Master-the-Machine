@@ -10,9 +10,9 @@ from pathlib import Path
 # ==============================================================================
 # 1. Model & Worker Execution Parameters (Fixed Codex Production Runtime)
 # ==============================================================================
-MODEL: str = "gpt-6.1-sol"
-MODEL_EFFORT: str = "medium"
-CONCURRENCY: int = 1
+MODEL: str = "gpt-6-luna"
+MODEL_EFFORT: str = "low"
+CONCURRENCY: int = 2
 DEFAULT_WORKER_BACKEND: str = "codex"
 STRICT_BACKEND: bool = True
 ALLOW_FALLBACK: bool = False

@@ -1,26 +1,12 @@
 ---
 name: mtm-verification
-description: Multi-level test runner, regression analysis, and Minimum Viable Solution (MVS) validation skill.
+description: Verify MTM acceptance criteria, complete MVS coverage, and regressions using real execution evidence.
 ---
 
-# MTM Verification Skill
+# Verification
 
-Specialized procedural skill for multi-level testing, test suite isolation, and MVS validation.
-
-## Principles
-
-1. **Focused Verification First**:
-   - Always verify the unit test directly testing the changed code before expanding scope.
-2. **Deterministic Status Gate (Strict Backlog Item Scope)**:
-   - Status `READY_FOR_REVIEW` requires 100% test pass rate for all executed tests covering the changed code and the current backlog item.
-   - **Strict Backlog Item Scope**: The 100% PASS requirement (Zero `NOT_RUN`, Zero `FAIL`) applies EXCLUSIVELY to the test cases declared in `answers/<key>/submit.json` for the current backlog item.
-   - **Baseline Test Isolation**: Pre-existing test failures outside the modified area (acknowledged in `PROJECT_MAP.md` during preparation, e.g. intentional baseline failures in `cascade.test.ts`) MUST NOT block task completion or submission. Never withhold submission because of pre-existing, unrelated repository test failures.
-   - If an item-specific test fails, status must remain `FAILED` while the worker fixes the issue.
-3. **Local Autonomy & Fixtures (No External Cloud Lookups)**:
-   - External cloud drives (Google Drive, Docs, external QA portals) DO NOT exist in the tournament runtime.
-   - Phrases like "obtain from QA test data store" or "official fixture" in task scenarios are narrative context.
-   - When seed loaders are provided in `challenge/` (`CR-01-seed.ts`, `BUG-02-seed.ts`), generate or load the fixture data locally according to the schema expected by the script and run it. Never report `BLOCKED` for missing external stores.
-4. **Mandatory Submission Trigger**:
-   - Once task verification scenarios pass and evidence files exist in `answers/<key>/evidence/`, the task is considered fully solved.
-   - The worker/orchestrator MUST commit the changes, push to the remote branch, and IMMEDIATELY call `submit_work`.
-   - NEVER leave a completed task unsubmitted. Never mark a solved task as BLOCKED.
+- Check the received template and every announced scenario ID against executed results. A shorter self-declared test list cannot replace required coverage. Run focused checks first, then relevant negative/boundary and regression checks; MVS is a minimum.
+- Save command, environment context needed to reproduce, stdout/stderr, and exit code. A tool timeout, missing runner, or unrun check is not PASS. Avoid relying on pipeline exit codes that conceal test failures.
+- Isolate worker test resources so concurrent runs cannot alter each other's fixtures or state. Use provided local loaders and task-permitted generated inputs; report unavailable mandatory inputs accurately.
+- Classify failures against the recorded baseline. Demonstrably unrelated pre-existing failures do not prevent submission of a verified item; regressions or failed required scenarios must be resolved and remain visible.
+- `READY_FOR_REVIEW` requires complete acceptance/MVS coverage, passing relevant checks, and real required artifacts. Report exact unresolved failures otherwise. Root integration must recheck affected behavior because independently passing patches can conflict; the root then pushes and submits promptly.

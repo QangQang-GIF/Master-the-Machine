@@ -1,14 +1,24 @@
 {
   "release_version": "1.0.0",
-  "frozen_at": "2026-10-22T22:45:00+07:00",
+  "frozen_at": "2026-10-29T08:09:19.732504+00:00",
   "active_skills": [
-    "mtm-init@1.0.0",
+    "game-preparation@1.0.0",
     "mtm-bug-worker@1.0.0",
     "mtm-cr-worker@1.0.0",
-    "mtm-task-worker@1.0.0",
+    "mtm-evidence@1.0.0",
+    "mtm-init@1.0.0",
     "mtm-pi-worker@1.0.0",
+    "mtm-task-worker@1.0.0",
     "mtm-verification@1.0.0",
-    "mtm-evidence@1.0.0"
+    "team-orchestrator@1.0.0",
+    "team-recovery@1.0.0"
   ],
-  "checksum_file": "releases/checksums.sha256"
+  "checksum_file": "releases/checksums.sha256",
+  "native_policy": {
+    "max_workers": 2,
+    "normal_workers": 1,
+    "urgent_reserved_workers": 1,
+    "model": "gpt-6-luna",
+    "effort": "low"
+  }
 }

@@ -110,7 +110,9 @@ def test_compiled_context_contains_real_skills(tmp_path):
     assert "Specialist Agent Profile" in context
     assert "Project Knowledge Index" in context
     assert "Selected MTM Skill Instructions" in context
-    assert "Minimal Surgical" in context
+    trusted_root = Path(__file__).resolve().parents[1]
+    for name in ("mtm-init", "mtm-bug-worker"):
+        assert (trusted_root / ".agents" / "skills" / name / "SKILL.md").read_text() in context
     with pytest.raises(ValueError):
         compile_task_context({"task_type": "BUG"}, ["../../secrets@1"])
 

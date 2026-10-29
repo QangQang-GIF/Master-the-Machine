@@ -247,6 +247,7 @@ class PreSubmissionGitGuard:
         checkout_root: Optional[Path | str] = None,
         require_remote: bool = True,
         raise_on_error: bool = False,
+        required_test_ids: Optional[List[str]] = None,
     ) -> ValidationResult:
         r_path = Path(repo_path or self.repo).resolve() if (repo_path or self.repo) else None
         if r_path is None or not (r_path / ".git").exists():
@@ -368,10 +369,29 @@ class PreSubmissionGitGuard:
                     return ValidationResult(valid=False, error_message=msg)
 
                 test_results = committed_answer.get("testResults")
+                required_ids = set(required_test_ids or [])
+                if required_ids and not isinstance(test_results, list):
+                    msg = f"Submission Gate: Missing required test results for task {backlog_item_key}: {sorted(required_ids)}"
+                    if raise_on_error:
+                        raise SubmissionGateError(msg)
+                    return ValidationResult(valid=False, error_message=msg)
+                seen_ids: set[str] = set()
                 if isinstance(test_results, list) and len(test_results) > 0:
                     for tr in test_results:
-                        if isinstance(tr, dict):
+                        if not isinstance(tr, dict):
+                            msg = f"Submission Gate: Malformed test result for task {backlog_item_key}"
+                            if raise_on_error:
+                                raise SubmissionGateError(msg)
+                            return ValidationResult(valid=False, error_message=msg)
+                        else:
                             tr_id = tr.get("id", "UNKNOWN")
+                            if "id" in tr and (not isinstance(tr_id, str) or not tr_id.strip() or tr_id in seen_ids):
+                                msg = f"Submission Gate: Invalid or duplicate test ID '{tr_id}' for task {backlog_item_key}"
+                                if raise_on_error:
+                                    raise SubmissionGateError(msg)
+                                return ValidationResult(valid=False, error_message=msg)
+                            if "id" in tr:
+                                seen_ids.add(tr_id)
                             tr_res = tr.get("result")
                             if tr_res != "PASS":
                                 msg = (
@@ -382,6 +402,12 @@ class PreSubmissionGitGuard:
                                 if raise_on_error:
                                     raise SubmissionGateError(msg)
                                 return ValidationResult(valid=False, error_message=msg)
+                missing_ids = required_ids - seen_ids
+                if missing_ids:
+                    msg = f"Submission Gate: Missing required test IDs for task {backlog_item_key}: {sorted(missing_ids)}"
+                    if raise_on_error:
+                        raise SubmissionGateError(msg)
+                    return ValidationResult(valid=False, error_message=msg)
 
         # 4. Relative Evidence Containment & Dynamic Requirement Extraction (GIT-02)
         if backlog_item_key:
@@ -420,13 +446,32 @@ class PreSubmissionGitGuard:
                 ])
 
             expected_scenario_ev: set[str] = set()
+            seen_scenarios: set[str] = set()
             for sc_file in scenario_candidates:
                 try:
-                    if sc_file.is_file():
-                        sc_text = sc_file.read_text(encoding="utf-8")
-                        expected_scenario_ev.update(extract_required_evidence(sc_text))
-                except Exception:
-                    pass
+                    relative_scenario = sc_file.resolve().relative_to(r_path).as_posix()
+                except (ValueError, OSError):
+                    continue
+                if relative_scenario in seen_scenarios:
+                    continue
+                seen_scenarios.add(relative_scenario)
+                scenario_ref = f"{full_sha}:{relative_scenario}"
+                committed_type = run_git(r_path, ["cat-file", "-t", scenario_ref])
+                if committed_type.returncode == 0:
+                    if committed_type.stdout.strip() != "blob":
+                        continue
+                    committed_scenario = run_git(r_path, ["show", scenario_ref])
+                    if committed_scenario.returncode == 0:
+                        expected_scenario_ev.update(extract_required_evidence(committed_scenario.stdout))
+                    continue
+                # Start Work may deliver public scenarios after the latest commit.
+                # A modified/deleted tracked scenario must never replace committed requirements.
+                tracked = run_git(r_path, ["ls-files", "--error-unmatch", "--", relative_scenario])
+                if tracked.returncode != 0 and sc_file.is_file():
+                    try:
+                        expected_scenario_ev.update(extract_required_evidence(sc_file.read_text(encoding="utf-8")))
+                    except (OSError, UnicodeError):
+                        pass
 
             if expected_scenario_ev:
                 declared_basenames = {Path(ev).name for ev in all_evidence}
@@ -486,8 +531,28 @@ class PreSubmissionGitGuard:
                         raise SubmissionGateError(msg)
                     return ValidationResult(valid=False, error_message=msg)
 
+                # Inspect the committed object, without decoding binary evidence or
+                # accepting a directory/symlink whose object merely exists.
+                evidence_ref = f"{full_sha}:{tree_ev_path}"
+                object_type = run_git(r_path, ["cat-file", "-t", evidence_ref])
+                object_size = run_git(r_path, ["cat-file", "-s", evidence_ref])
+                tree_entry = run_git(r_path, ["ls-tree", full_sha, "--", tree_ev_path])
+                mode = tree_entry.stdout.split(maxsplit=1)[0] if tree_entry.stdout.strip() else ""
+                if (
+                    object_type.returncode != 0
+                    or object_type.stdout.strip() != "blob"
+                    or object_size.returncode != 0
+                    or not object_size.stdout.strip().isdigit()
+                    or int(object_size.stdout.strip()) == 0
+                    or mode not in ("100644", "100755")
+                ):
+                    msg = f"Evidence file '{ev_str}' must be a nonempty regular file in commit {full_sha}"
+                    if raise_on_error:
+                        raise SubmissionGateError(msg)
+                    return ValidationResult(valid=False, error_message=msg)
+
                 local_ev_path = r_path / tree_ev_path
-                if not local_ev_path.is_file():
+                if not local_ev_path.is_file() or local_ev_path.is_symlink() or not local_ev_path.resolve().is_relative_to(r_path):
                     msg = f"Evidence file '{ev_str}' does not exist on disk at '{local_ev_path}'"
                     if raise_on_error:
                         raise SubmissionGateError(msg)

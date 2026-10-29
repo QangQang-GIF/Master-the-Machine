@@ -1,27 +1,26 @@
 default_profile: fast
 profiles:
   fast:
-    codex_model: gpt-6.1-sol
+    codex_model: gpt-6-luna
     codex_effort: low
     agy_model: gemini-3.8-flash-low
     agy_effort: low
     use_case: "narrow tasks, minor bug fixes, verification"
   standard:
-    codex_model: gpt-6.1-sol
-    codex_effort: medium
+    codex_model: gpt-6-luna
+    codex_effort: low
     agy_model: gemini-3.8-flash-high
     agy_effort: medium
     use_case: "standard CR and multi-file BUG tasks"
   deep_reasoning:
-    codex_model: gpt-6.1-sol
-    codex_effort: high
+    codex_model: gpt-6-luna
+    codex_effort: low
     agy_model: claude-sonnet-4-6
     agy_effort: high
     use_case: "complex production incidents (PI) and architectural investigations"
 allowlist:
   models:
-    - gpt-6.1-sol
-    - gpt-6.1-luna
+    - gpt-6-luna
     - gemini-3.8-flash-low
     - gemini-3.8-flash-high
     - claude-sonnet-4-6

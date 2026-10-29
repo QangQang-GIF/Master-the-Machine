@@ -368,6 +368,15 @@ class OfficialGameMasterAdapter(GameMasterAdapter):
                 with urllib.request.urlopen(req, timeout=self.timeout) as resp:
                     status_code = getattr(resp, "status", getattr(resp, "code", 200))
 
+                    # Scheduling anchors to an authenticated server response, never host wall time.
+                    if getattr(resp, "headers", None) and resp.headers.get("Date"):
+                        from email.utils import parsedate_to_datetime
+                        try:
+                            self.server_epoch = parsedate_to_datetime(resp.headers["Date"]).timestamp()
+                            self.server_clock_monotonic = time.monotonic()
+                        except (ValueError, TypeError, OverflowError):
+                            pass
+
                     # Parse and store cookies from response
                     if hasattr(resp, "headers") and resp.headers:
                         cookie_hdrs = []
