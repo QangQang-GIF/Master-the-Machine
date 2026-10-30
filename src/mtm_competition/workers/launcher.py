@@ -171,7 +171,12 @@ class WorkerLauncher:
         )
 
         trace_log = ws_path / "trace.jsonl"
-        if os.environ.get("MTM_NATIVE_AGENT_DISPATCH") == "1":
+        use_native_dispatch = (
+            os.environ.get("MTM_NATIVE_AGENT_DISPATCH") == "1"
+            or env_dict.get("use_native_subagents")
+            or env_dict.get("native_subagents")
+        )
+        if use_native_dispatch:
             from mtm_agents.dispatcher import NativeSubagentDispatcher
 
             dispatcher = NativeSubagentDispatcher(runtime=self.runtime)

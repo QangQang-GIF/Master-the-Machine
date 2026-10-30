@@ -1,12 +1,14 @@
 ---
 name: mtm-verification
-description: Verify MTM acceptance criteria, complete MVS coverage, and regressions using real execution evidence.
+description: Verify MTM acceptance criteria, MVS coverage, and regressions with real execution logs.
 ---
 
 # Verification
 
-- Check the received template and every announced scenario ID against executed results. A shorter self-declared test list cannot replace required coverage. Run focused checks first, then relevant negative/boundary and regression checks; MVS is a minimum.
-- Save command, environment context needed to reproduce, stdout/stderr, and exit code. A tool timeout, missing runner, or unrun check is not PASS. Avoid relying on pipeline exit codes that conceal test failures.
-- Isolate worker test resources so concurrent runs cannot alter each other's fixtures or state. Use provided local loaders and task-permitted generated inputs; report unavailable mandatory inputs accurately.
-- Classify failures against the recorded baseline. Demonstrably unrelated pre-existing failures do not prevent submission of a verified item; regressions or failed required scenarios must be resolved and remain visible.
-- `READY_FOR_REVIEW` requires complete acceptance/MVS coverage, passing relevant checks, and real required artifacts. Report exact unresolved failures otherwise. Root integration must recheck affected behavior because independently passing patches can conflict; the root then pushes and submits promptly.
+Follow `mtm-init` and `mtm-worker`.
+
+1. Execute reproduction check and every announced MVS scenario ID. MVS is mandatory.
+2. Record exact commands, stdout/stderr, and exit code 0 for PASS.
+3. Isolated test runs must never mutate shared fixtures.
+4. Distinguish baseline pre-existing failures from new regressions; all new regressions must be fixed.
+5. Report `READY_FOR_REVIEW` only when all executed checks pass and required artifacts exist on disk.

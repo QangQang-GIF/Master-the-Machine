@@ -10,6 +10,7 @@
     "mtm-pi-worker@1.0.0",
     "mtm-task-worker@1.0.0",
     "mtm-verification@1.0.0",
+    "mtm-worker@1.0.0",
     "team-orchestrator@1.0.0",
     "team-recovery@1.0.0"
   ],

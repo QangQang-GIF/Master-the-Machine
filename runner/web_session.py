@@ -6,6 +6,7 @@ kept in a small ring-like buffer and is never written to disk by this helper.
 from __future__ import annotations
 
 import os
+import shutil
 import signal
 import subprocess
 import threading
@@ -111,9 +112,14 @@ def run_web_session(runtime: ProjectRuntime, server_argv: list[str],
 
         signal.signal(signal.SIGTERM, stop_session)
     try:
+        server_cmd = list(map(str, server_argv))
+        if os.name == "nt" and server_cmd:
+            resolved = shutil.which(server_cmd[0])
+            if resolved:
+                server_cmd[0] = resolved
         proc = subprocess.Popen(
-            list(map(str, server_argv)), cwd=runtime.app_root,
-            env=runtime.env.copy(), shell=False, stdout=subprocess.PIPE,
+            server_cmd, cwd=runtime.app_root,
+            env=runtime.env.copy(), shell=(os.name == "nt"), stdout=subprocess.PIPE,
             stderr=subprocess.PIPE, text=True, errors="replace", bufsize=1,
             start_new_session=(os.name != "nt"),
             creationflags=(getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0) if os.name == "nt" else 0),

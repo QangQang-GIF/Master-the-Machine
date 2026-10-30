@@ -198,9 +198,13 @@ class TournamentScheduler:
 
         Returns task_id to preempt if policy triggers, else None.
         """
+        # If spare capacity exists (slot 2 reserved for urgent/PI), run concurrently without preemption!
+        if self.has_capacity:
+            return None
+
         for running_id, running_task in list(self.running_tasks.items()):
             elapsed = time.time() - float(running_task.get("start_time") or time.time())
-            if PreemptionPolicy.should_preempt(incoming_task, running_task, elapsed):
+            if PreemptionPolicy.should_preempt(incoming_task, running_task, elapsed, has_capacity=self.has_capacity):
                 return running_id
         return None
 

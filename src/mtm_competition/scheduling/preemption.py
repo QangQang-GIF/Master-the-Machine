@@ -12,7 +12,12 @@ class PreemptionPolicy:
         incoming_task: Dict[str, Any],
         running_task: Dict[str, Any],
         running_elapsed_seconds: float,
+        has_capacity: bool = False,
     ) -> bool:
+        # If spare capacity exists (e.g., slot 2 reserved for urgent/PI), run concurrently without preemption!
+        if has_capacity:
+            return False
+
         # Only PI (Production Incident) can preempt
         if incoming_task.get("task_type") != "PI":
             return False

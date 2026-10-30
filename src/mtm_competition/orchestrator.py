@@ -143,6 +143,7 @@ class CompetitionOrchestrator:
 
         self.cumulative_billable_tokens: int = self.store.get_total_billable_tokens()
         self.token_budget = token_budget
+        self._active_contexts: Dict[str, Dict[str, Any]] = {}
 
         from mtm_core.config.loader import get_environment_mode
         mode = get_environment_mode()
@@ -548,24 +549,24 @@ class CompetitionOrchestrator:
         except Exception:
             pass
 
-        task_data = self.scheduler.select_next_task()
-        if not task_data:
-            return None
+    def _is_task_urgent(self, task: Dict[str, Any]) -> bool:
+        """Evaluate if task has urgent priority (PI or tight deadline)."""
+        if task.get("task_type") == "PI":
+            return True
+        deadline = task.get("deadline_epoch")
+        if deadline:
+            remaining = deadline - self.scheduler.current_server_time
+            time_budget = float(task.get("time_budget_seconds") or 420)
+            if remaining <= (time_budget * 2.0):
+                return True
+        return False
 
+    def _launch_worker_task(self, task_data: Dict[str, Any]) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
+        """Prepare envelope, unlock MVS with Game Master, and asynchronously launch worker."""
         task_id = task_data["task_id"]
-        if self.supervisor.has_pending_cleanup(task_id) or self.scheduler.is_quarantined(task_id):
-            # Previous worker for this task is still alive: never start a new attempt on top of it.
-            return {"task_id": task_id, "status": "BLOCKED_PENDING_CLEANUP"}
-        self.scheduler.assign_task(task_id)
-
-        # Direct READY_TO_SUBMIT recovery path (do not re-run worker or start_working)
-        if task_data.get("status") == TaskState.READY_TO_SUBMIT.value:
-            return self._resume_ready_to_submit(task_data)
-
         t_stage_start = time.time()
         fencing_token = self.store.issue_fencing_token(task_id)
 
-        # 1. Signal Game Master and unlock MVS with transient vs permanent error classification & retry
         try:
             self._call_gm_with_retry(lambda: self.gm.start_working(task_id))
             mvs = self._call_gm_with_retry(lambda: self.gm.get_mvs(task_id))
@@ -583,7 +584,7 @@ class CompetitionOrchestrator:
                         TaskState.QUEUED.value,
                         {"error": str(e), "requeue_count": requeue_count},
                     )
-                    return {
+                    return None, {
                         "task_id": task_id,
                         "status": "TRANSIENT_RETRY_QUEUED",
                         "error": str(e),
@@ -594,7 +595,7 @@ class CompetitionOrchestrator:
             self.store.record_event(
                 task_id, "START_WORKING_FAILED", TaskState.RUNNING.value, TaskState.REJECTED.value, {"error": str(e)}
             )
-            return {"task_id": task_id, "status": "FAILED", "error": f"Failed to start working on Game Master: {e}"}
+            return None, {"task_id": task_id, "status": "FAILED", "error": f"Failed to start working on Game Master: {e}"}
 
         evidence_req = []
         if task_data.get("evidence_required_json"):
@@ -618,11 +619,10 @@ class CompetitionOrchestrator:
             backend=self.worker_backend,
         )
 
-        # 2. Token Budget Watchdog: block launch if hard budget reached, or downshift effort
         if self.cumulative_billable_tokens >= self.token_budget:
             self.store.invalidate_fencing_token(task_id, reason="budget_exceeded")
             self.scheduler.complete_task(task_id, TaskState.REJECTED)
-            return {
+            return None, {
                 "task_id": task_id,
                 "status": "BUDGET_EXCEEDED",
                 "error": f"Match token budget exceeded: {self.cumulative_billable_tokens} >= {self.token_budget}",
@@ -632,7 +632,6 @@ class CompetitionOrchestrator:
             envelope.reasoning_effort = "low"
             envelope.model = "gpt-6.1-sol" if self.worker_backend == "codex" else "gemini-3.8-flash-low"
 
-        # 3. Supervised worker launch with mid-execution preemption, PID tracking, and match pause awareness
         t_worker_start = time.time()
         attempt_num = self.store.get_attempt_count(task_id) + 1
         supervised_proc = self.supervisor.launch_async(
@@ -642,53 +641,28 @@ class CompetitionOrchestrator:
             on_pid_callback=lambda pid: self.store.set_active_pid(task_id, pid, fencing_token=fencing_token),
         )
 
-        while not self.supervisor.is_finished(task_id):
-            # Sync match state and clock
-            try:
-                match_state = self.gm.get_match_state()
-                self.scheduler.sync_with_game_master(match_state)
-            except Exception:
-                pass
+        ctx = {
+            "task_id": task_id,
+            "task_data": task_data,
+            "envelope": envelope,
+            "supervised_proc": supervised_proc,
+            "fencing_token": fencing_token,
+            "t_worker_start": t_worker_start,
+            "t_stage_start": t_stage_start,
+            "attempt_num": attempt_num,
+        }
+        return ctx, None
 
-            if self.scheduler.match_status == "FINISHED":
-                self.supervisor.cancel_worker(task_id)
-                self.store.invalidate_fencing_token(task_id, reason="match_finished")
-                self.scheduler.complete_task(task_id, TaskState.ABORTED)
-                return {"task_id": task_id, "status": "FINISHED"}
+    def _finalize_worker_result(self, ctx: Dict[str, Any]) -> Dict[str, Any]:
+        """Perform QA Gate, post-integration, git verification, and submission for a finished worker."""
+        task_id = ctx["task_id"]
+        envelope = ctx["envelope"]
+        supervised_proc = ctx["supervised_proc"]
+        fencing_token = ctx["fencing_token"]
+        t_worker_start = ctx["t_worker_start"]
+        t_stage_start = ctx["t_stage_start"]
+        attempt_num = ctx["attempt_num"]
 
-            if self.scheduler.is_paused:
-                self.supervisor.pause_all()
-                time.sleep(0.2)
-                continue
-            self.supervisor.resume_all()
-
-            # Poll backlog to detect if high-priority PI arrived that preempts us
-            self.sync_backlog()
-            if supervised_proc.status == "PREEMPTED":
-                still_unquiesced = self.supervisor.has_pending_cleanup(task_id) or not supervised_proc.quiesced
-                self.store.invalidate_fencing_token(
-                    task_id, reason="preempted", clear_pid=not still_unquiesced
-                )
-                return {"task_id": task_id, "status": "PREEMPTED"}
-
-            if self.supervisor.is_timed_out(task_id):
-                self.supervisor.timeout_worker(task_id)
-                still_unquiesced = self.supervisor.has_pending_cleanup(task_id) or not supervised_proc.quiesced
-                self.store.invalidate_fencing_token(
-                    task_id, reason="timed_out", clear_pid=not still_unquiesced
-                )
-                break
-
-            time.sleep(0.05)
-
-        if supervised_proc.status == "PREEMPTED":
-            still_unquiesced = self.supervisor.has_pending_cleanup(task_id) or not supervised_proc.quiesced
-            self.store.invalidate_fencing_token(
-                task_id, reason="preempted", clear_pid=not still_unquiesced
-            )
-            return {"task_id": task_id, "status": "PREEMPTED"}
-
-        # Retrieve result with status-aware handling
         supervised_proc = self.supervisor.get_process(task_id) or supervised_proc
         try:
             res = self.supervisor.get_result(task_id, timeout=5.0)
@@ -702,12 +676,10 @@ class CompetitionOrchestrator:
             self.store.set_active_pid(task_id, None, fencing_token=fencing_token)
 
         if res is None:
-            # Distinguish based on supervisor's tracked status
             terminal_status = supervised_proc.status
             self.supervisor.unregister_worker(task_id)
             has_pending = self.supervisor.has_pending_cleanup(task_id)
             if has_pending:
-                # Cancelled worker thread is still alive: quarantine (capacity held, no reuse of task/workspace)
                 self._quarantine_unquiesced(
                     task_id,
                     f"terminal_{terminal_status}",
@@ -741,7 +713,6 @@ class CompetitionOrchestrator:
                 )
                 return {"task_id": task_id, "status": "TIMED_OUT", "error": "Worker exceeded time budget"}
             elif terminal_status == "PREEMPTED":
-                # Ensure running_tasks is cleaned up if preemption occurred outside sync_backlog
                 if task_id in self.scheduler.running_tasks and not self.scheduler.is_quarantined(task_id):
                     self.scheduler.requeue_task(task_id)
                 return {"task_id": task_id, "status": "PREEMPTED"}
@@ -754,12 +725,9 @@ class CompetitionOrchestrator:
 
         worker_res, trace, ws_path = res
         self.supervisor.unregister_worker(task_id)
-
         worker_duration = round(time.time() - t_worker_start, 2)
-
         self.cumulative_billable_tokens += trace.billable_tokens
 
-        # Record attempt with unique attempt ID and fencing token
         att_num = getattr(supervised_proc, "attempt_number", attempt_num)
         unique_att_id = f"{task_id}_att{att_num}_{int(time.time() * 1000)}"
         self.store.record_attempt(
@@ -773,7 +741,6 @@ class CompetitionOrchestrator:
             fencing_token=fencing_token,
         )
 
-        # If worker itself reported TIMED_OUT, transition directly to TIMED_OUT without QA Gate rejection
         if worker_res.status == "TIMED_OUT":
             self.store.invalidate_fencing_token(task_id, reason="worker_timed_out")
             self.scheduler.complete_task(task_id, TaskState.TIMED_OUT)
@@ -786,7 +753,6 @@ class CompetitionOrchestrator:
             )
             return {"task_id": task_id, "status": "TIMED_OUT", "error": "Worker execution timed out"}
 
-        # Validate fencing token and transition RUNNING -> VERIFYING before QA Gate
         try:
             self.store.transition_state(
                 task_id,
@@ -798,7 +764,6 @@ class CompetitionOrchestrator:
             self.scheduler.requeue_task(task_id)
             return {"task_id": task_id, "status": "FENCED_OFF", "error": str(e)}
 
-        # 4. Deterministic QA Gate validation
         t_qa_start = time.time()
         try:
             validate_qa_gate(
@@ -816,7 +781,6 @@ class CompetitionOrchestrator:
             return {"task_id": task_id, "status": "REJECTED", "error": str(e)}
         qa_duration = round(time.time() - t_qa_start, 2)
 
-        # 5. If Ready for Review, integrate and submit
         if worker_res.status == "READY_FOR_REVIEW":
             t_integ_start = time.time()
             v_cmd = envelope.verification_cmd or envelope.metadata.get("verification_cmd")
@@ -838,7 +802,6 @@ class CompetitionOrchestrator:
                     "error": integ_res.error_message,
                 }
 
-            # Enforce remote push verification if remote exists and push is enabled
             remote_configured = self.git_guard.has_remote(self.integration_guard.remote_name)
             must_verify_pushed = self.integration_guard.push_to_remote and remote_configured
             if must_verify_pushed and not integ_res.pushed:
@@ -866,7 +829,6 @@ class CompetitionOrchestrator:
                 }
             integ_duration = round(time.time() - t_integ_start, 2)
 
-            # Persist verified checkpoint and transition VERIFYING -> READY_TO_SUBMIT under fencing token
             try:
                 self.store.save_verified_checkpoint(
                     task_id,
@@ -885,7 +847,6 @@ class CompetitionOrchestrator:
                 self.scheduler.requeue_task(task_id)
                 return {"task_id": task_id, "status": "FENCED_OFF", "error": str(e)}
 
-            # Re-check deadline immediately before submission (P1.2)
             current_server_now = self.scheduler.current_server_time
             if envelope.deadline_epoch and current_server_now > envelope.deadline_epoch:
                 self.store.invalidate_fencing_token(task_id, reason="deadline_expired")
@@ -896,7 +857,6 @@ class CompetitionOrchestrator:
                     "error": f"Task deadline expired before submission: {current_server_now} > {envelope.deadline_epoch}",
                 }
 
-            # Guarded Submission with Server Clock & Reconciliation
             t_submit_start = time.time()
             sub_res = self.submission_guard.execute_guarded_submission(
                 envelope=envelope,
@@ -908,7 +868,6 @@ class CompetitionOrchestrator:
             )
             submit_duration = round(time.time() - t_submit_start, 2)
 
-            # Check grading status if server returned ACCEPTED
             final_status = sub_res.status
             final_points = sub_res.points_awarded
             if sub_res.success and final_status not in ("PASSED", "FAILED") and hasattr(self.gm, "get_submission_status"):
@@ -921,7 +880,7 @@ class CompetitionOrchestrator:
                             raw_pts = grading.get("points") if grading.get("points") is not None else grading.get("score")
                             if g_status == "PASSED":
                                 final_points = int(raw_pts) if raw_pts is not None else (final_points or envelope.points)
-                            else:  # FAILED
+                            else:
                                 final_points = int(raw_pts) if raw_pts is not None else 0
                             self.store.update_submission_status(task_id, g_status, final_points, grading)
                 except Exception:
@@ -937,8 +896,6 @@ class CompetitionOrchestrator:
                 final_state = TaskState.REJECTED
 
             self.scheduler.complete_task(task_id, final_state)
-
-            # Record stage trace metrics
             self.store.record_event(
                 task_id,
                 "TASK_PIPELINE_STAGES",
@@ -953,20 +910,137 @@ class CompetitionOrchestrator:
                     "billable_tokens": trace.billable_tokens,
                 },
             )
-
             return {
                 "task_id": task_id,
                 "status": final_status,
                 "points": final_points,
                 "pushed": integ_res.pushed,
             }
-
         else:
             if worker_res.status == "BLOCKED":
                 self.scheduler.complete_task(task_id, TaskState.BLOCKED)
             else:
                 self.scheduler.complete_task(task_id, TaskState.REJECTED)
             return {"task_id": task_id, "status": worker_res.status}
+
+    def step(self) -> Optional[Dict[str, Any]]:
+        """Perform one discrete orchestration cycle with hybrid parallel dispatch."""
+        self._release_quiesced_workers()
+        if hasattr(self.gm, "get_submission_status"):
+            try:
+                self.store.reconcile_grading_lifecycle(self.gm.get_submission_status)
+            except Exception as e:
+                logger.debug("Grading reconciliation error: %s", e)
+
+        # 0. Sync match state before step
+        try:
+            match_state = self.gm.get_match_state()
+            self.scheduler.sync_with_game_master(match_state)
+            if self.scheduler.is_paused:
+                return {"status": "PAUSED"}
+            if self.scheduler.match_status == "FINISHED":
+                self.supervisor.terminate_all("CANCELLED")
+                return {"status": "FINISHED"}
+        except Exception:
+            pass
+
+        # 1. Check if any previously running worker has completed
+        for tid in list(self._active_contexts.keys()):
+            if self.supervisor.is_finished(tid):
+                ctx = self._active_contexts.pop(tid)
+                return self._finalize_worker_result(ctx)
+
+        # 2. If capacity is available, select and launch next task
+        if self.scheduler.has_capacity:
+            task_data = self.scheduler.select_next_task()
+            if task_data:
+                task_id = task_data["task_id"]
+                if self.supervisor.has_pending_cleanup(task_id) or self.scheduler.is_quarantined(task_id):
+                    return {"task_id": task_id, "status": "BLOCKED_PENDING_CLEANUP"}
+                self.scheduler.assign_task(task_id)
+
+                if task_data.get("status") == TaskState.READY_TO_SUBMIT.value:
+                    return self._resume_ready_to_submit(task_data)
+
+                ctx, err = self._launch_worker_task(task_data)
+                if err:
+                    return err
+                if ctx:
+                    self._active_contexts[task_id] = ctx
+
+        if not self._active_contexts:
+            return None
+
+        # 3. Supervised monitoring loop: wait for the earliest worker to complete
+        while self._active_contexts:
+            try:
+                match_state = self.gm.get_match_state()
+                self.scheduler.sync_with_game_master(match_state)
+            except Exception:
+                pass
+
+            if self.scheduler.match_status == "FINISHED":
+                self.supervisor.terminate_all("CANCELLED")
+                first_tid = next(iter(self._active_contexts.keys()), None)
+                for tid in list(self._active_contexts.keys()):
+                    self.store.invalidate_fencing_token(tid, reason="match_finished")
+                    self.scheduler.complete_task(tid, TaskState.ABORTED)
+                self._active_contexts.clear()
+                ret = {"status": "FINISHED"}
+                if first_tid:
+                    ret["task_id"] = first_tid
+                return ret
+
+            if self.scheduler.is_paused:
+                self.supervisor.pause_all()
+                time.sleep(0.2)
+                continue
+            self.supervisor.resume_all()
+
+            # Poll backlog & detect if an urgent PI task arrived
+            self.sync_backlog()
+
+            # Check if any active worker was preempted during backlog sync
+            for tid in list(self._active_contexts.keys()):
+                ctx = self._active_contexts[tid]
+                proc = ctx["supervised_proc"]
+                if proc.status == "PREEMPTED":
+                    self._active_contexts.pop(tid, None)
+                    still_unquiesced = self.supervisor.has_pending_cleanup(tid) or not proc.quiesced
+                    self.store.invalidate_fencing_token(tid, reason="preempted", clear_pid=not still_unquiesced)
+                    return {"task_id": tid, "status": "PREEMPTED"}
+
+            # Hybrid Parallel Fast-Track: If capacity is available, launch urgent task in parallel!
+            if self.scheduler.has_capacity:
+                urgent_task = self.scheduler.select_next_task()
+                if urgent_task and self._is_task_urgent(urgent_task):
+                    u_tid = urgent_task["task_id"]
+                    if not self.supervisor.has_pending_cleanup(u_tid) and not self.scheduler.is_quarantined(u_tid):
+                        logger.info("Fast-tracking urgent task %s in parallel slot", u_tid)
+                        self.scheduler.assign_task(u_tid, worker_id="worker-urgent")
+                        u_ctx, u_err = self._launch_worker_task(urgent_task)
+                        if u_ctx:
+                            self._active_contexts[u_tid] = u_ctx
+
+            # Check if any active worker finished or timed out
+            for tid in list(self._active_contexts.keys()):
+                ctx = self._active_contexts[tid]
+                proc = ctx["supervised_proc"]
+
+                if self.supervisor.is_timed_out(tid):
+                    self._active_contexts.pop(tid, None)
+                    self.supervisor.timeout_worker(tid)
+                    still_unquiesced = self.supervisor.has_pending_cleanup(tid) or not proc.quiesced
+                    self.store.invalidate_fencing_token(tid, reason="timed_out", clear_pid=not still_unquiesced)
+                    return self._finalize_worker_result(ctx)
+
+                if self.supervisor.is_finished(tid):
+                    self._active_contexts.pop(tid, None)
+                    return self._finalize_worker_result(ctx)
+
+            time.sleep(0.05)
+
+        return None
 
     def run_loop(
         self,

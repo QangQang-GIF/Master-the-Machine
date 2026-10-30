@@ -278,9 +278,41 @@ class OfficialGameMasterAdapter(GameMasterAdapter):
                     parsed.setdefault(k, v)
                 for k, v in match_obj.items():
                     parsed.setdefault(k, v)
+                _enrich_descriptions_from_html(parsed.get("backlogItems", []))
                 return parsed
             except Exception:
                 return None
+
+        def _resolve_flight_chunk(val: Any) -> Any:
+            if isinstance(val, str) and re.match(r"^\$([0-9a-fA-F]+)$", val):
+                chunk_id = val[1:]
+                m_chunk = re.search(r'(?:^|[\r\n])' + re.escape(chunk_id) + r':"((?:[^"\\]|\\.)*)"', resp_body)
+                if m_chunk:
+                    try:
+                        return json.loads(f'"{m_chunk.group(1)}"')
+                    except Exception:
+                        return m_chunk.group(1)
+            return val
+
+        def _enrich_descriptions_from_html(target_items: List[Dict[str, Any]]) -> None:
+            import html as py_html
+            for it in target_items:
+                if not isinstance(it, dict):
+                    continue
+                k = it.get("key") or it.get("backlogItemKey") or it.get("backlogId") or it.get("id")
+                desc = it.get("descriptionMd") or it.get("description") or ""
+                if not desc or (isinstance(desc, str) and (desc.startswith("$") or desc.strip() == "")):
+                    if k:
+                        m_desc = re.search(
+                            r'<span class="font-mono text-zinc-300">' + re.escape(str(k)) + r'</span>.*?'
+                            r'<h4[^>]*>Description</h4>\s*<pre[^>]*>(.*?)</pre>',
+                            resp_body,
+                            re.DOTALL
+                        )
+                        if m_desc:
+                            real_text = py_html.unescape(m_desc.group(1).strip())
+                            it["descriptionMd"] = real_text
+                            it["description"] = real_text
 
         if "initialProjection" in resp_body:
             try:
@@ -293,6 +325,12 @@ class OfficialGameMasterAdapter(GameMasterAdapter):
                     team_obj = proj_obj.get("team") or {}
                     repo_obj = proj_obj.get("repo") or proj_obj.get("repository") or {}
                     items = proj_obj.get("backlog") or proj_obj.get("backlogItems") or []
+                    if isinstance(items, list):
+                        for it in items:
+                            if isinstance(it, dict):
+                                for fld in ("descriptionMd", "description", "title", "name", "startInstruction"):
+                                    if fld in it:
+                                        it[fld] = _resolve_flight_chunk(it[fld])
                     parsed = {
                         "matchUuid": match_obj.get("id") or match_obj.get("matchUuid"),
                         "matchCode": match_obj.get("publicId") or match_obj.get("matchCode"),
@@ -309,9 +347,63 @@ class OfficialGameMasterAdapter(GameMasterAdapter):
                         parsed.setdefault(k, v)
                     for k, v in match_obj.items():
                         parsed.setdefault(k, v)
+                    _enrich_descriptions_from_html(parsed.get("backlogItems", []))
                     return parsed
             except Exception:
                 return None
+
+        # Fallback for Next.js 15 App Router HTML (Server Components / Flight)
+        m_uuid = re.search(r'/api/v1/matches/([0-9a-fA-F-]{36})/(?:backlogs/start|submissions)', resp_body)
+        if m_uuid:
+            match_uuid = m_uuid.group(1)
+            m_code = re.search(r'<dt[^>]*>Match ID</dt>\s*<dd[^>]*>([A-Za-z0-9_-]+)</dd>', resp_body)
+            match_code = m_code.group(1) if m_code else (self.match_code or "")
+            backlog_items = []
+            seen_keys = set()
+            for item_match in re.finditer(r'<span class="font-mono text-zinc-300">(BUG-\d+|TASK-\d+|CR-\d+|PI-\d+)</span>', resp_body):
+                key = item_match.group(1)
+                if key in seen_keys:
+                    continue
+                seen_keys.add(key)
+                chunk = resp_body[item_match.start():item_match.start() + 1500]
+                type_m = re.search(r'<span[^>]*>(Bug|Change Request|Task|Product Incident)</span>', chunk)
+                raw_type = type_m.group(1) if type_m else "BUG"
+                type_map = {"Bug": "BUG", "Change Request": "CR", "Task": "TASK", "Product Incident": "PI"}
+                b_type = type_map.get(raw_type, raw_type.upper())
+                pts_m = re.search(r'(\d+)<!-- --> pts', chunk)
+                max_pts = int(pts_m.group(1)) if pts_m else 100
+                desc_m = re.search(r'<h3[^>]*>([^<]+)</h3>', chunk)
+                title = desc_m.group(1).strip() if desc_m else key
+                deadline_m = re.search(r'(\d+):(\d+)', chunk)
+                deadline_sec = None
+                if deadline_m:
+                    mins = int(deadline_m.group(1))
+                    secs = int(deadline_m.group(2))
+                    deadline_sec = mins * 60 + secs
+                desc_p = re.search(r'<p[^>]*>([^<]+)</p>', chunk)
+                description_val = desc_p.group(1).strip() if desc_p else title
+                backlog_items.append({
+                    "key": key,
+                    "backlogItemKey": key,
+                    "title": title,
+                    "description": description_val,
+                    "descriptionMd": description_val,
+                    "type": b_type,
+                    "status": "OPEN",
+                    "maxScore": max_pts,
+                    "deadline_seconds": deadline_sec,
+                })
+            _enrich_descriptions_from_html(backlog_items)
+            return {
+                "matchUuid": match_uuid,
+                "id": match_uuid,
+                "matchCode": match_code,
+                "status": "IN_PROGRESS",
+                "backlogItems": backlog_items,
+                "team": {"teamId": self.team_id, "teamName": self.team_name},
+                "teamId": self.team_id,
+                "teamName": self.team_name,
+            }
         return None
 
     def _request(

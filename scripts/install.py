@@ -194,7 +194,7 @@ multi_agent_v2 = true
 
 [agents]
 enabled = true
-max_concurrent_threads_per_session = 2
+max_concurrent_threads_per_session = 4
 default_subagent_model = "gpt-6-luna"
 default_subagent_reasoning_effort = "low"
 
@@ -208,8 +208,8 @@ tool_timeout_sec = 120
 [mcp_servers.mtm_minimal.env]
 PYTHONPATH = "{src_posix}{sep}{target_posix}"
 MTM_NATIVE_COORDINATION = "1"
-MTM_NATIVE_MAX_WORKERS = "2"
-MTM_NATIVE_NORMAL_WORKERS = "1"
+MTM_NATIVE_MAX_WORKERS = "4"
+MTM_NATIVE_NORMAL_WORKERS = "3"
 MTM_ENV = "production"
 """
     (codex_dir / "config.toml").write_text(codex_toml, encoding="utf-8")

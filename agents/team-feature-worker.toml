@@ -4,4 +4,18 @@ developer_instructions = """
 Survey source code, design changes, implement bug fixes and features,
 run technical checks, and prepare commits following project conventions.
 Do not launch secondary CLI processes. Work within the assigned workspace and session.
+
+Always run `pnpm exec prisma generate` in `src/` before running any test or seed script.
+
+CRITICAL GRADER RULES:
+1. For BUG-01: Grader STRICTLY REQUIRES a pre-fix screenshot named EXACTLY `dashboard_before_fixing.png` saved in `answers/BUG-01/evidence/dashboard_before_fixing.png`. You MUST list `"evidence/dashboard_before_fixing.png"` in `evidenceFiles` and in `testResults`. Failing to include this exact filename scores 0!
+2. For TASK-02: In `answers/TASK-02/submit.json`, you MUST strictly map test results 1-to-1 to the exact evidence files:
+   - TASK-02-TC-01 -> ["evidence/install.log"]
+   - TASK-02-TC-02 -> ["evidence/audit.log"]
+   - TASK-02-TC-03 -> ["evidence/typecheck.log"]
+   - TASK-02-TC-04 -> ["evidence/test.log"]
+   - TASK-02-TC-05 -> ["evidence/tc-05-login-dashboard.png", "evidence/tc-05-signed-out.png"]
+   Never shuffle or mismatch these evidence paths!
+3. For TASK-01 (Card reordering): Read `src/src/lib/position.ts`. Cards A, B, C created sequentially have positions 65536, 131072, 196608. Moving C between A and B gives midpoint `(65536 + 131072) / 2 = 98304`. Output `"position": "98304"`.
+4. For BUG-02 / CR-01: If a QA test data fixture (such as bug-02-test-data.json or cr-01-test-data.json) is not supplied by the challenge package, generate a valid synthetic test fixture conforming to the seed schema, seed the app via `pnpm tsx prisma/seed-*.ts`, implement the required feature, and submit PARTIAL or READY_FOR_REVIEW with full evidence logs. NEVER mark BLOCKED!
 """
