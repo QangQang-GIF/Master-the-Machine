@@ -1245,11 +1245,52 @@ class MCPHelperServer:
             status_code = getattr(exc, "status_code", None)
             req_id = getattr(exc, "request_id", None)
             err_code = getattr(exc, "error_code", None) or getattr(exc, "code", None)
+            exc_str = str(exc).lower()
+            err_code_str = str(err_code or "").lower()
+
+            is_already_submitted = (status_code == 409 and ("already_submitted" in err_code_str or "already submitted" in exc_str))
+
+            # Terminal rejection: 409 [CLOSED / NOT ALLOWED / EXPIRED], 400, 404, 410, 422
+            is_terminal_rejection = (
+                (status_code == 409 and not is_already_submitted and any(k in exc_str for k in ("closed", "not allowed", "deadline", "expired")))
+                or (status_code in (400, 404, 410, 422))
+            )
+
+            if is_terminal_rejection and self.native:
+                try:
+                    # 1. Reconcile and free worker immediately, transitioning directly to CLOSED
+                    self.native.reconcile_worker(
+                        backlog_item_key,
+                        confirmed_stopped=True,
+                        reason=f"GM_TERMINAL_REJECTED_{status_code}: {exc}",
+                        requeue=False,
+                    )
+                except Exception as rec_err:
+                    sys.stderr.write(f"Warning: reconcile_worker failed: {rec_err}\n")
+
+                try:
+                    # 2. Release integration owner lock immediately
+                    self.native.end_integration(backlog_item_key, success=False)
+                except Exception:
+                    pass
+
+                # 3. Emit dashboard telemetry status as CLOSED
+                if self.telemetry:
+                    self.telemetry.emit_backlog_status(
+                        backlog_id=backlog_item_key,
+                        title=self._get_backlog_title(backlog_item_key),
+                        status="CLOSED",
+                        summary=f"Item closed/rejected by Game Master ({status_code}): {exc}",
+                    )
+            elif self.native and not is_already_submitted:
+                try:
+                    self.native.end_integration(backlog_item_key, success=False)
+                except Exception:
+                    pass
 
             # Distinguish deterministic 4xx rejection (excluding 429) from unknown outcome (timeouts, 5xx)
             if status_code is not None and 400 <= status_code < 500 and status_code != 429:
-                err_code_str = str(err_code or "")
-                if status_code == 409 and ("already_submitted" in err_code_str.lower() or "already submitted" in str(exc).lower()):
+                if is_already_submitted:
                     # R5: 409 ALREADY_SUBMITTED retains in-flight lock, requiring reconciliation against server records
                     self.journal.record_already_submitted(
                         match_uuid=self.match_uuid,

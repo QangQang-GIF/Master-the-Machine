@@ -156,6 +156,38 @@ class NativeTaskCoordinator:
         # Any task with a deadline, deadlineMinutes, or PI is urgent so it is never starved or blocked
         return task.get("type") == "PI" or deadline is not None or task.get("deadlineMinutes") is not None
 
+    def _calculate_task_difficulty(self, task: dict) -> float:
+        """Calculate estimated task difficulty based on task type, UI keywords, and MVS scenarios."""
+        task_type = str(task.get("type", "TASK")).upper()
+
+        # 1. Base difficulty by type
+        base_diff = {
+            "TASK": 1.0,
+            "BUG": 1.5,
+            "CR": 2.5,
+            "PI": 2.0,
+        }.get(task_type, 2.0)
+
+        # 2. UI penalty (browser/playwright/css/render tasks take significantly longer)
+        ui_penalty = 0.0
+        text_content = (str(task.get("title", "")) + " " +
+                        str(task.get("description", "")) + " " +
+                        str(task.get("descriptionMd", ""))).lower()
+        ui_keywords = ("screenshot", "layout", "sidebar", "responsive", "browser",
+                       "dom", "component", "table", "render", "css")
+        if any(k in text_content for k in ui_keywords):
+            ui_penalty = 1.0
+
+        # 3. Penalty for many verification scenarios (>= 5 MVS / test cases)
+        mvs_penalty = 0.0
+        mvs = task.get("minimumVerificationScenarios") or task.get("mvs") or []
+        if isinstance(mvs, list) and len(mvs) >= 5:
+            mvs_penalty = 0.5
+        elif isinstance(mvs, str) and mvs.count("TC-") >= 5:
+            mvs_penalty = 0.5
+
+        return max(0.5, base_diff + ui_penalty + mvs_penalty)
+
     def _plan(self, db) -> dict:
         planning_time = time.monotonic()
         status, now, remaining = self._clock(db)
@@ -170,8 +202,8 @@ class NativeTaskCoordinator:
         clock_ready = not stale and now is not None and remaining is not None
         owner = self._meta(db, "integration_owner")
         acquired_at = self._meta(db, "integration_acquired_at", 0)
-        if owner and acquired_at and (planning_time - float(acquired_at)) > 30:
-            # Auto-clear stalled integration owner so ready tasks can progress
+        if owner and acquired_at and (planning_time - float(acquired_at)) > 8:
+            # Auto-clear stalled integration owner so ready tasks can progress (universal 8s ceiling)
             db.execute("UPDATE tasks SET phase='READY_TO_INTEGRATE' WHERE key=? AND phase='INTEGRATING'", (owner,))
             self._set_meta(db, "integration_owner", None)
             self._set_meta(db, "integration_acquired_at", None)
@@ -180,19 +212,19 @@ class NativeTaskCoordinator:
                     "selected": [], "active": [public_row(r) for r in active], "readyToIntegrate": [],
                     "readyDiagnostics": [], "skippedReady": [], "integrationOwner": owner, "integrationBlocked": [],
                     "overdueWorkers": []}
-        # Emergency Deadline Flush: auto-promote active tasks with <= 210s remaining before deadline
+        # Emergency Deadline Flush: auto-promote active tasks with <= 120s remaining before deadline
         for row in list(active):
             task = json.loads(row["data"])
             deadline = task.get("deadline_epoch")
             slack = min(remaining, float(deadline) - now) if (clock_ready and deadline is not None) else None
-            if clock_ready and slack is not None and 0 < slack <= 210:
+            if clock_ready and slack is not None and 0 < slack <= 120:
                 key = row["key"]
                 wt = Path(row["worktree"]) / self.repository_folder
                 ans_file = wt / "answers" / key / "submit.json"
                 has_changes = False
                 try:
                     diff_res = subprocess.run(["git", "-C", str(wt), "status", "--porcelain"],
-                                              capture_output=True, text=True, check=False)
+                                              capture_output=True, text=True, timeout=5, check=False)
                     if diff_res.returncode == 0 and diff_res.stdout.strip():
                         has_changes = True
                 except Exception:
@@ -208,9 +240,9 @@ class NativeTaskCoordinator:
                     emergency_result = {
                         "task_id": key, "worker_id": row["worker_id"], "status": "PARTIAL",
                         "skill_ids": ["mtm-emergency-flush"], "changed_files": [f"answers/{key}/submit.json"],
-                        "test_results": [{"command": "emergency-deadline-flush", "passed": True, "exit_code": 0}],
+                        "test_results": [{"command": "emergency-deadline-cutoff", "passed": True, "exit_code": 0}],
                         "evidence_paths": [], "elapsed_seconds": 0,
-                        "note": f"Emergency deadline flush triggered with {int(slack)}s remaining"
+                        "note": f"Hard cutoff triggered at {int(slack)}s remaining before deadline"
                     }
                     db.execute("UPDATE tasks SET phase='READY_TO_INTEGRATE',result=? WHERE key=?",
                                (json.dumps(emergency_result), key))
@@ -269,10 +301,13 @@ class NativeTaskCoordinator:
             else:
                 record["reason"] = "Match/item not dispatchable or official clock unavailable/stale"
             response["readyDiagnostics"].append(record)
+        type_priority = {"PI": 0, "BUG": 1, "TASK": 2, "CR": 3}
         response["readyToIntegrate"].sort(key=lambda r: (
             0 if r["key"] == owner else 1,
             0 if r["type"] == "PI" else 1,
-            r["slackSeconds"] if r["deadlineEpoch"] is not None else float('inf'), r["key"]))
+            r["slackSeconds"] if r["deadlineEpoch"] is not None else float('inf'),
+            type_priority.get(r["type"], 2),
+            r["key"]))
         # Ready results may still be integrated/submitted inside the reserve window;
         # the reserve only forbids starting another worker.
         if not running or not clock_ready or remaining <= self.reserve:
@@ -298,19 +333,28 @@ class NativeTaskCoordinator:
             estimate = max(10, float(task.get("estimated_seconds", 420)))
             points = float(task.get("points", 0))
 
-            # Multi-level priority: Tier 0 (Emergency <= 300s), Tier 1 (PI), Tier 2 (Deadline EDF), Tier 3 (Points)
-            if deadline is not None and slack <= 300:
+            # Multi-level priority:
+            # Tier 0: Emergency deadline imminent (slack <= 180s)
+            # Tier 1: Product Incident (PI) - urgent incident resolution
+            # Tier 2: Deadline tasks (Earliest Deadline First)
+            # Tier 3: All remaining tasks (BUG ~ CR), ranked by ROI = Points / Difficulty
+            is_pi = (task.get("type") == "PI")
+            has_deadline = (deadline is not None or task.get("deadlineMinutes") is not None)
+
+            if deadline is not None and slack <= 180:
                 prio_tier = 0
                 prio_sub = slack
-            elif task.get("type") == "PI":
+            elif is_pi:
                 prio_tier = 1
-                prio_sub = slack
-            elif deadline is not None or task.get("deadlineMinutes") is not None:
+                prio_sub = slack if slack is not None else 0
+            elif has_deadline:
                 prio_tier = 2
-                prio_sub = slack
+                prio_sub = slack if slack is not None else 9999
             else:
                 prio_tier = 3
-                prio_sub = -points
+                difficulty = self._calculate_task_difficulty(task)
+                roi = points / difficulty
+                prio_sub = -roi
             candidates.append(((prio_tier, prio_sub, row["key"]), task, urgent, slack))
         candidates.sort(key=lambda r: r[0])
         for _, task, urgent, slack in candidates:
@@ -354,7 +398,7 @@ class NativeTaskCoordinator:
             eligible = next((t for t in plan["selected"] if t["key"] == key), None)
             if eligible is None:
                 # If capacity is available and task is officially active/started, permit direct claim
-                if plan["availableSlots"] > 0 and row["phase"] == "QUEUED" and row["started"]:
+                if plan.get("matchStatus") in ("RUNNING", "IN_PROGRESS", "STARTED") and plan["availableSlots"] > 0 and row["phase"] == "QUEUED" and row["started"]:
                     eligible = json.loads(row["data"])
                 else:
                     raise NativeCoordinationError("Task not eligible under current capacity/deadline policy")
@@ -387,7 +431,12 @@ class NativeTaskCoordinator:
                 raise
             task_type = eligible["type"]
             specification = details.get("files", {}).get(f"challenge/{key}.md")
-            budget = min(max(10, int(estimated_seconds)), int(eligible["slackSeconds"] - self.reserve))
+            status, now, remaining = self._clock(db)
+            deadline = eligible.get("deadline_epoch")
+            slack = eligible.get("slackSeconds")
+            if slack is None:
+                slack = min(remaining, float(deadline) - now if deadline is not None else remaining) if (now is not None and remaining is not None) else (remaining or 2400)
+            budget = min(max(10, int(estimated_seconds)), max(10, int(slack - self.reserve)))
             envelope = {"task_id": key, "task_type": task_type, "title": eligible.get("title", key),
                         "description": specification or eligible.get("description") or eligible.get("descriptionMd", ""), "repository_path": str(target),
                         "match_root": str(worker_match), "base_revision": base, "points": int(eligible.get("points", 0)),
@@ -495,15 +544,18 @@ class NativeTaskCoordinator:
             raise NativeCoordinationError("Confirmed stopped worker and reason are required")
         with self._db() as db:
             row = self._task(db, self._key(key))
-            if row["phase"] not in ("RUNNING", "NEEDS_ATTENTION"):
+            if row["phase"] not in ("RUNNING", "NEEDS_ATTENTION", "READY_TO_INTEGRATE", "INTEGRATING"):
                 raise NativeCoordinationError("Only active/failed workers can be reconciled")
             data = json.loads(row["data"])
             data["prior_attempts"] = [*data.get("prior_attempts", []),
                                      {"worktree": row["worktree"], "worker": row["worker_id"], "reason": reason}]
             data["attempt_number"] = int(data.get("attempt_number", 1)) + 1
-            phase = "QUEUED" if requeue else "NEEDS_ATTENTION"
+            phase = "QUEUED" if requeue else "CLOSED"
             db.execute("UPDATE tasks SET phase=?,data=?,worker_id=NULL,worktree=NULL WHERE key=?",
                        (phase, json.dumps(data), key))
+            if self._meta(db, "integration_owner") == key:
+                self._set_meta(db, "integration_owner", None)
+                self._set_meta(db, "integration_acquired_at", None)
             return {"key": key, "phase": phase}
 
     def record_worker_result(self, key: str, worker_result: dict[str, Any]) -> dict[str, Any]:
@@ -604,13 +656,9 @@ class NativeTaskCoordinator:
             now_m = time.monotonic()
             lock_duration = (now_m - float(acquired_at)) if acquired_at else 0
             if owner and owner != key:
-                is_timeout = lock_duration > 30
-                task_data = json.loads(row["data"])
-                deadline = task_data.get("deadline_epoch")
-                status_clk, now_clk, rem_clk = self._clock(db)
-                is_urgent = (rem_clk is not None and rem_clk <= 180) or (now_clk is not None and deadline is not None and float(deadline) - now_clk <= 180)
-                if is_timeout or (is_urgent and lock_duration > 10):
-                    # Force release previous stalled owner and grant lock to current task
+                is_timeout = lock_duration > 8
+                if is_timeout:
+                    # Force release previous stalled owner and grant lock to current task (universal 8s ceiling)
                     db.execute("UPDATE tasks SET phase='READY_TO_INTEGRATE' WHERE key=? AND phase='INTEGRATING'", (owner,))
                     owner = None
                 else:

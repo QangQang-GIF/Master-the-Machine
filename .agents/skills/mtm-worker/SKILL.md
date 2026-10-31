@@ -20,7 +20,11 @@ Follow `mtm-init` boundaries, TaskEnvelope constraints, and returned submit temp
 - **TASK**: Satisfy definition of done. Validate configuration or documentation changes with an executable validation command.
 - **PI (Urgent)**: Fastest path to verified fix. Score depends directly on elapsed time from reveal to PASS. Diagnose symptoms rapidly, patch minimally, avoid broad suites.
 
-### 3. Comprehensive Verification
+### 3. Comprehensive Verification & Score Protection (Logic First, UI Second)
+- **Mandatory Policy**:
+  1. Priority 1: Fix source logic and execute unit / regression tests (`pnpm test` / vitest) until `passed: true`.
+  2. Priority 2: UI Screenshots / Playwright checks. Only run after unit tests pass. Cap screenshot/browser operations to at most **60 seconds**.
+  3. If browser times out, dev server hangs, or task deadline is within 2 minutes: immediately STOP browser verification, synthesize placeholder evidence PNG under `answers/<key>/evidence/<filename>`, write `worker_result.json` with status `PARTIAL` (or `READY_FOR_REVIEW` if unit tests passed), and return. NEVER risk missing a deadline or delaying submission for UI screenshots!
 - Execute reproduction check, every announced MVS scenario ID, and regression checks.
 - Run project commands via: `python3 <runtime_path> --match-root <match_root> --match-id <match_id> --worker-id <worker_id> run -- <cmd>`
 - Record every check with exact `command`, `passed: true`, and zero exit code.
