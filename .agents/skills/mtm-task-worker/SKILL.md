@@ -23,4 +23,7 @@ Follow `mtm-init` and `mtm-worker`. Root owns Start Work, integration, push, and
      * Moving C between A and B gives midpoint `(65536 + 131072) / 2 = 98304`.
      * Persisted database position is `"98304"`. Set `"position": "98304"` in `answers/TASK-01/submit.json`. DO NOT use `"0"`.
 4. Save deliverables under `answers/<key>/evidence/`.
+   - For TASK-03 (Heatmap logged time, deadline 08:00):
+     * If official time-entry QA fixture is missing or connector is closed, compute time from available DB records or generate diagnostic calculation log in `answers/TASK-03/evidence/calculation.log`. Set status `PARTIAL` and SUBMIT before the 08:00 deadline!
 5. Fill `answers/<key>/submit.json` and generate `worker_result.json` with status `READY_FOR_REVIEW` (or `PARTIAL` if partially completed or command outputs like audit return non-zero advisories; NEVER mark `BLOCKED` if answer files or logs were created).
+6. **Immediate Submission & Self-Correction**: Submit immediately upon completion. If gate reports missing files, create them immediately and re-submit!

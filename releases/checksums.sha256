@@ -1,6 +1,6 @@
 95806f8566930510892c73668555cc53e6c36ed47537db076d90dea0dca3c9c0  .agents/skills/game-preparation/SKILL.md
 d427adbf60609fa2ac477288a47e16b3d099ccbc38915ab7ea2f03cdaa63a66b  .agents/skills/mtm-bug-worker/SKILL.md
-749f9d35e7725137db78850e160dccf33025a21db0ea8b977806f741fc4d849c  .agents/skills/mtm-cr-worker/SKILL.md
+bb2c4f396106e14dd95934bfadadbd90800f57f18fee4eb8ce37bdc032895170  .agents/skills/mtm-cr-worker/SKILL.md
 f1ef5e5d701cbaee4976f5c25f251441b1086e34ebab61dfbb71ff6638fce9e8  .agents/skills/mtm-evidence/SKILL.md
 4699b93c3c4621670e7f7df5a528cf00db19cff69d7cab629dbe19d87ee4cd03  .agents/skills/mtm-init/SKILL.md
 9af94d0c8ad4b7a3ea639b8af4697e0f91ecdd609d61ee2e479bd6c9b1874829  .agents/skills/mtm-init/references/competition-rules.md
@@ -9,10 +9,10 @@ f552e27e1966878d76fdc9bec03e0136532981c044f9d04197eca5b7f8e9186d  .agents/skills
 4d06f5b41134e54c5748a92479488ba6add41e3af0e3fba5fb97622483ff85e6  .agents/skills/mtm-init/references/worker-contract.md
 b2a89c4c97a33b1bf28fc48d2ee94dddf8124b2099325f54733270cdb16513a4  .agents/skills/mtm-init/tests/negative.md
 038ff1f7a826472017e5010e6e131e5cc78b0a11b8b0c93451ef7fa396864f69  .agents/skills/mtm-init/tests/positive.md
-a9c381d126258be46a8496c039733e8df5a82b31ebddab1027d2d082c919a726  .agents/skills/mtm-pi-worker/SKILL.md
-ff724eadd11ebba819afe7297bb7ec4df1a0f9ee21481678dbc027efd90dacdf  .agents/skills/mtm-task-worker/SKILL.md
+058111e22f14bee2b4d95bd19deac2cf9b44c6de32448b76795206d0a36f0397  .agents/skills/mtm-pi-worker/SKILL.md
+389af28ea614e99f9713e9123379f09a369341243beff64d05bfc293e7e8361d  .agents/skills/mtm-task-worker/SKILL.md
 9629a1b905b547c04a4fd99c0f0cc25713a1ef22023f991c9f155deb442fde25  .agents/skills/mtm-verification/SKILL.md
-2711b5935fc4d1a993f439683a9e299f68a61db0348dd0db689b3fb075bc49d9  .agents/skills/mtm-worker/SKILL.md
+58cef9af9159a71b0fac78f30ed4b85ab68f011e4a14a9d1c3aaf24044bd03a4  .agents/skills/mtm-worker/SKILL.md
 0c942fc03c484c8b91d130449d7df68dcdf217806e68da933791ce41a989a977  .agents/skills/team-orchestrator/SKILL.md
 fc205500f0bf7da267d5c395c30e0ea8c7efc0051d228ce7d9b73b66da9d16c5  .agents/skills/team-recovery/SKILL.md
 f52634d5c28d649d68dfd104d19fb34d4c4e9d217a39042ba0100b78aab9a46e  agents/team-business-analyst.toml
