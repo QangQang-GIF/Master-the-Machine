@@ -49,15 +49,29 @@ def _append_bounded(buffer: deque[str], size: list[int], chunk: str) -> None:
             size[0] -= excess
 
 
+def _kill_port_listeners(port: int) -> None:
+    if os.name != "nt" or not port:
+        return
+    try:
+        cmd = f'powershell -NoProfile -Command "Get-NetTCPConnection -LocalPort {port} -ErrorAction SilentlyContinue | ForEach-Object {{ Stop-Process -Id $_.OwningProcess -Force -ErrorAction SilentlyContinue }}"'
+        subprocess.run(cmd, shell=True, capture_output=True, timeout=5)
+    except Exception:
+        pass
+
+
 def _terminate_tree(proc: subprocess.Popen[str], grace: float = 2.0) -> None:
     if os.name == "nt":
-        if proc.poll() is None:
-            proc.terminate()
+        # On Windows, always kill entire process tree (/T /F) to prevent orphaned node.exe holding ports!
         try:
-            proc.wait(timeout=grace)
-        except subprocess.TimeoutExpired:
             subprocess.run(["taskkill", "/PID", str(proc.pid), "/T", "/F"],
                            capture_output=True, check=False, timeout=grace)
+        except Exception:
+            pass
+        if proc.poll() is None:
+            try:
+                proc.terminate()
+            except Exception:
+                pass
         return
     try:
         os.killpg(proc.pid, signal.SIGTERM)
@@ -111,6 +125,9 @@ def run_web_session(runtime: ProjectRuntime, server_argv: list[str],
             raise SystemExit(128 + signum)
 
         signal.signal(signal.SIGTERM, stop_session)
+    port = int(runtime.env.get("PORT", 0))
+    if port:
+        _kill_port_listeners(port)
     try:
         server_cmd = list(map(str, server_argv))
         if os.name == "nt" and server_cmd:
@@ -164,6 +181,16 @@ def run_web_session(runtime: ProjectRuntime, server_argv: list[str],
             readiness_error = f"server readiness timed out after {readiness_timeout:g}s"
 
         if not readiness_error:
+            # Pre-warm common Next.js routes so Playwright / checkers don't hit cold on-demand compilation timeouts
+            if port:
+                for prewarm_route in ["/dashboard", "/accounting", "/boards", "/login"]:
+                    try:
+                        prewarm_url = f"http://127.0.0.1:{port}{prewarm_route}"
+                        with urlopen(prewarm_url, timeout=10) as _:
+                            pass
+                    except Exception:
+                        pass
+
             remaining = timeout - (time.monotonic() - started)
             if remaining <= 0:
                 timed_out = True
@@ -173,6 +200,8 @@ def run_web_session(runtime: ProjectRuntime, server_argv: list[str],
     finally:
         try:
             _terminate_tree(proc)
+            if port:
+                _kill_port_listeners(port)
             for reader in readers:
                 reader.join(timeout=1)
         finally:
