@@ -26,9 +26,21 @@ import sys
 from pathlib import Path
 
 ROOT_DIR = Path(__file__).resolve().parent.parent
-MASTER_DIR = ROOT_DIR.parent
-THI_DIR = MASTER_DIR / "Thi"
-WORKSPACE_DIR = THI_DIR / "Workspace"
+
+def _find_workspace_dir() -> Path:
+    direct = Path("D:/Working/Master_the_Machine/Thi/Workspace").resolve()
+    if direct.is_dir():
+        return direct
+    cur = Path(__file__).resolve()
+    while cur.parent != cur:
+        if (cur / "Thi" / "Workspace").is_dir():
+            return (cur / "Thi" / "Workspace").resolve()
+        if cur.name == "Workspace" and (cur / "matches").is_dir():
+            return cur.resolve()
+        cur = cur.parent
+    return direct
+
+WORKSPACE_DIR = _find_workspace_dir()
 MATCHES_DIR = WORKSPACE_DIR / "matches"
 SDLC_PACK_DIR = WORKSPACE_DIR / "team-sdlc-pack"
 AGENTS_MD_PATH = WORKSPACE_DIR / "AGENTS.md"

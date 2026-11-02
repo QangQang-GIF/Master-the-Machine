@@ -45,9 +45,21 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 ROOT_DIR = Path(__file__).resolve().parent.parent
-MASTER_DIR = ROOT_DIR.parent
-THI_DIR = MASTER_DIR / "Thi"
-WORKSPACE_DIR = THI_DIR / "Workspace"
+
+def _find_workspace_dir() -> Path:
+    direct = Path("D:/Working/Master_the_Machine/Thi/Workspace").resolve()
+    if direct.is_dir():
+        return direct
+    cur = Path(__file__).resolve()
+    while cur.parent != cur:
+        if (cur / "Thi" / "Workspace").is_dir():
+            return (cur / "Thi" / "Workspace").resolve()
+        if cur.name == "Workspace" and (cur / "matches").is_dir():
+            return cur.resolve()
+        cur = cur.parent
+    return direct
+
+WORKSPACE_DIR = _find_workspace_dir()
 SDLC_PACK_DIR = WORKSPACE_DIR / "team-sdlc-pack"
 LOGS_DIR = SDLC_PACK_DIR / "logs"
 MATCHES_DIR = WORKSPACE_DIR / "matches"
@@ -423,7 +435,10 @@ def handle_initialize_action(data: Dict[str, Any]) -> Dict[str, Any]:
     CURRENT_MATCH.append_log("INITIALIZE", "STARTED", f"Initializing tournament workspace for {match_id}")
 
     # 1. Call create_btc_match to seed pristine match into Thi/Workspace/matches/<matchId>
-    from scripts.create_btc_match import create_btc_match
+    try:
+        from scripts.create_btc_match import create_btc_match
+    except ImportError:
+        from create_btc_match import create_btc_match
     try:
         create_btc_match(match_id=match_id, reset_existing=True)
         CURRENT_MATCH.append_log("WORKSPACE", "SEEDED", f"Seeded pristine Solova exam baseline to matches/{match_id}")
@@ -1113,11 +1128,12 @@ def render_dashboard_page(match_id: str) -> str:
 </html>"""
 
 
-def run_tournament_app(port: int = 54321) -> None:
+def run_tournament_app(port: int = 8000) -> None:
     server = ThreadingHTTPServer(("127.0.0.1", port), TournamentUIHandler)
     print("=" * 75)
     print(f"[*] MTM OFFICIAL COMPETITION WEB UI & DASHBOARD IS RUNNING")
-    print(f"[*] URL: http://127.0.0.1:{port}/init")
+    print(f"[*] Setup URL  : http://127.0.0.1:{port}/init")
+    print(f"[*] Match URL  : http://127.0.0.1:{port}/match/SOLOVA01")
     print(f"[*] Default Workspace : {DEFAULT_WORKSPACE}")
     print(f"[*] Codex CLI Path     : {DEFAULT_CODEX_CLI}")
     print("=" * 75)
@@ -1131,7 +1147,7 @@ def run_tournament_app(port: int = 54321) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="MTM Competition Portal & Live Dashboard")
-    parser.add_argument("--port", type=int, default=54321, help="Server port (default: 54321)")
+    parser.add_argument("--port", type=int, default=8000, help="Server port (default: 8000)")
     args = parser.parse_args()
     run_tournament_app(port=args.port)
 
