@@ -1,7 +1,7 @@
 95806f8566930510892c73668555cc53e6c36ed47537db076d90dea0dca3c9c0  .agents/skills/game-preparation/SKILL.md
-6fd2dc0440b2718f683e96680a24ae39b34cfd04001eb2eeb4fbb098d0e8d848  .agents/skills/mtm-bug-worker/SKILL.md
-55f1294636c15b828608dcb53a8e6abf536bd9eae8f8a404cb1a6134fbb38d1b  .agents/skills/mtm-cr-worker/SKILL.md
-f1ef5e5d701cbaee4976f5c25f251441b1086e34ebab61dfbb71ff6638fce9e8  .agents/skills/mtm-evidence/SKILL.md
+083ed0552084f99bac3be226edfd5c7ef2d9d4f8b8ca2df0568d95133f579462  .agents/skills/mtm-bug-worker/SKILL.md
+30e5befde26107f8b83483727ac94aede6092df0a69f4d19c2ab2928935834c6  .agents/skills/mtm-cr-worker/SKILL.md
+9cec54287abc151eafc5dd6067837c3b0096410b63aa5f3612017ee557422ff1  .agents/skills/mtm-evidence/SKILL.md
 4699b93c3c4621670e7f7df5a528cf00db19cff69d7cab629dbe19d87ee4cd03  .agents/skills/mtm-init/SKILL.md
 9af94d0c8ad4b7a3ea639b8af4697e0f91ecdd609d61ee2e479bd6c9b1874829  .agents/skills/mtm-init/references/competition-rules.md
 710509c5f1d48626b656660ef508c0786003cae9d54a18bbdeb59e37b1cc1ad5  .agents/skills/mtm-init/references/efficient-repo-reading.md
@@ -12,7 +12,7 @@ b2a89c4c97a33b1bf28fc48d2ee94dddf8124b2099325f54733270cdb16513a4  .agents/skills
 058111e22f14bee2b4d95bd19deac2cf9b44c6de32448b76795206d0a36f0397  .agents/skills/mtm-pi-worker/SKILL.md
 389af28ea614e99f9713e9123379f09a369341243beff64d05bfc293e7e8361d  .agents/skills/mtm-task-worker/SKILL.md
 9629a1b905b547c04a4fd99c0f0cc25713a1ef22023f991c9f155deb442fde25  .agents/skills/mtm-verification/SKILL.md
-3f17ed7e8194e9eb6e9c51538fbc2f38b65c4055b8d5529fd404f552f9dfaee8  .agents/skills/mtm-worker/SKILL.md
+b40e68d64021f1e698b897707a8273f4b31b324a96eac9c5ba1b80e00ebbcc55  .agents/skills/mtm-worker/SKILL.md
 51bb22dd0dacbcc86e9bd8cc52d06d301b96398c0637dca72e71b37bb37a2aed  .agents/skills/team-orchestrator/SKILL.md
 fc205500f0bf7da267d5c395c30e0ea8c7efc0051d228ce7d9b73b66da9d16c5  .agents/skills/team-recovery/SKILL.md
 f52634d5c28d649d68dfd104d19fb34d4c4e9d217a39042ba0100b78aab9a46e  agents/team-business-analyst.toml
@@ -45,4 +45,4 @@ e5565761c1c8ea1e18fd35a44943368505656cb18f0aaab805f47f28563ac15e  runner/web_ses
 fc205500f0bf7da267d5c395c30e0ea8c7efc0051d228ce7d9b73b66da9d16c5  skills/team-recovery/SKILL.md
 42984d2b196fef7a31218eb43da511701543eb1137de12cbbf7f6073f43ba6f4  src/mtm_competition/adapters/official_game_master.py
 4b38368cc006b7c6b0b02a90d0c80c4ef00969f3a36c23589ae9525e0ba1867f  src/mtm_competition/integration/git_guard.py
-31f022f316132645825aef14ead6d5e547cc604db98f1806b598bec5820981ae  src/mtm_competition/scheduling/native.py
+3d789a56f228cdbff7a5aa27845b8d02f903854496f1c679d69c375b5210e7c2  src/mtm_competition/scheduling/native.py
