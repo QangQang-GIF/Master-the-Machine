@@ -333,11 +333,11 @@ class NativeTaskCoordinator:
             estimate = max(10, float(task.get("estimated_seconds", 420)))
             points = float(task.get("points", 0))
 
-            # Multi-level priority:
+            # Multi-level priority (Strict Practical Architecture - Zero Score Discrimination):
             # Tier 0: Emergency deadline imminent (slack <= 180s)
-            # Tier 1: Product Incident (PI) - urgent incident resolution
-            # Tier 2: Deadline tasks (Earliest Deadline First)
-            # Tier 3: All remaining tasks (BUG ~ CR), ranked by ROI = Points / Difficulty
+            # Tier 1: Product Incident (PI) - urgent incident resolution (fast-track for 1st place badge)
+            # Tier 2: Deadline tasks (Earliest Deadline First - prioritized on worker completion)
+            # Tier 3: All remaining tasks (Equal Priority - First-Come First-Served, no ROI/points calculation)
             is_pi = (task.get("type") == "PI")
             has_deadline = (deadline is not None or task.get("deadlineMinutes") is not None)
 
@@ -352,9 +352,7 @@ class NativeTaskCoordinator:
                 prio_sub = slack if slack is not None else 9999
             else:
                 prio_tier = 3
-                difficulty = self._calculate_task_difficulty(task)
-                roi = points / difficulty
-                prio_sub = -roi
+                prio_sub = 0  # All general tasks are strictly equal; no score/ROI discrimination
             candidates.append(((prio_tier, prio_sub, row["key"]), task, urgent, slack))
         candidates.sort(key=lambda r: r[0])
         for _, task, urgent, slack in candidates:
