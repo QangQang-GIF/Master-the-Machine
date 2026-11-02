@@ -579,7 +579,9 @@ class NativeTaskCoordinator:
 
             worker_match = Path(row["worktree"]) / self.repository_folder
             has_changes_or_answers = bool(result.get("changed_files")) or (worker_match / "answers" / key / "submit.json").is_file()
-            is_integratable = result["status"] in ('READY_FOR_REVIEW', 'PARTIAL', 'DONE') or (result["status"] == "BLOCKED" and has_changes_or_answers)
+            if result["status"] in ("BLOCKED", "TIMED_OUT", "FAILED") and has_changes_or_answers:
+                result["status"] = "PARTIAL"
+            is_integratable = result["status"] in ('READY_FOR_REVIEW', 'PARTIAL', 'DONE')
 
             if not is_integratable:
                 db.execute("UPDATE tasks SET phase='NEEDS_ATTENTION',result=? WHERE key=?", (json.dumps(result), key))

@@ -86,9 +86,9 @@ class SubmissionGuard:
         if self.store.has_submitted(task_id) and not self.store.is_in_flight(task_id):
             raise SubmissionGateError(f"Task {task_id} has already been submitted! Once-only policy blocks re-submission.")
 
-        # 2. Worker result status must be READY_FOR_REVIEW
-        if worker_result.status != "READY_FOR_REVIEW":
-            raise SubmissionGateError(f"Cannot submit task {task_id}: status is '{worker_result.status}', expected READY_FOR_REVIEW")
+        # 2. Worker result status must be READY_FOR_REVIEW, PARTIAL, or DONE
+        if worker_result.status not in ("READY_FOR_REVIEW", "PARTIAL", "DONE"):
+            raise SubmissionGateError(f"Cannot submit task {task_id}: status is '{worker_result.status}', expected READY_FOR_REVIEW or PARTIAL")
 
         # 3. Verified revision must exist
         if not revision or not revision.commit_sha:

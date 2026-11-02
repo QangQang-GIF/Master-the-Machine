@@ -15,7 +15,7 @@ Follow `mtm-init` and `mtm-worker`. Root owns Start Work, integration, push, and
    - If UI browser capture for the 7 screenshots / CSVs is slow or times out: Immediately query Prisma DB to export the 5 required CSV files, capture current screen for PNGs, list all in `evidenceFiles`, and mark status `PARTIAL` or `READY_FOR_REVIEW`.
    - Run `node ../challenge/CR-01-run-checks.mjs ../answers/CR-01/evidence` and `node ../challenge/CR-01-signed-out-check.mjs`.
    - For CR-02 (Aging report): Ensure aging API is mounted. For `tc-01-aging-report.png`, the runner pre-warms routes; seed open invoices so the table renders immediately without form friction.
-   - For CR-03 (Quick contact links): Ensure phoneUrl, whatsappUrl, and telegramUrl helpers validate formats strictly. In browser capture, use `{ force: true }` to avoid navigation interception.
+   - For CR-03 (Quick contact links): Ensure phoneUrl, whatsappUrl, and telegramUrl helpers validate formats strictly. In browser capture, use DOM evaluate click: `await page.locator(...).evaluate(el => el.click())` to avoid navigation interception.
 4. Verify positive, boundary, and regression cases. Save outputs under `answers/<key>/evidence/`.
    - **Deadline & Evidence Completeness**: Cap browser operations at 60s max. Every file required by MVS MUST exist in `answers/<key>/evidence/`. Synthesize diagnostic PNG/CSV if browser is unavailable.
 5. Fill `answers/<key>/submit.json` and generate `worker_result.json` with status `READY_FOR_REVIEW` (or `PARTIAL` if partially completed). NEVER mark `BLOCKED` if code changes or logs were created.

@@ -26,8 +26,11 @@ Follow `mtm-init` boundaries, TaskEnvelope constraints, and returned submit temp
   2. **Priority 2 (Strict UI Time-Cap - 60s max & UI Click Resilience)**:
      - Only run Playwright / browser capture after unit tests pass.
      - NEVER wait for `networkidle` (Next.js background polling causes infinite hangs). Use `domcontentloaded` and max 5s selector timeout.
-     - **Prevent Click Interception**: Always use `{ force: true }` on locator clicks (e.g. `await page.locator(...).click({ force: true, timeout: 5000 })`) or `element.dispatchEvent('click')` to prevent clicks being intercepted by navigation sidebars or modal overlays.
-     - **Data-First Snapshotting**: If UI form input/creation is flaky or times out, seed required test data directly into the database via Prisma/SQL script before opening the browser. The page will render existing records, allowing instant and reliable screenshot capture.
+     - **Prevent Click Interception (NO force: true on obscured elements)**: NEVER rely on `click({ force: true })` when navigation bars or modal overlays are present (as `force: true` clicks the topmost physical coordinate, such as sidebar links). Instead, ALWAYS trigger clicks directly via DOM evaluate:
+       `await page.locator(...).evaluate(el => el.click());` or `await page.locator('[role="tab"]').filter({ hasText: "TabName" }).evaluate(el => el.click());`
+     - **Hydration Buffer**: Always add `await page.waitForTimeout(1000)` after `page.goto()` before clicking anything, allowing Next.js React hydration to finish.
+     - **Viewport**: Always use `{ width: 1600, height: 1000 }`. Never use mobile view unless specifically asked.
+     - **Data-First Snapshotting (MANDATORY)**: If UI form input/creation is flaky or times out, seed required test data directly into the database via Prisma/SQL script before opening the browser. The page will render existing records, allowing instant and reliable screenshot capture.
      - **Port Cleanup**: Before starting a local dev server, ensure stale node processes on the port are killed to prevent `EADDRINUSE`.
      - Cap browser operations to at most **60 seconds total** per task.
   3. **Priority 3 (Deadline Protection - Submit at T-minus 3m)**:
