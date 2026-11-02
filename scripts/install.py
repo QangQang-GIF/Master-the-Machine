@@ -43,6 +43,26 @@ def install_pack(source_dir: Path, workspace_dir: Path) -> None:
 
     print(f"Installing team pack from {source_dir} to {target_pack_dir}...")
 
+    # 0. Ensure PyYAML is available
+    try:
+        import yaml
+    except ImportError:
+        subprocess.run([sys.executable, "-m", "pip", "install", "pyyaml", "--no-binary", "pyyaml", "--config-settings=--without-libyaml"], capture_output=True)
+
+    # 0b. Self-healing PostgreSQL watchdog (stale PID cleanup)
+    for pg_data in [Path(r"D:\PostgreSQL\16\data"), Path(r"C:\Program Files\PostgreSQL\16\data")]:
+        pid_file = pg_data / "postmaster.pid"
+        if pid_file.exists():
+            try:
+                content = pid_file.read_text(encoding="utf-8").splitlines()
+                if content:
+                    pid = int(content[0].strip())
+                    chk = subprocess.run(["tasklist", "/FI", f"PID eq {pid}"], capture_output=True, text=True)
+                    if str(pid) not in chk.stdout:
+                        pid_file.unlink(missing_ok=True)
+            except Exception:
+                pass
+
     # 1. Copy key pack manifests to team-sdlc-pack and mirror to .mtm/
     (ws / ".mtm").mkdir(parents=True, exist_ok=True)
     files_to_copy = [
@@ -195,8 +215,8 @@ multi_agent_v2 = true
 [agents]
 enabled = true
 max_concurrent_threads_per_session = 4
-default_subagent_model = "gpt-6-luna"
-default_subagent_reasoning_effort = "low"
+default_subagent_model = "gpt-6-sol"
+default_subagent_reasoning_effort = "medium"
 
 [mcp_servers.mtm_minimal]
 command = "{python_exe}"

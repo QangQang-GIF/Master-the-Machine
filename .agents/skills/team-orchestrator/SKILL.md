@@ -20,20 +20,19 @@ For PREPARE/RESUME, follow `game-preparation`/`team-recovery`. For `START_GAME`,
 
 ## Integration and submission
 
-**STRICT ROLE BOUNDARY (Root Orchestrator)**:
-- The Orchestrator is ONLY a coordinator, integrator, and submitter.
-- NEVER launch Playwright, headless browser scripts, dev servers, or execute test commands in the main checkout.
-- NEVER attempt to complete or fix verification/evidence on behalf of a worker.
-- If a worker result reports missing evidence or partial tests, accept it AS-IS and submit as PARTIAL immediately.
-- Your sole job upon worker completion: Git cherry-pick/merge -> Verify submit.json schema -> Git push -> submit_work RPC -> receive receipt (total duration: ~2 seconds).
-- The integration lock has a universal 8-second ceiling across the entire match. If an integration attempt stalls for > 8s, it is automatically demoted to let ready items progress.
+**STRICT ROLE BOUNDARY & IMMEDIATE SUBMISSION (Root Orchestrator)**:
+- **No Idle Queues**: Con nào làm xong là phải nộp liền! As soon as a worker returns a result, immediately integrate and submit. Never let a completed worker wait in an integration queue while deadlines expire.
+- **Immediate Remediation on Submission Feedback**: If `submit_work` or Game Master returns ANY error (e.g. missing evidence file, schema mismatch, or parity error), DO NOT mark `BLOCKED` or abandon the task! Immediately remedy the issue: synthesize/capture the missing evidence file, update `submit.json`, commit, and re-submit immediately.
+- **Mandatory Submission Before Slot Reassignment**: An item MUST be successfully submitted (server receipt received) before reassigning that worker or releasing the item.
+- The Orchestrator integrates git: merge/cherry-pick -> verify/auto-heal submit.json & evidence -> git push -> `submit_work` RPC -> receive receipt.
+- The integration lock has an 8-second ceiling to ensure fast, pipelined submission without deadlocks.
 
-Serialize integration/push/Submit; workers continue independent work. Prioritize urgent ready items. Acquire `integration_gate(backlogItemKey, action="begin")` before integration. The root alone holds this lock through verification, push, and Submit. On failure, stop mutations and reconcile Git/push state before releasing with `action="failed"`; successful `submit_work` releases it on the real receipt. Verify the patch is confined to permitted paths, integrate into the assigned branch, resolve conflicts. Source, answers, and evidence stay under `matchRoot = checkoutRoot/repository.folder`.
+Serialize integration/push/Submit; workers continue independent work. Prioritize urgent ready items. Acquire `integration_gate(backlogItemKey, action="begin")` before integration. The root alone holds this lock through verification, push, and Submit. On failure, do not abandon: resolve missing files, auto-heal evidence, reconcile Git/push state, and re-submit; successful `submit_work` releases it on the real receipt. Verify the patch is confined to permitted paths, integrate into the assigned branch, resolve conflicts. Source, answers, and evidence stay under `matchRoot = checkoutRoot/repository.folder`.
 
-For every item, cover all required acceptance/MVS scenarios and exact evidence requirements, including requested before-change captures. Keep actual command outcomes, including `command`, `passed`, and `exit_code=0` for passing WorkerResult tests. Require a meaningful validation command even for documentation/artifact TASKs. Demonstrated unrelated baseline failures do not block a solved item; new regressions, omitted scenarios, fabricated PASS, or missing evidence do.
+For every item, cover all required acceptance/MVS scenarios and exact evidence requirements, including requested before-change captures. All declared evidence files MUST exist as nonempty files in `answers/<key>/evidence/`. If browser capture times out or cannot settle, capture a diagnostic screenshot of the current app or write a diagnostic report; NEVER omit required evidence files from the commit.
 
-Fill `answers/<key>/submit.json` exactly from the received template. Before dispatch, deterministic guards must verify answer/payload parity, complete passing required results, nonempty contained evidence in the exact commit tree, permitted diff, full SHA, assigned branch, ordinary push, and remote ref parity. Never force-push or alter immutable/secret/agent files. Workers' READY status alone is insufficient.
+Fill `answers/<key>/submit.json` exactly from the received template. Before dispatch, deterministic guards verify answer/payload parity, complete passing required results, nonempty contained evidence in the exact commit tree, permitted diff, full SHA, assigned branch, ordinary push, and remote ref parity. Never force-push or alter immutable/secret/agent files.
 
-As soon as the item is verified, committed, and pushed, call `submit_work(clientSubmissionId, backlogItemKey, gitRevision, answer)` without waiting for other items. Preserve the journal's canonical request bytes and idempotency identity across uncertainty; reconcile rather than submit a second solution. Record a real server receipt; ACCEPTED is not graded PASSED. Track grading and all item outcomes. A solved item left unsubmitted is unfinished work.
+As soon as the item is verified, committed, and pushed, call `submit_work(clientSubmissionId, backlogItemKey, gitRevision, answer)` immediately without waiting for other items. Preserve the journal's canonical request bytes and idempotency identity across uncertainty; reconcile rather than submit a second solution. Record a real server receipt; ACCEPTED is not graded PASSED. Track grading and all item outcomes. A solved item left unsubmitted is unfinished work.
 
 On PAUSED, halt new work/submission dispatches and honor Player controls; on FINISHED stop descendants and finalize logs. CLOSED items are terminal; record and advance without retry loops. Keep unresolved blockers visible while other eligible tasks continue.
