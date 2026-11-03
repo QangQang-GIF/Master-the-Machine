@@ -445,12 +445,14 @@ class NativeTaskCoordinator:
             if slack is None:
                 slack = min(remaining, float(deadline) - now if deadline is not None else remaining) if (now is not None and remaining is not None) else (remaining or 2400)
             budget = min(max(10, int(estimated_seconds)), max(10, int(slack - self.reserve)))
+            worker_model = os.environ.get("MTM_WORKER_MODEL", "gpt-6.1-sol" if os.environ.get("MTM_ENV") == "production" else "gpt-6-luna")
+            worker_effort = os.environ.get("MTM_WORKER_EFFORT", "medium" if os.environ.get("MTM_ENV") == "production" else "low")
             envelope = {"task_id": key, "task_type": task_type, "title": eligible.get("title", key),
                         "description": specification or eligible.get("description") or eligible.get("descriptionMd", ""), "repository_path": str(target),
                         "match_root": str(worker_match), "base_revision": base, "points": int(eligible.get("points", 0)),
                         "deadline_epoch": eligible.get("deadline_epoch"),
                         "selected_skills": ["mtm-init", f"mtm-{task_type.lower()}-worker", "mtm-verification", "mtm-evidence"],
-                        "time_budget_seconds": budget, "model": "gpt-6-luna", "reasoning_effort": "low", "backend": "codex",
+                        "time_budget_seconds": budget, "model": worker_model, "reasoning_effort": worker_effort, "backend": "codex",
                         "evidence_required": details.get("evidence_required", eligible.get("evidence_required", [])),
                         "mvs": self._mvs_list(details.get("minimumVerificationScenarios", details.get("mvs"))),
                         "submit_template": details.get("submitTemplate"), "allowed_paths": [str(worker_match)],
