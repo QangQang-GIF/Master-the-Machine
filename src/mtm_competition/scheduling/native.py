@@ -1,10 +1,10 @@
-import os
 """Persisted scheduling/leases for Codex's native subagents; never launches an AI CLI.
 
 The root calls Start Work, registers its response, claims a task, then delegates the
 returned envelope with the provider's spawn tool. Only the root integrates/submits.
 """
 from __future__ import annotations
+import os
 
 from contextlib import contextmanager
 import json
