@@ -17,7 +17,7 @@ def test_reconcile_worker_integrating_phase_to_closed(tmp_path):
     subprocess.run(["git", "-C", str(repo), "add", "."], check=True, capture_output=True)
     subprocess.run(["git", "-C", str(repo), "commit", "-m", "init"], check=True, capture_output=True)
 
-    c = NativeTaskCoordinator(tmp_path / "state", repo, repo / "source", "source", "MATCH")
+    c = NativeTaskCoordinator(tmp_path / "state", repo, repo / "source", "source", "MATCH", max_workers=4, normal_workers=3)
     c.register_projection({
         "status": "RUNNING",
         "server_epoch": 1000,
@@ -87,7 +87,7 @@ def test_mcp_server_submit_work_terminal_rejection_cleanup(tmp_path):
     server.player_session_id = "test-session"
     server.assigned_branch = "main"
 
-    c = NativeTaskCoordinator(tmp_path / "state", repo, repo / "source", "source", "MATCH")
+    c = NativeTaskCoordinator(tmp_path / "state", repo, repo / "source", "source", "MATCH", max_workers=4, normal_workers=3)
     c.register_projection({
         "status": "RUNNING",
         "server_epoch": 1000,

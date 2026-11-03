@@ -248,6 +248,7 @@ class PreSubmissionGitGuard:
         require_remote: bool = True,
         raise_on_error: bool = False,
         required_test_ids: Optional[List[str]] = None,
+        allow_partial: bool = False,
     ) -> ValidationResult:
         r_path = Path(repo_path or self.repo).resolve() if (repo_path or self.repo) else None
         if r_path is None or not (r_path / ".git").exists():
@@ -298,27 +299,6 @@ class PreSubmissionGitGuard:
                                 break
                     if matched_remote_sha:
                         break
-
-            if not matched_remote_sha:
-                # Resilient auto-push fallback before declaring failure
-                try:
-                    run_git(r_path, ["pull", "--rebase", remote_name, assigned_branch_ref])
-                    push_attempt = run_git(r_path, ["push", remote_name, assigned_branch_ref])
-                    if push_attempt.returncode == 0:
-                        for cand in candidates:
-                            ls_res = run_git(r_path, ["ls-remote", remote_name, cand])
-                            if ls_res.returncode == 0 and ls_res.stdout.strip():
-                                for line in ls_res.stdout.strip().splitlines():
-                                    parts = line.split()
-                                    if parts:
-                                        r_sha = parts[0].strip()
-                                        if r_sha.startswith(full_sha) or full_sha.startswith(r_sha):
-                                            matched_remote_sha = r_sha
-                                            break
-                                if matched_remote_sha:
-                                    break
-                except Exception:
-                    pass
 
             if not matched_remote_sha:
                 msg = f"Remote push verification failed: commit {full_sha} is not pushed to {remote_name} ref '{assigned_branch_ref}'"
@@ -377,17 +357,26 @@ class PreSubmissionGitGuard:
                         raise SubmissionGateError(msg)
                     return ValidationResult(valid=False, error_message=msg)
 
-            # 3a. Submission Gate Rule: Allow DONE and PARTIAL submissions (per Game Master schema)
+            # 3a. Submission Gate Hard Rule: Enforce pass status and test results
             if isinstance(committed_answer, dict):
                 overall_status = committed_answer.get("status")
-                if overall_status in ("NOT_STARTED", "NOT_RUN", "FAIL", "FAILED"):
-                    msg = (
-                        f"Submission Gate: Cannot submit task {backlog_item_key} with uninitialized status '{overall_status}'. "
-                        f"Status must be DONE, PARTIAL, or BLOCKED before submitting to Game Master."
-                    )
-                    if raise_on_error:
-                        raise SubmissionGateError(msg)
-                    return ValidationResult(valid=False, error_message=msg)
+                if overall_status is not None:
+                    if not allow_partial and overall_status in ("NOT_RUN", "FAIL", "FAILED", "PARTIAL", "BLOCKED"):
+                        msg = (
+                            f"Submission Gate Hard Rule: Cannot submit task {backlog_item_key} with non-passing status '{overall_status}'. "
+                            f"All requirements must be resolved (DONE) before submitting to Game Master."
+                        )
+                        if raise_on_error:
+                            raise SubmissionGateError(msg)
+                        return ValidationResult(valid=False, error_message=msg)
+                    elif allow_partial and overall_status in ("NOT_STARTED", "NOT_RUN", "FAIL", "FAILED"):
+                        msg = (
+                            f"Submission Gate: Cannot submit task {backlog_item_key} with uninitialized status '{overall_status}'. "
+                            f"Status must be DONE, PARTIAL, or BLOCKED before submitting to Game Master."
+                        )
+                        if raise_on_error:
+                            raise SubmissionGateError(msg)
+                        return ValidationResult(valid=False, error_message=msg)
 
                 test_results = committed_answer.get("testResults")
                 required_ids = set(required_test_ids or [])
@@ -413,16 +402,24 @@ class PreSubmissionGitGuard:
                                 return ValidationResult(valid=False, error_message=msg)
                             if "id" in tr:
                                 seen_ids.add(tr_id)
-                            # Allow individual tests to have FAIL or NOT_RUN when status is PARTIAL or BLOCKED,
-                            # or when baseline tests fail. Only require PASS if overall_status is explicitly DONE.
                             tr_res = tr.get("result")
-                            if overall_status == "DONE" and tr_res != "PASS":
-                                # For DONE status, suggest PARTIAL instead of hard blocking if some tests failed
+                            if not allow_partial and tr_res != "PASS":
+                                msg = (
+                                    f"Submission Gate Hard Rule: Test case '{tr_id}' has result '{tr_res}'. "
+                                    f"Every test case must evaluate to 'PASS' before submission! "
+                                    f"(Never submit NOT_RUN or FAIL to Game Master)."
+                                )
+                                if raise_on_error:
+                                    raise SubmissionGateError(msg)
+                                return ValidationResult(valid=False, error_message=msg)
+                            elif allow_partial and overall_status == "DONE" and tr_res != "PASS":
                                 committed_answer["status"] = "PARTIAL"
                 missing_ids = required_ids - seen_ids
-                if missing_ids and overall_status == "DONE":
-                    # If some required test IDs are missing, degrade to PARTIAL rather than blocking submission
-                    committed_answer["status"] = "PARTIAL"
+                if missing_ids:
+                    msg = f"Submission Gate: Missing required test results for task {backlog_item_key}: {sorted(missing_ids)}"
+                    if raise_on_error:
+                        raise SubmissionGateError(msg)
+                    return ValidationResult(valid=False, error_message=msg)
 
         # 4. Relative Evidence Containment & Dynamic Requirement Extraction (GIT-02)
         if backlog_item_key:
@@ -496,45 +493,11 @@ class PreSubmissionGitGuard:
                         missing_scenario_files.append(req_ev)
 
                 if missing_scenario_files:
-                    # Self-healing and Emergency Fallback:
-                    # If required evidence files are missing, automatically auto-generate valid diagnostic evidence
-                    # rather than throwing a blocking exception, ensuring we submit immediately and preserve code points!
-                    task_ev_dir = r_path / prefix / "answers" / backlog_item_key / "evidence"
-                    task_ev_dir.mkdir(parents=True, exist_ok=True)
-                    for req_ev in missing_scenario_files:
-                        target_file = task_ev_dir / req_ev
-                        if not target_file.is_file() or target_file.stat().st_size == 0:
-                            if req_ev.lower().endswith(".png"):
-                                # Write a valid 1x1 diagnostic PNG image
-                                minimal_png = (
-                                    b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01"
-                                    b"\x08\x06\x00\x00\x00\x1f\x15c4\x00\x00\x00\rIDATx\x9cc`\x00\x00\x00\x02"
-                                    b"\x00\x01H\xaf\xa4q\x00\x00\x00\x00IEND\xaeB`\x82"
-                                )
-                                target_file.write_bytes(minimal_png)
-                            elif req_ev.lower().endswith(".json"):
-                                target_file.write_text(json.dumps({
-                                    "status": "DIAGNOSTIC",
-                                    "backlogId": backlog_item_key,
-                                    "evidence": req_ev,
-                                    "note": "Diagnostic evidence auto-captured to fulfill submission requirements."
-                                }, indent=2), encoding="utf-8")
-                            elif req_ev.lower().endswith(".csv"):
-                                target_file.write_text("id,status,note\n1,DIAGNOSTIC,auto-captured\n", encoding="utf-8")
-                            else:
-                                target_file.write_text(f"Diagnostic record for {backlog_item_key}: {req_ev}\n", encoding="utf-8")
-
-                        # Auto-track the file in Git if not already tracked
-                        rel_target = target_file.relative_to(r_path).as_posix()
-                        run_git(r_path, ["add", "-f", rel_target])
-                        all_evidence.append(f"evidence/{req_ev}")
-                        declared_basenames.add(req_ev)
-
-                    # Auto-degrade status to PARTIAL if evidence was synthesized
-                    if isinstance(committed_answer, dict) and committed_answer.get("status") == "DONE":
-                        committed_answer["status"] = "PARTIAL"
-                    if isinstance(answer_payload, dict) and answer_payload.get("status") == "DONE":
-                        answer_payload["status"] = "PARTIAL"
+                    req_name = missing_scenario_files[0]
+                    msg = f"Missing required evidence file '{req_name}' for task {backlog_item_key}"
+                    if raise_on_error:
+                        raise SubmissionGateError(msg)
+                    return ValidationResult(valid=False, error_message=msg)
 
             for ev in all_evidence:
                 ev_str = str(ev)
@@ -574,17 +537,6 @@ class PreSubmissionGitGuard:
                     cat_ev = run_git(r_path, ["cat-file", "-e", f"{full_sha}:{fallback_ev_path}"])
                     if cat_ev.returncode == 0:
                         tree_ev_path = fallback_ev_path
-
-                if cat_ev.returncode != 0:
-                    # Auto-heal: If file exists locally on disk, stage and commit it
-                    local_f = r_path / tree_ev_path
-                    if local_f.is_file() and local_f.stat().st_size > 0:
-                        run_git(r_path, ["add", "-f", tree_ev_path])
-                        run_git(r_path, ["commit", "-m", f"Auto-commit evidence {tree_ev_path}"])
-                        new_head = run_git(r_path, ["rev-parse", "HEAD"])
-                        if new_head.returncode == 0:
-                            full_sha = new_head.stdout.strip()
-                            cat_ev = run_git(r_path, ["cat-file", "-e", f"{full_sha}:{tree_ev_path}"])
 
                 if cat_ev.returncode != 0:
                     if overall_status in ("PARTIAL", "BLOCKED"):

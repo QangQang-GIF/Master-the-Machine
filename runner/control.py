@@ -59,6 +59,37 @@ class ControlBridge:
 
 def main() -> None:
     bridge = ControlBridge()
+
+    # CLI subcommands support for worker scripts and operators
+    if len(sys.argv) > 1 and sys.argv[1] != "-":
+        subcmd = sys.argv[1]
+        try:
+            if subcmd == "company":
+                if len(sys.argv) < 3 or sys.argv[2] == "list":
+                    res = bridge.server.list_company_tools()
+                    print(json.dumps(res, indent=2))
+                    return
+                elif sys.argv[2] == "call":
+                    if len(sys.argv) < 4:
+                        print("Usage: python -m runner.control company call <tool_name> [json_args]", file=sys.stderr)
+                        sys.exit(1)
+                    tool_name = sys.argv[3]
+                    args = json.loads(sys.argv[4]) if len(sys.argv) > 4 else {}
+                    res = bridge.server.call_company_tool(tool_name, args)
+                    print(json.dumps(res, indent=2) if isinstance(res, (dict, list)) else str(res))
+                    return
+            elif subcmd == "fixture":
+                if len(sys.argv) < 3:
+                    print("Usage: python -m runner.control fixture <backlog_item_key>", file=sys.stderr)
+                    sys.exit(1)
+                item_key = sys.argv[2]
+                res = bridge.server.fetch_fixture(item_key)
+                print(json.dumps(res, indent=2))
+                return
+        except Exception as exc:
+            print(json.dumps({"error": str(exc)}), file=sys.stderr)
+            sys.exit(1)
+
     # Unified exec closes noninteractive stdin. Launch with tty=true; turn echo
     # off before accepting a credential-bearing descriptor on this private PTY.
     if sys.stdin.isatty() and sys.platform != "win32":

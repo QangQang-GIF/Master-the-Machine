@@ -182,7 +182,7 @@ class ProjectRuntime:
                 psql_cmd = shutil.which("psql") or "psql"
             result = subprocess.run(
                 [psql_cmd, "-w", "-h", host, "-p", str(port), "-U", user, "-d", "postgres", "-Atqc", "SELECT 1"],
-                cwd=self.match_root, env=os.environ.copy(), shell=(sys.platform == "win32"), capture_output=True,
+                cwd=self.match_root, env=os.environ.copy(), shell=False, capture_output=True,
                 text=True, timeout=3, check=False,
             )
             return result.returncode == 0 and result.stdout.strip() == "1"
@@ -219,13 +219,12 @@ class ProjectRuntime:
                 path_value = env.get("PATH", "")
                 if str(bin_dir) not in path_value.split(os.pathsep):
                     env["PATH"] = str(bin_dir) + (os.pathsep + path_value if path_value else "")
-            use_shell = sys.platform == "win32"
             cmd_args = list(args)
-            if use_shell and cmd_args:
+            if sys.platform == "win32" and cmd_args:
                 resolved = shutil.which(cmd_args[0])
                 if resolved:
                     cmd_args[0] = resolved
-            result = subprocess.run(cmd_args, cwd=workdir, env=env, shell=use_shell, capture_output=True,
+            result = subprocess.run(cmd_args, cwd=workdir, env=env, shell=False, capture_output=True,
                                     text=True, timeout=max(0.1, timeout), check=False)
             return CommandResult(tuple(self._redact(a) for a in args), str(workdir), result.returncode, self._redact(result.stdout), self._redact(result.stderr))
         except subprocess.TimeoutExpired as exc:
@@ -274,10 +273,6 @@ class ProjectRuntime:
 
     def _package_cmd(self, *args: str) -> list[str]:
         mgr = self._package_manager()
-        if sys.platform == "win32":
-            resolved = shutil.which(mgr)
-            if resolved:
-                mgr = resolved
         return [mgr, *args]
 
     def build_command(self) -> list[str] | None:

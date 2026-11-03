@@ -251,6 +251,37 @@ class OfficialGameMasterAdapter(GameMasterAdapter):
 
     def _extract_nextjs_projection(self, resp_body: str) -> Optional[Dict[str, Any]]:
         """Extract embedded Next.js page state from spectator HTML (<script id="__NEXT_DATA__"> or initialProjection)."""
+        def _resolve_flight_chunk(val: Any) -> Any:
+            if isinstance(val, str) and re.match(r"^\$([0-9a-fA-F]+)$", val):
+                chunk_id = val[1:]
+                m_chunk = re.search(r'(?:^|[\r\n])' + re.escape(chunk_id) + r':"((?:[^"\\]|\\.)*)"', resp_body)
+                if m_chunk:
+                    try:
+                        return json.loads(f'"{m_chunk.group(1)}"')
+                    except Exception:
+                        return m_chunk.group(1)
+            return val
+
+        def _enrich_descriptions_from_html(target_items: List[Dict[str, Any]]) -> None:
+            import html as py_html
+            for it in target_items:
+                if not isinstance(it, dict):
+                    continue
+                k = it.get("key") or it.get("backlogItemKey") or it.get("backlogId") or it.get("id")
+                desc = it.get("descriptionMd") or it.get("description") or ""
+                if not desc or (isinstance(desc, str) and (desc.startswith("$") or desc.strip() == "")):
+                    if k:
+                        m_desc = re.search(
+                            r'<span class="font-mono text-zinc-300">' + re.escape(str(k)) + r'</span>.*?'
+                            r'<h4[^>]*>Description</h4>\s*<pre[^>]*>(.*?)</pre>',
+                            resp_body,
+                            re.DOTALL
+                        )
+                        if m_desc:
+                            real_text = py_html.unescape(m_desc.group(1).strip())
+                            it["descriptionMd"] = real_text
+                            it["description"] = real_text
+
         m = re.search(r'<script\s+id="__NEXT_DATA__"[^>]*>(.*?)</script>', resp_body, re.DOTALL)
         if m:
             try:
@@ -282,37 +313,6 @@ class OfficialGameMasterAdapter(GameMasterAdapter):
                 return parsed
             except Exception:
                 return None
-
-        def _resolve_flight_chunk(val: Any) -> Any:
-            if isinstance(val, str) and re.match(r"^\$([0-9a-fA-F]+)$", val):
-                chunk_id = val[1:]
-                m_chunk = re.search(r'(?:^|[\r\n])' + re.escape(chunk_id) + r':"((?:[^"\\]|\\.)*)"', resp_body)
-                if m_chunk:
-                    try:
-                        return json.loads(f'"{m_chunk.group(1)}"')
-                    except Exception:
-                        return m_chunk.group(1)
-            return val
-
-        def _enrich_descriptions_from_html(target_items: List[Dict[str, Any]]) -> None:
-            import html as py_html
-            for it in target_items:
-                if not isinstance(it, dict):
-                    continue
-                k = it.get("key") or it.get("backlogItemKey") or it.get("backlogId") or it.get("id")
-                desc = it.get("descriptionMd") or it.get("description") or ""
-                if not desc or (isinstance(desc, str) and (desc.startswith("$") or desc.strip() == "")):
-                    if k:
-                        m_desc = re.search(
-                            r'<span class="font-mono text-zinc-300">' + re.escape(str(k)) + r'</span>.*?'
-                            r'<h4[^>]*>Description</h4>\s*<pre[^>]*>(.*?)</pre>',
-                            resp_body,
-                            re.DOTALL
-                        )
-                        if m_desc:
-                            real_text = py_html.unescape(m_desc.group(1).strip())
-                            it["descriptionMd"] = real_text
-                            it["description"] = real_text
 
         if "initialProjection" in resp_body:
             try:

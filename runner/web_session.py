@@ -53,8 +53,8 @@ def _kill_port_listeners(port: int) -> None:
     if os.name != "nt" or not port:
         return
     try:
-        cmd = f'powershell -NoProfile -Command "Get-NetTCPConnection -LocalPort {port} -ErrorAction SilentlyContinue | ForEach-Object {{ Stop-Process -Id $_.OwningProcess -Force -ErrorAction SilentlyContinue }}"'
-        subprocess.run(cmd, shell=True, capture_output=True, timeout=5)
+        ps_cmd = f"Get-NetTCPConnection -LocalPort {port} -ErrorAction SilentlyContinue | ForEach-Object {{ Stop-Process -Id $_.OwningProcess -Force -ErrorAction SilentlyContinue }}"
+        subprocess.run(["powershell", "-NoProfile", "-Command", ps_cmd], shell=False, capture_output=True, timeout=5)
     except Exception:
         pass
 
@@ -136,7 +136,7 @@ def run_web_session(runtime: ProjectRuntime, server_argv: list[str],
                 server_cmd[0] = resolved
         proc = subprocess.Popen(
             server_cmd, cwd=runtime.app_root,
-            env=runtime.env.copy(), shell=(os.name == "nt"), stdout=subprocess.PIPE,
+            env=runtime.env.copy(), shell=False, stdout=subprocess.PIPE,
             stderr=subprocess.PIPE, text=True, errors="replace", bufsize=1,
             start_new_session=(os.name != "nt"),
             creationflags=(getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0) if os.name == "nt" else 0),

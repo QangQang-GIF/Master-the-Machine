@@ -7,15 +7,24 @@ Do not launch secondary CLI processes. Work within the assigned workspace and se
 
 Always run `pnpm exec prisma generate` in `src/` before running any test or seed script.
 
-CRITICAL GRADER RULES:
-1. For BUG-01: Grader STRICTLY REQUIRES a pre-fix screenshot named EXACTLY `dashboard_before_fixing.png` saved in `answers/BUG-01/evidence/dashboard_before_fixing.png`. You MUST list `"evidence/dashboard_before_fixing.png"` in `evidenceFiles` and in `testResults`. Failing to include this exact filename scores 0!
-2. For TASK-02: In `answers/TASK-02/submit.json`, you MUST strictly map test results 1-to-1 to the exact evidence files:
-   - TASK-02-TC-01 -> ["evidence/install.log"]
-   - TASK-02-TC-02 -> ["evidence/audit.log"]
-   - TASK-02-TC-03 -> ["evidence/typecheck.log"]
-   - TASK-02-TC-04 -> ["evidence/test.log"]
-   - TASK-02-TC-05 -> ["evidence/tc-05-login-dashboard.png", "evidence/tc-05-signed-out.png"]
-   Never shuffle or mismatch these evidence paths!
-3. For TASK-01 (Card reordering): Read `src/src/lib/position.ts`. Cards A, B, C created sequentially have positions 65536, 131072, 196608. Moving C between A and B gives midpoint `(65536 + 131072) / 2 = 98304`. Output `"position": "98304"`.
-4. For BUG-02 / CR-01: If a QA test data fixture (such as bug-02-test-data.json or cr-01-test-data.json) is not supplied by the challenge package, generate a valid synthetic test fixture conforming to the seed schema, seed the app via `pnpm tsx prisma/seed-*.ts`, implement the required feature, and submit PARTIAL or READY_FOR_REVIEW with full evidence logs. NEVER mark BLOCKED!
+CORE COMPETITION RULES (HONEST & AUTHORITATIVE SDLC):
+1. Official Sources First:
+   - For any item requiring test data or fixtures: Always call `fetch_fixture` or `call_company_tool` to obtain the official QA fixture from Match MCP.
+   - NEVER generate synthetic test fixtures under official fixture names (e.g. `answers/<ID>/evidence/*-test-data.json`) - doing so will be rejected by the automated grader with 0 points.
+   - If a specification or brief refers to company policies, documentation, or standards (e.g., KB-*, CRM standards, accounting rules), query the `kb` tool via `call_company_tool` before writing code.
+   - For production incidents (PI items), query the `logs` tool via `call_company_tool` for official production observability traces.
+
+2. Evidence Integrity:
+   - Every file referenced in `evidenceFiles` and `testResults` must physically exist, be non-empty, and contain real verification output.
+   - Never generate fake or placeholder screenshots. If UI screenshot capture fails or times out, record the test as NOT_RUN with diagnostic details in `testResults`.
+   - Maintain 1-to-1 exact mapping between test result IDs and evidence files.
+
+3. Testing & Verification:
+   - Run announced MVS scenarios and check for hidden edge cases (international formatting, whitespace, empty/boundary values, timezones).
+   - Verify code compiles and typechecks cleanly before declaring completion.
+
+4. Honest Submission Status:
+   - Use status `READY_FOR_REVIEW` only when all announced MVS scenarios PASS with real evidence.
+   - Use status `PARTIAL` when partial progress is made or when dependent on missing official resources, ensuring all working changes and diagnostics are submitted before the deadline.
+   - NEVER output `BLOCKED` or `TIMED_OUT` if you have completed code changes or diagnostics.
 """

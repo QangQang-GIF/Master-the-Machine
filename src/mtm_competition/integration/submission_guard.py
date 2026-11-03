@@ -1,7 +1,9 @@
 """SubmissionGuard: Deterministic once-only submission gating and integrity checks."""
 from __future__ import annotations
 
+import hashlib
 import json
+import re
 import time
 import uuid
 from dataclasses import dataclass
@@ -93,20 +95,38 @@ class SubmissionGuard:
         # 3. Verified revision must exist
         if not revision or not revision.commit_sha:
             raise SubmissionGateError(f"Cannot submit task {task_id}: missing verified Git revision")
+        sha = revision.commit_sha.strip()
+        if len(sha) == 40 and not re.fullmatch(r"[0-9a-fA-F]{40}", sha):
+            raise SubmissionGateError(f"Cannot submit task {task_id}: invalid 40-character git commit SHA '{sha}'")
 
         # 4. Deadline check using server/calibrated time
         if envelope.deadline_epoch and now > envelope.deadline_epoch:
             raise SubmissionGateError(f"Cannot submit task {task_id}: deadline expired at {envelope.deadline_epoch} (current time {now})")
+
+        is_near_deadline = bool(envelope.deadline_epoch and (envelope.deadline_epoch - now <= 120))
+        effective_ans_status = (answer_payload.get("status") if isinstance(answer_payload, dict) else None) or worker_result.status
 
         # 5. Required evidence presence check
         for req_ev in envelope.evidence_required:
             if req_ev not in worker_result.evidence_paths:
                 raise SubmissionGateError(f"Cannot submit task {task_id}: missing required evidence '{req_ev}'")
 
-        # 6. Test results must not have any failures
-        for tr in worker_result.test_results:
-            if not tr.get("passed"):
-                raise SubmissionGateError(f"Cannot submit task {task_id}: test failed: {tr.get('command')}")
+        # 6. Test results and Typecheck validation (fail-closed unless near deadline)
+        has_failed_tests = any(not tr.get("passed") for tr in worker_result.test_results)
+        typecheck_passed = True
+        if hasattr(worker_result, "metadata") and isinstance(worker_result.metadata, dict):
+            typecheck_passed = worker_result.metadata.get("typecheck_passed", True)
+
+        if has_failed_tests or not typecheck_passed:
+            failed_desc = next((tr.get("command") for tr in worker_result.test_results if not tr.get("passed")), "typecheck")
+            if not is_near_deadline:
+                raise SubmissionGateError(f"Cannot submit task {task_id}: test failed: {failed_desc}")
+            else:
+                # Near deadline: block DONE submissions, but permit PARTIAL with honest failure results
+                if effective_ans_status == "DONE" or worker_result.status == "DONE":
+                    raise SubmissionGateError(
+                        f"Cannot submit task {task_id} as DONE near deadline when tests or typecheck failed; status must be PARTIAL"
+                    )
 
         # 7. Check for forbidden files in worker changes (GIT-04)
         for changed_f in worker_result.changed_files:
@@ -119,12 +139,105 @@ class SubmissionGuard:
             if forbidden:
                 raise SubmissionGateError(f"Cannot submit task {task_id}: forbidden file '{ev_f}' in declared evidence ({reason})")
 
-        # 8. Git Tree Hard Gate (GIT-01, GIT-02, GIT-03, GIT-05)
+        # 7a. Evidence Integrity, Non-Empty, and Sidecar Verification
+        all_declared_evidence = list(worker_result.evidence_paths or [])
+        if answer_payload and isinstance(answer_payload, dict):
+            for k in ("evidence", "evidenceFiles"):
+                ev_list = answer_payload.get(k)
+                if isinstance(ev_list, list):
+                    for ev_item in ev_list:
+                        if ev_item and str(ev_item) not in all_declared_evidence:
+                            all_declared_evidence.append(str(ev_item))
+
         repo_path = Path(envelope.repository_path).resolve() if envelope.repository_path else None
+        for ev_path_str in all_declared_evidence:
+            ev_p = Path(ev_path_str)
+            resolved_file = None
+            if repo_path:
+                candidates = [
+                    repo_path / "answers" / task_id / "evidence" / ev_p.name,
+                    repo_path / "answers" / task_id / ev_path_str,
+                    repo_path / ev_path_str,
+                ]
+                if checkout_root:
+                    candidates.append(Path(checkout_root) / "answers" / task_id / "evidence" / ev_p.name)
+                    candidates.append(Path(checkout_root) / "answers" / task_id / ev_path_str)
+                for cand in candidates:
+                    if cand.is_file():
+                        resolved_file = cand
+                        break
+
+            if resolved_file:
+                # Disallow empty files
+                if resolved_file.stat().st_size == 0:
+                    raise SubmissionGateError(f"Cannot submit task {task_id}: evidence file '{ev_path_str}' is empty")
+
+                # Check for PNG placeholder / tiny stub
+                if ev_p.suffix.lower() == ".png":
+                    if resolved_file.stat().st_size <= 100:
+                        if effective_ans_status == "DONE" or worker_result.status == "DONE":
+                            raise SubmissionGateError(
+                                f"Cannot submit task {task_id} as DONE: evidence PNG '{ev_path_str}' is a placeholder stub ({resolved_file.stat().st_size} bytes)"
+                            )
+
+                # Check for synthetic fixture markers in text/json files
+                if ev_p.suffix.lower() in (".json", ".txt", ".csv", ".log", ".md"):
+                    try:
+                        content_str = resolved_file.read_text(encoding="utf-8", errors="ignore")
+                        if re.search(r"fixture-[A-Za-z0-9_-]*-synthetic", content_str, re.IGNORECASE) or "fixture-*-synthetic" in content_str:
+                            raise SubmissionGateError(
+                                f"Cannot submit task {task_id}: evidence file '{ev_path_str}' contains forbidden synthetic marker"
+                            )
+                        if "{{" in content_str and ("test-data" in ev_p.name or "fixture" in ev_p.name):
+                            raise SubmissionGateError(
+                                f"Cannot submit task {task_id}: fixture '{ev_path_str}' contains unrendered template placeholder"
+                            )
+                    except UnicodeDecodeError:
+                        pass
+
+                # Check .source.json sidecar for fixture files
+                if ev_p.name.endswith("-test-data.json") or "fixture" in ev_p.name.lower():
+                    sidecar = resolved_file.with_name(resolved_file.name + ".source.json")
+                    if not sidecar.is_file():
+                        if effective_ans_status == "DONE" or worker_result.status == "DONE":
+                            raise SubmissionGateError(
+                                f"Cannot submit task {task_id} as DONE: fixture '{ev_path_str}' is missing official '.source.json' sidecar"
+                            )
+                    else:
+                        try:
+                            sidecar_data = json.loads(sidecar.read_text(encoding="utf-8"))
+                            expected_hash = hashlib.sha256(resolved_file.read_bytes()).hexdigest()
+                            actual_hash = sidecar_data.get("sha256")
+                            if actual_hash != expected_hash:
+                                raise SubmissionGateError(
+                                    f"Fixture '{ev_path_str}' sha256 mismatch with sidecar: expected {expected_hash}, got {actual_hash}"
+                                )
+                            src_tool = sidecar_data.get("tool") or sidecar_data.get("source")
+                            if not src_tool or "synthetic" in str(src_tool).lower():
+                                raise SubmissionGateError(
+                                    f"Fixture '{ev_path_str}' does not originate from official company tools ({src_tool})"
+                                )
+                        except Exception as sidecar_err:
+                            if isinstance(sidecar_err, SubmissionGateError):
+                                raise
+                            raise SubmissionGateError(f"Invalid sidecar for '{ev_path_str}': {sidecar_err}")
+
+        # 7b. Validate submitTemplate if provided in envelope metadata
+        submit_template = None
+        if hasattr(envelope, "metadata") and isinstance(envelope.metadata, dict):
+            submit_template = envelope.metadata.get("submitTemplate") or envelope.metadata.get("submit_template")
+        effective_answer = answer_payload or getattr(worker_result, "answer", None)
+        if submit_template and isinstance(submit_template, dict) and isinstance(effective_answer, dict):
+            for t_key in submit_template.keys():
+                if t_key not in effective_answer:
+                    raise SubmissionGateError(
+                        f"Cannot submit task {task_id}: answer payload missing required key '{t_key}' from submitTemplate"
+                    )
+
+        # 8. Git Tree Hard Gate (GIT-01, GIT-02, GIT-03, GIT-05)
         repo_has_git = repo_path is not None and (repo_path / ".git").exists()
 
         effective_strict = self.strict_git_gate if strict_git_gate is None else strict_git_gate
-        effective_answer = answer_payload or getattr(worker_result, "answer", None)
         has_submit_json_on_disk = repo_has_git and (repo_path / "answers" / task_id / "submit.json").exists()
 
         if repo_has_git and (effective_strict or effective_answer is not None or has_submit_json_on_disk):
@@ -133,6 +246,7 @@ class SubmissionGuard:
             needs_remote = eff_remote or getattr(revision, "is_pushed", False)
 
             git_gate = PreSubmissionGitGuard(repo_path)
+            allow_partial_flag = bool(effective_ans_status in ("PARTIAL", "BLOCKED"))
             val_res = git_gate.validate_pre_submission(
                 repo_path=repo_path,
                 target_commit_sha=revision.commit_sha,
@@ -145,6 +259,7 @@ class SubmissionGuard:
                 checkout_root=checkout_root,
                 require_remote=needs_remote,
                 raise_on_error=False,
+                allow_partial=allow_partial_flag,
             )
             if not val_res.valid:
                 raise SubmissionGateError(f"Pre-submission Git gate failed for task {task_id}: {val_res.error_message}")

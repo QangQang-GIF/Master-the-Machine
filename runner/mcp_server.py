@@ -14,6 +14,7 @@ Stdout is strictly reserved for JSON-RPC messages; all diagnostics go to stderr.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -23,7 +24,7 @@ import sys
 import time
 import urllib.parse
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -37,6 +38,7 @@ for _p in [str(_pack_root), str(_src_dir)]:
 
 from mtm.constants import DEFAULT_GAME_MASTER_ORIGIN
 from mtm_competition.adapters.base import validate_match_projection_schema
+from mtm_competition.adapters.company_tools import CompanyToolsClient, categorize_tool
 from mtm_competition.adapters.official_game_master import (
     OfficialGameMasterAdapter,
     build_match_page_url,
@@ -167,6 +169,131 @@ class MCPHelperServer:
         self.native: Optional[NativeTaskCoordinator] = None
         self.latest_projection: Dict[str, Any] = {}
         self.project_runtime = None
+        self.company_tools_client: Optional[CompanyToolsClient] = None
+        self.company_tools: List[Dict[str, Any]] = []
+
+    def _init_company_tools(self) -> None:
+        """Initialize CompanyToolsClient and discover tools from Match MCP if credentials are present."""
+        match_id = self.match_code or self.match_uuid
+        token = self.bearer_token or self.descriptor.get("apiKeySecret") or self.descriptor.get("bearerToken")
+        if not match_id or not token:
+            return
+
+        base_url = (
+            self.match_page_url
+            or self.descriptor.get("gameMasterApiUrl")
+            or self.descriptor.get("baseUrl")
+            or "https://masterthemachine.tech"
+        )
+        state_dir = self.workspace_root / "team-sdlc-pack" / "state" / str(match_id)
+
+        try:
+            if not self.company_tools_client:
+                self.company_tools_client = CompanyToolsClient(
+                    base_url=base_url,
+                    match_id=str(match_id),
+                    api_key=str(token),
+                    timeout=15.0,
+                    state_dir=state_dir,
+                )
+            self.company_tools = self.company_tools_client.discover_tools()
+        except Exception as exc:
+            sys.stderr.write(f"Warning: company tools discovery: {exc}\n")
+
+    def list_company_tools(self) -> List[Dict[str, Any]]:
+        """List discovered tools from the official Match MCP server."""
+        if not self.company_tools_client:
+            self._init_company_tools()
+        if self.company_tools_client:
+            try:
+                self.company_tools = self.company_tools_client.discover_tools()
+            except Exception as exc:
+                sys.stderr.write(f"Warning: refreshing company tools: {exc}\n")
+        return self.company_tools
+
+    def call_company_tool(self, name: str, arguments: Dict[str, Any]) -> Any:
+        """Invoke an authoritative company tool via Match MCP server."""
+        if not self.company_tools_client:
+            self._init_company_tools()
+        if not self.company_tools_client:
+            raise RuntimeError("Company tools bridge not initialized (missing match credentials or match ID).")
+        return self.company_tools_client.call_tool(name, arguments)
+
+    def fetch_fixture(
+        self,
+        backlog_item_key: str,
+        tool_name: Optional[str] = None,
+        arguments: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """
+        Fetch authoritative QA test data fixture from Match MCP and save with source metadata.
+        NEVER generates synthetic fixtures!
+        """
+        if not self.company_tools_client:
+            self._init_company_tools()
+        if not self.company_tools_client:
+            return {"status": "UNAVAILABLE", "reason": "No company tools client connection"}
+
+        tools = self.list_company_tools()
+        target_tool = tool_name
+        if not target_tool:
+            qa_tools = [t for t in tools if t.get("category") == "qa_data"]
+            if qa_tools:
+                target_tool = qa_tools[0]["name"]
+            else:
+                any_qa = [
+                    t for t in tools
+                    if any(k in t.get("name", "").lower() for k in ["qa", "fixture", "store", "test_data"])
+                ]
+                if any_qa:
+                    target_tool = any_qa[0]["name"]
+
+        if not target_tool:
+            return {"status": "UNAVAILABLE", "reason": "No QA test data tool found in company tools list"}
+
+        args = dict(arguments or {})
+        if "backlogItemKey" not in args and "item_id" not in args and "key" not in args:
+            args["backlogItemKey"] = backlog_item_key
+            args["item_id"] = backlog_item_key
+
+        try:
+            raw_data = self.company_tools_client.call_tool(target_tool, args)
+        except Exception as exc:
+            return {"status": "ERROR", "reason": f"Tool '{target_tool}' call failed: {exc}"}
+
+        if not raw_data:
+            return {"status": "UNAVAILABLE", "reason": f"Tool '{target_tool}' returned empty payload"}
+
+        evidence_dir = Path(self.match_root) / "answers" / backlog_item_key / "evidence"
+        evidence_dir.mkdir(parents=True, exist_ok=True)
+        fixture_filename = f"{backlog_item_key.lower()}-test-data.json"
+        fixture_path = evidence_dir / fixture_filename
+
+        raw_json_str = json.dumps(raw_data, indent=2, ensure_ascii=False) if isinstance(raw_data, (dict, list)) else str(raw_data)
+        if "{{" in raw_json_str:
+            return {"status": "INVALID", "reason": "Fetched fixture contains unrendered template placeholders '{{'"}
+
+        fixture_path.write_text(raw_json_str, encoding="utf-8")
+        file_sha = hashlib.sha256(fixture_path.read_bytes()).hexdigest()
+
+        sidecar_path = evidence_dir / f"{fixture_filename}.source.json"
+        sidecar_data = {
+            "tool": target_tool,
+            "arguments": args,
+            "sha256": file_sha,
+            "fetchedAt": datetime.now(timezone.utc).isoformat(),
+            "backlogItemKey": backlog_item_key,
+            "official": True,
+        }
+        sidecar_path.write_text(json.dumps(sidecar_data, indent=2), encoding="utf-8")
+
+        return {
+            "status": "FETCHED",
+            "path": str(fixture_path.relative_to(self.match_root)),
+            "sidecar": str(sidecar_path.relative_to(self.match_root)),
+            "sha256": file_sha,
+            "tool": target_tool,
+        }
 
     def _get_backlog_title(self, key: str) -> str:
         item = self.known_backlog_items.get(key, {})
@@ -373,7 +500,7 @@ class MCPHelperServer:
                 pass
 
         # Journal & Git Guard
-        db_path = descriptor.get("journalDbPath") or (self.workspace_root / "team-sdlc-pack" / "state" / str(self.match_code or "active") / "submissions.db")
+        db_path = descriptor.get("journalDbPath") or (self.workspace_root / ".mtm" / "submissions.db")
         Path(db_path).parent.mkdir(parents=True, exist_ok=True)
         if self.journal is None or str(getattr(self.journal, "db_path", "")) != str(db_path):
             if self.journal is not None:
@@ -927,13 +1054,26 @@ class MCPHelperServer:
             for field in ("releaseFiles", "onStartFiles"):
                 if isinstance(public_item.get(field), list):
                     public_paths.extend(p for p in public_item[field] if isinstance(p, str))
-            delivered = result.get("files") or {}
+            delivered_raw = result.get("files")
+            if isinstance(delivered_raw, list):
+                delivered = {}
+                for f_item in delivered_raw:
+                    if isinstance(f_item, str):
+                        p = Path(self.match_root) / f_item
+                        delivered[f_item] = p.read_text(encoding="utf-8") if p.exists() else ""
+                result["files"] = delivered
+            elif isinstance(delivered_raw, dict):
+                delivered = delivered_raw
+            else:
+                delivered = {}
+                result["files"] = delivered
+
             if public_paths:
                 from runner.announced_inputs import resolve_announced_files
                 unavailable = []
                 result["files"] = resolve_announced_files(
                     self.checkout_root, self.match_root, self.assigned_branch,
-                    backlog_item_key, [*public_paths, *delivered], delivered,
+                    backlog_item_key, [*public_paths, *delivered.keys()], delivered,
                     missing_paths=unavailable)
                 if unavailable:
                     result["unavailableAnnouncedFiles"] = unavailable
@@ -962,60 +1102,9 @@ class MCPHelperServer:
                 if "unavailableAnnouncedFiles" in result and challenge_rel in result["unavailableAnnouncedFiles"]:
                     result["unavailableAnnouncedFiles"].remove(challenge_rel)
 
-            # Automatic QA test fixture generation for BUG-02 and CR-01 if absent
+            # Attempt official QA test fixture fetching via company tools (no synthetic generation!)
             try:
-                if backlog_item_key == "BUG-02":
-                    fix_path = Path(self.match_root) / "answers" / "BUG-02" / "evidence" / "bug-02-test-data.json"
-                    if not fix_path.exists():
-                        fix_path.parent.mkdir(parents=True, exist_ok=True)
-                        fix_data = {
-                            "fixtureId": "fixture-bug-02-synthetic",
-                            "backlogItemKey": "BUG-02",
-                            "description": "Auto-generated synthetic QA test data for VND client fix",
-                            "data": {
-                                "companies": [
-                                    {"key": "c-vnd", "name": "VND Client Co", "currency": "VND"},
-                                    {"key": "c-usd", "name": "USD Client Co", "currency": "USD"}
-                                ]
-                            }
-                        }
-                        fix_path.write_text(json.dumps(fix_data, indent=2), encoding="utf-8")
-                elif backlog_item_key == "CR-01":
-                    fix_path = Path(self.match_root) / "answers" / "CR-01" / "evidence" / "cr-01-test-data.json"
-                    if not fix_path.exists():
-                        fix_path.parent.mkdir(parents=True, exist_ok=True)
-                        fix_data = {
-                            "fixtureId": "fixture-cr-01-synthetic",
-                            "backlogItemKey": "CR-01",
-                            "description": "Auto-generated synthetic QA test data for CR-01 invoice export",
-                            "data": {
-                                "companies": [
-                                    {"key": "c1", "name": "Acme Corp", "currency": "USD"},
-                                    {"key": "c2", "name": "VND Studio", "currency": "VND"}
-                                ],
-                                "invoices": [
-                                    {
-                                        "number": "INV-2026-001",
-                                        "company": "c1",
-                                        "issueDate": "2026-10-01",
-                                        "dueDate": "2026-10-15",
-                                        "totalMinor": 100000,
-                                        "state": "ISSUED",
-                                        "payments": []
-                                    },
-                                    {
-                                        "number": "INV-2026-002",
-                                        "company": "c2",
-                                        "issueDate": "2026-10-05",
-                                        "dueDate": "2026-10-20",
-                                        "totalMinor": 500000,
-                                        "state": "DRAFT",
-                                        "payments": []
-                                    }
-                                ]
-                            }
-                        }
-                        fix_path.write_text(json.dumps(fix_data, indent=2), encoding="utf-8")
+                self.fetch_fixture(backlog_item_key)
             except Exception:
                 pass
 
@@ -1407,13 +1496,27 @@ class MCPHelperServer:
 
     def claim_task(self, backlog_item_key: str, worker_id: str, estimated_seconds: int = 420) -> Dict[str, Any]:
         try:
-            return self._native_coordinator().claim_task(backlog_item_key, worker_id, estimated_seconds)
+            res = self._native_coordinator().claim_task(backlog_item_key, worker_id, estimated_seconds)
         except Exception as e:
             if "Start Work must succeed" in str(e):
                 sys.stderr.write(f"Auto-healing unstarted task {backlog_item_key} before claim...\n")
                 self.start_work(backlog_item_key)
-                return self._native_coordinator().claim_task(backlog_item_key, worker_id, estimated_seconds)
-            raise
+                res = self._native_coordinator().claim_task(backlog_item_key, worker_id, estimated_seconds)
+            else:
+                raise
+
+        # Inject company tools catalog into TaskEnvelope metadata
+        if isinstance(res, dict) and "taskEnvelope" in res and isinstance(res["taskEnvelope"], dict):
+            env = res["taskEnvelope"]
+            meta = env.setdefault("metadata", {})
+            # Ensure tools catalog is refreshed
+            tools = self.list_company_tools()
+            meta["company_tools"] = [
+                {"name": t["name"], "category": t.get("category", "other"), "description": t.get("description", "")}
+                for t in tools
+            ]
+            meta["company_tools_help"] = "Use call_company_tool(name, arguments) or CLI `python -m runner.control company call <name> '<json_args>'` to query official KB, QA store, and production logs."
+        return res
 
     def record_worker_result(self, backlog_item_key: str, worker_result: Dict[str, Any]) -> Dict[str, Any]:
         return self._native_coordinator().record_worker_result(backlog_item_key, worker_result)
@@ -1561,6 +1664,39 @@ def get_tool_definitions() -> List[Dict[str, Any]]:
                 },
             },
         },
+        {
+            "name": "list_company_tools",
+            "description": "List authoritative company tools available on the Match MCP server (KB search, QA fixture store, production observability logs).",
+            "inputSchema": {
+                "type": "object",
+                "properties": {},
+            },
+        },
+        {
+            "name": "call_company_tool",
+            "description": "Invoke an authoritative company tool (KB search, QA fixture store, production observability logs) via Match MCP server.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "description": "The exact name of the company tool to call"},
+                    "arguments": {"type": "object", "description": "Arguments object passed to the tool"},
+                },
+                "required": ["name", "arguments"],
+            },
+        },
+        {
+            "name": "fetch_fixture",
+            "description": "Fetch official QA test data fixture from Match MCP and save into answers/<key>/evidence/<id>-test-data.json with .source.json sidecar.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "backlogItemKey": {"type": "string", "description": "Backlog item key (e.g. CR-01, BUG-02)"},
+                    "toolName": {"type": "string", "description": "Optional specific QA tool name to use"},
+                    "arguments": {"type": "object", "description": "Optional custom arguments object"},
+                },
+                "required": ["backlogItemKey"],
+            },
+        },
     ]
 
 
@@ -1633,6 +1769,16 @@ def run_mcp_stdio_server():
                     val = server.integration_gate(tool_args["backlogItemKey"], tool_args.get("action", "begin"))
                 elif tool_name == "reconcile_worker":
                     val = server.reconcile_worker(tool_args["backlogItemKey"], tool_args["confirmedStopped"], tool_args["reason"], tool_args.get("requeue", True))
+                elif tool_name == "list_company_tools":
+                    val = server.list_company_tools()
+                elif tool_name == "call_company_tool":
+                    val = server.call_company_tool(tool_args.get("name", ""), tool_args.get("arguments", {}))
+                elif tool_name == "fetch_fixture":
+                    val = server.fetch_fixture(
+                        tool_args.get("backlogItemKey", ""),
+                        tool_name=tool_args.get("toolName"),
+                        arguments=tool_args.get("arguments"),
+                    )
                 else:
                     raise ValueError(f"Unknown tool: {tool_name}")
 

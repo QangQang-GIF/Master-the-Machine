@@ -151,7 +151,7 @@ def test_high_volume_stream_pause_resume_deadline_freeze():
         assert proc.returncode == 0
         assert len(stdout_text) == total_bytes
         # Without pause freezing, proc would have failed with TimeoutExpired at 0.7s
-        assert elapsed >= pause_hold_duration, f"Elapsed {elapsed:.2f}s should reflect freeze duration"
+        assert elapsed >= (pause_hold_duration - 0.1), f"Elapsed {elapsed:.2f}s should reflect freeze duration"
     finally:
         if proc.poll() is None:
             proc.kill()

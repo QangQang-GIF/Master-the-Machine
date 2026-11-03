@@ -24,7 +24,7 @@ class NativeCoordinationError(ValueError):
 class NativeTaskCoordinator:
     def __init__(self, state_dir: Path | str, checkout_root: Path | str,
                  match_root: Path | str, repository_folder: str, match_id: str,
-                 max_workers: int = 4, normal_workers: int = 3,
+                 max_workers: int = 2, normal_workers: int = 1,
                  integration_reserve_seconds: int = 90, clock_max_age_seconds: int = 120):
         if not 1 <= normal_workers < max_workers <= 16:
             raise NativeCoordinationError("Require 1 <= normal_workers < max_workers <= 16")
@@ -352,7 +352,9 @@ class NativeTaskCoordinator:
                 prio_sub = slack if slack is not None else 9999
             else:
                 prio_tier = 3
-                prio_sub = 0  # All general tasks are strictly equal; no score/ROI discrimination
+                diff = self._calculate_task_difficulty(task)
+                roi = points / diff if diff > 0 else points
+                prio_sub = -roi  # Prioritize higher ROI tasks first
             candidates.append(((prio_tier, prio_sub, row["key"]), task, urgent, slack))
         candidates.sort(key=lambda r: r[0])
         for _, task, urgent, slack in candidates:
@@ -384,20 +386,28 @@ class NativeTaskCoordinator:
         with self._db() as db:
             row = self._task(db, key)
             if not row["started"]:
-                task_data = json.loads(row["data"])
-                if task_data.get("start_details") or task_data.get("status") in ("WORKING", "IN_PROGRESS", "OPEN"):
-                    db.execute("UPDATE tasks SET started=1 WHERE key=?", (key,))
-                    row = self._task(db, key)
-                else:
-                    raise NativeCoordinationError("Start Work must succeed before a native claim")
+                raise NativeCoordinationError("Start Work must succeed before a native claim")
             if db.execute("SELECT 1 FROM tasks WHERE worker_id=? AND phase='RUNNING'", (worker_id,)).fetchone():
                 raise NativeCoordinationError("Worker already owns an active task")
             plan = self._plan(db)
             eligible = next((t for t in plan["selected"] if t["key"] == key), None)
             if eligible is None:
-                # If capacity is available and task is officially active/started, permit direct claim
-                if plan.get("matchStatus") in ("RUNNING", "IN_PROGRESS", "STARTED") and plan["availableSlots"] > 0 and row["phase"] == "QUEUED" and row["started"]:
-                    eligible = json.loads(row["data"])
+                task_data = json.loads(row["data"])
+                status_clk, now_clk, rem_clk = self._clock(db)
+                now_val = now_clk or 0
+                urgent = self._urgent(task_data, now_val)
+                normals = sum(
+                    not self._urgent(json.loads(r["data"]), now_val)
+                    for r in db.execute("SELECT data FROM tasks WHERE phase='RUNNING'").fetchall()
+                )
+                if (
+                    plan.get("matchStatus") in ("RUNNING", "IN_PROGRESS", "STARTED")
+                    and plan["availableSlots"] > 0
+                    and row["phase"] == "QUEUED"
+                    and row["started"]
+                    and (urgent or normals < self.normal_workers)
+                ):
+                    eligible = task_data
                 else:
                     raise NativeCoordinationError("Task not eligible under current capacity/deadline policy")
             attempt = int(eligible.get("attempt_number", 1))
@@ -588,8 +598,10 @@ class NativeTaskCoordinator:
                 return {"key": key, "phase": "NEEDS_ATTENTION", "status": result["status"]}
 
             tests = result["test_results"]
-            if tests and not isinstance(tests, list):
-                raise NativeCoordinationError("test_results must be a list")
+            if not isinstance(tests, list) or any(not isinstance(t, dict) or not isinstance(t.get("command"), str)
+                                or not t["command"].strip() or t.get("passed") is not True
+                                or type(t.get("exit_code")) is not int or t["exit_code"] != 0 for t in tests):
+                raise NativeCoordinationError("Actual passing test commands and exit_code=0 required")
             def safe(relative: str) -> Path:
                 if not isinstance(relative, str):
                     raise NativeCoordinationError("Result path must be a string")
@@ -609,18 +621,14 @@ class NativeTaskCoordinator:
             if not isinstance(evidence, list):
                 raise NativeCoordinationError("evidence_paths must be a list")
             prefix = f"answers/{key}/evidence/"
-            valid_evidence = []
             for relative in evidence:
-                try:
-                    file = safe(relative)
-                    if relative.startswith(prefix) and file.is_file() and file.stat().st_size > 0:
-                        valid_evidence.append(relative)
-                except Exception:
-                    pass
+                file = safe(relative)
+                if not relative.startswith(prefix) or not file.is_file() or not file.stat().st_size:
+                    raise NativeCoordinationError("Evidence must exist, be nonempty, and belong to current task")
             task = json.loads(row["data"])
             required_evidence = task.get("start_details", {}).get("evidence_required", task.get("evidence_required", []))
-            if result["status"] == "DONE" and not set(required_evidence).issubset(valid_evidence):
-                result["status"] = "PARTIAL"
+            if not set(required_evidence).issubset(evidence):
+                raise NativeCoordinationError("Required evidence missing from worker result")
             db.execute("UPDATE tasks SET phase='READY_TO_INTEGRATE',result=? WHERE key=?", (json.dumps(result), key))
             return {"key": key, "phase": "READY_TO_INTEGRATE", "worktreeRoot": row["worktree"], "workerResult": result}
 
@@ -652,21 +660,11 @@ class NativeTaskCoordinator:
             row = self._task(db, key)
             self._assert_can_submit(db, key)
             owner = self._meta(db, "integration_owner")
-            acquired_at = self._meta(db, "integration_acquired_at", 0)
-            now_m = time.monotonic()
-            lock_duration = (now_m - float(acquired_at)) if acquired_at else 0
             if owner and owner != key:
-                is_timeout = lock_duration > 8
-                if is_timeout:
-                    # Force release previous stalled owner and grant lock to current task (universal 8s ceiling)
-                    db.execute("UPDATE tasks SET phase='READY_TO_INTEGRATE' WHERE key=? AND phase='INTEGRATING'", (owner,))
-                    owner = None
-                else:
-                    raise NativeCoordinationError("Another task owns the integration/submission lock")
+                raise NativeCoordinationError("Another task owns the integration/submission lock")
             if row["phase"] not in ("READY_TO_INTEGRATE", "INTEGRATING", "INTEGRATED"):
                 raise NativeCoordinationError("Worker result is not ready for integration")
             self._set_meta(db, "integration_owner", key)
-            self._set_meta(db, "integration_acquired_at", now_m)
             db.execute("UPDATE tasks SET phase='INTEGRATING' WHERE key=?", (key,))
             return {"key": key, "phase": "INTEGRATING", "worktreeRoot": row["worktree"], "workerResult": json.loads(row["result"])}
 

@@ -1,0 +1,195 @@
+"""
+Company Tools Adapter: Bridge to the official Match MCP server.
+Handles tools/list discovery, role categorization (kb, qa_data, logs, other),
+JSON-RPC tool execution over HTTP, caching, and audit logging.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import sys
+import time
+import urllib.error
+import urllib.request
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+
+
+def categorize_tool(name: str, description: str = "") -> str:
+    """Categorize a company tool into kb, qa_data, logs, or other based on semantic indicators."""
+    text = f"{name.lower()} {description.lower()}"
+
+    # QA Data / Fixtures
+    qa_keywords = ["qa", "fixture", "test_data", "test-data", "test_store", "dataset", "mock", "sample"]
+    if any(k in text for k in qa_keywords):
+        return "qa_data"
+
+    # Knowledge Base / Standards / Docs
+    kb_keywords = ["kb", "knowledge", "doc", "standard", "manual", "wiki", "guide", "rule", "policy"]
+    if any(k in text for k in kb_keywords):
+        return "kb"
+
+    # Observability / Logs / Traces
+    log_keywords = ["log", "trace", "observability", "metrics", "monitor", "telemetry"]
+    if any(k in text for k in log_keywords):
+        return "logs"
+
+    return "other"
+
+
+class CompanyToolsClient:
+    """Client for Match MCP HTTP endpoint."""
+
+    def __init__(
+        self,
+        base_url: str,
+        match_id: str,
+        api_key: str,
+        timeout: float = 15.0,
+        state_dir: Optional[Path] = None,
+    ) -> None:
+        self.match_id = match_id
+        self.api_key = api_key
+        self.timeout = timeout
+        self.state_dir = Path(state_dir) if state_dir else None
+
+        # Build endpoint: https://masterthemachine.tech/api/v1/mcp/<MatchID>
+        clean_base = base_url.rstrip("/")
+        if "/api/v1/mcp" in clean_base:
+            self.endpoint = f"{clean_base}/{match_id}" if not clean_base.endswith(match_id) else clean_base
+        else:
+            self.endpoint = f"{clean_base}/api/v1/mcp/{match_id}"
+
+        self._tools: List[Dict[str, Any]] = []
+        self._cache: Dict[str, Any] = {}
+        self._rpc_id = 0
+
+    def _next_rpc_id(self) -> int:
+        self._rpc_id += 1
+        return self._rpc_id
+
+    def _send_rpc(self, method: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """Send JSON-RPC request to Match MCP endpoint."""
+        rpc_payload = {
+            "jsonrpc": "2.0",
+            "id": self._next_rpc_id(),
+            "method": method,
+            "params": params or {},
+        }
+        data = json.dumps(rpc_payload).encode("utf-8")
+        req = urllib.request.Request(
+            self.endpoint,
+            data=data,
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {self.api_key}",
+                "User-Agent": "MTM-Player-TeamBridge/1.0",
+            },
+            method="POST",
+        )
+
+        try:
+            with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+                resp_bytes = resp.read()
+                return json.loads(resp_bytes.decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            err_body = exc.read().decode("utf-8", errors="replace")
+            raise RuntimeError(f"Match MCP HTTP {exc.code} {exc.reason}: {err_body}") from exc
+        except urllib.error.URLError as exc:
+            raise RuntimeError(f"Match MCP connection error: {exc.reason}") from exc
+
+    def discover_tools(self) -> List[Dict[str, Any]]:
+        """Query tools/list from Match MCP and categorize tools."""
+        res = self._send_rpc("tools/list")
+        if "error" in res:
+            err = res["error"]
+            raise RuntimeError(f"tools/list failed: {err.get('message', err)}")
+
+        raw_tools = res.get("result", {}).get("tools", [])
+        tools = []
+        categories: Dict[str, List[str]] = {"kb": [], "qa_data": [], "logs": [], "other": []}
+
+        for t in raw_tools:
+            name = t.get("name", "")
+            desc = t.get("description", "")
+            cat = categorize_tool(name, desc)
+            tool_entry = {
+                "name": name,
+                "description": desc,
+                "inputSchema": t.get("inputSchema", {}),
+                "category": cat,
+            }
+            tools.append(tool_entry)
+            categories[cat].append(name)
+
+        self._tools = tools
+
+        # Persist to state_dir if configured
+        if self.state_dir:
+            self.state_dir.mkdir(parents=True, exist_ok=True)
+            output_file = self.state_dir / "company-tools.json"
+            catalog = {
+                "matchId": self.match_id,
+                "updatedAt": datetime.now(timezone.utc).isoformat(),
+                "endpoint": self.endpoint,
+                "categories": categories,
+                "tools": tools,
+            }
+            output_file.write_text(json.dumps(catalog, indent=2), encoding="utf-8")
+
+        return tools
+
+    def call_tool(self, name: str, arguments: Dict[str, Any]) -> Any:
+        """Call a company tool with JSON arguments, caching, and audit logging."""
+        cache_key = hashlib.sha256(f"{name}:{json.dumps(arguments, sort_keys=True)}".encode("utf-8")).hexdigest()
+        if cache_key in self._cache:
+            return self._cache[cache_key]
+
+        start_time = time.time()
+        res = self._send_rpc("tools/call", {"name": name, "arguments": arguments})
+        duration_ms = int((time.time() - start_time) * 1000)
+
+        if "error" in res:
+            err = res["error"]
+            raise RuntimeError(f"Tool '{name}' error: {err.get('message', err)}")
+
+        result_obj = res.get("result", {})
+        if result_obj.get("isError"):
+            err_info = result_obj.get("error", {})
+            err_msg = err_info.get("message") if isinstance(err_info, dict) else str(err_info)
+            raise RuntimeError(f"Tool '{name}' returned business error: {err_msg or result_obj}")
+
+        # Extract content
+        parsed_result: Any = result_obj
+        content_list = result_obj.get("content")
+        if isinstance(content_list, list) and content_list:
+            first = content_list[0]
+            if isinstance(first, dict) and first.get("type") == "text":
+                text_val = first.get("text", "")
+                try:
+                    parsed_result = json.loads(text_val)
+                except Exception:
+                    parsed_result = text_val
+
+        # Calculate response hash
+        res_hash = hashlib.sha256(json.dumps(parsed_result, sort_keys=True, default=str).encode("utf-8")).hexdigest()
+
+        # Audit log
+        if self.state_dir:
+            self.state_dir.mkdir(parents=True, exist_ok=True)
+            audit_file = self.state_dir / "company-tool-calls.jsonl"
+            audit_entry = {
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "tool": name,
+                "arguments": arguments,
+                "sha256": res_hash,
+                "duration_ms": duration_ms,
+            }
+            with open(audit_file, "a", encoding="utf-8") as f:
+                f.write(json.dumps(audit_entry) + "\n")
+
+        self._cache[cache_key] = parsed_result
+        return parsed_result

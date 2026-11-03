@@ -57,7 +57,7 @@ def purge_history(workspace: Path, keep_match_id: str, player_status: dict[str, 
             shutil.rmtree(path)
         else:
             path.unlink()
-        removed.append(str(path.relative_to(workspace.resolve())))
+        removed.append(path.relative_to(workspace.resolve()).as_posix())
     return removed
 
 

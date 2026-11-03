@@ -3,20 +3,22 @@ name: mtm-cr-worker
 description: Implement and verify an announced MTM change request against specification and MVS.
 ---
 
-# CR
+# CR (Change Request)
 
 Follow `mtm-init` and `mtm-worker`. Root owns Start Work, integration, push, and Submit.
 
 1. Always run `pnpm exec prisma generate` in `src/` before running any test or seed script.
-2. Capture requested pre-change evidence before editing code.
-3. For CR-01:
-   - Run `pnpm tsx prisma/seed-cr01.ts ../answers/CR-01/evidence/cr-01-test-data.json`.
-   - Add CSV export functionality to the invoices page / API with standard columns (invoiceNumber, company, issueDate, dueDate, totalMinor, status).
-   - If UI browser capture for the 7 screenshots / CSVs is slow or times out: Immediately query Prisma DB to export the 5 required CSV files, capture current screen for PNGs, list all in `evidenceFiles`, and mark status `PARTIAL` or `READY_FOR_REVIEW`.
-   - Run `node ../challenge/CR-01-run-checks.mjs ../answers/CR-01/evidence` and `node ../challenge/CR-01-signed-out-check.mjs`.
-   - For CR-02 (Aging report): Ensure aging API is mounted. For `tc-01-aging-report.png`, the runner pre-warms routes; seed open invoices so the table renders immediately without form friction.
-   - For CR-03 (Quick contact links): Ensure phoneUrl, whatsappUrl, and telegramUrl helpers validate formats strictly. In browser capture, use DOM evaluate click: `await page.locator(...).evaluate(el => el.click())` to avoid navigation interception.
-4. Verify positive, boundary, and regression cases. Save outputs under `answers/<key>/evidence/`.
-   - **Deadline & Evidence Completeness**: Cap browser operations at 60s max. Every file required by MVS MUST exist in `answers/<key>/evidence/`. Synthesize diagnostic PNG/CSV if browser is unavailable.
-5. Fill `answers/<key>/submit.json` and generate `worker_result.json` with status `READY_FOR_REVIEW` (or `PARTIAL` if partially completed). NEVER mark `BLOCKED` if code changes or logs were created.
-6. **Immediate Submission & Self-Correction**: Submit immediately. If the gate reports missing evidence or schema error, immediately generate the missing file, update `submit.json`, and re-submit until a valid receipt is obtained!
+2. Ingestion & Official Data:
+   - Identify if the CR requires test fixtures, schemas, or seed data. Call `fetch_fixture` or query the official Match MCP QA tool.
+   - If the CR mentions company policies or standards (e.g. KB-*), query the `kb` tool via `call_company_tool` before implementing logic.
+   - NEVER generate synthetic test fixtures under official fixture filenames (`answers/<key>/evidence/*-test-data.json`).
+3. Implementation:
+   - Implement acceptance criteria cleanly extending existing controllers, routers, services, and UI components.
+   - Guard against common edge cases: international currency formatting, special characters, whitespace trimming, timezones, and null/empty handling.
+4. Verification & Testing:
+   - Verify positive, boundary, and regression cases. Run existing test suite to ensure zero regressions across other items.
+   - For UI MVS scenarios: Cap browser operations at 60s max. Use DOM evaluate click (`await page.locator(...).evaluate(el => el.click())`) to avoid navigation interception.
+   - If browser UI capture is unavailable or times out: Mark the UI scenario `NOT_RUN` with clear diagnostic notes in `testResults`. Never fabricate fake placeholder PNGs.
+5. Submission:
+   - Fill `answers/<key>/submit.json` and generate `worker_result.json` with status `READY_FOR_REVIEW` (or `PARTIAL` if partially completed).
+   - NEVER mark `BLOCKED` or `TIMED_OUT` when working code changes or logs exist. Submit before deadline to claim maximum points!

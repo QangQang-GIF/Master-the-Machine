@@ -5,7 +5,7 @@ from mtm_competition.scheduling.native import NativeTaskCoordinator
 def test_roi_difficulty_calculation(tmp_path):
     repo = tmp_path / "checkout"
     repo.mkdir()
-    c = NativeTaskCoordinator(tmp_path / "state", repo, repo / "source", "source", "MATCH")
+    c = NativeTaskCoordinator(tmp_path / "state", repo, repo / "source", "source", "MATCH", max_workers=4, normal_workers=3)
 
     # TASK-04: 70 points, TASK, logic only
     t_task = {"key": "TASK-04", "type": "TASK", "points": 70, "title": "Trace log data"}
@@ -49,7 +49,7 @@ def test_roi_difficulty_calculation(tmp_path):
 def test_roi_prioritization_order(tmp_path):
     repo = tmp_path / "checkout"
     repo.mkdir()
-    c = NativeTaskCoordinator(tmp_path / "state", repo, repo / "source", "source", "MATCH")
+    c = NativeTaskCoordinator(tmp_path / "state", repo, repo / "source", "source", "MATCH", max_workers=4, normal_workers=3)
 
     # 4 tasks registered into projection
     tasks = [

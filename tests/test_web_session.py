@@ -48,7 +48,7 @@ assert urllib.request.urlopen(url, timeout=2).read().decode() == os.environ["AUT
     for _ in range(30):
         try:
             os.kill(child_pid, 0)
-        except ProcessLookupError:
+        except (ProcessLookupError, OSError):
             break
         time.sleep(0.05)
     else:
@@ -91,6 +91,7 @@ def test_check_failure_is_preserved_and_server_is_stopped(tmp_path):
     assert pid_file.exists()
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="killpg and SIGTERM process groups are POSIX only")
 def test_sigterm_of_wrapper_reaps_server_group(tmp_path):
     runtime = _runtime(tmp_path)
     pid_file = tmp_path / "child.pid"
