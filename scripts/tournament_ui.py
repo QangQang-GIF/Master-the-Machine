@@ -47,11 +47,16 @@ from typing import Any, Dict, List, Optional, Tuple
 ROOT_DIR = Path(__file__).resolve().parent.parent
 
 def _find_workspace_dir() -> Path:
-    direct = Path("D:/Working/Master_the_Machine/Thi/Workspace").resolve()
+    ws_candidate = ROOT_DIR.parent / "runtime" / "workspace"
+    if ws_candidate.is_dir():
+        return ws_candidate.resolve()
+    direct = Path("D:/Working/Cuộc thi Agent/runtime/workspace").resolve()
     if direct.is_dir():
         return direct
     cur = Path(__file__).resolve()
     while cur.parent != cur:
+        if (cur / "runtime" / "workspace").is_dir():
+            return (cur / "runtime" / "workspace").resolve()
         if (cur / "Thi" / "Workspace").is_dir():
             return (cur / "Thi" / "Workspace").resolve()
         if cur.name == "Workspace" and (cur / "matches").is_dir():

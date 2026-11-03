@@ -51,8 +51,9 @@ if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
 # Assets locations
-THI_CHALLENGE_DIR = Path(r"D:\Working\Master_the_Machine\Thi\Workspace\matches\PVKPJ94U\PVKPJ94U\challenge")
-DE_THI_DIR = Path(r"D:\Working\Master_the_Machine\Đề thi")
+MATCHES_ROOT = ROOT_DIR.parent / "matches"
+THI_CHALLENGE_DIR = MATCHES_ROOT / "G97MQB4T" / "G97MQB4T" / "challenge"
+DE_THI_DIR = MATCHES_ROOT / "G97MQB4T" / "de-thi"
 
 # 10 Official Backlog Items (Solova Competition Set - 1000 Total Points)
 OFFICIAL_SOLOVA_TASKS: List[Dict[str, Any]] = [
