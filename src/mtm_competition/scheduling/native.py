@@ -1,3 +1,4 @@
+import os
 """Persisted scheduling/leases for Codex's native subagents; never launches an AI CLI.
 
 The root calls Start Work, registers its response, claims a task, then delegates the
