@@ -1,33 +1,26 @@
 ---
 name: mtm-evidence
-description: Capture, validate, and reference official MTM evidence artifacts and web sessions.
+description: Capture, validate, and reference official MTM evidence artifacts and Ephemeral Web Sessions.
 ---
 
-# MTM Evidence
+# MTM Evidence (Ephemeral Web Session Sandbox)
 
 - **Storage Location**: Save artifacts under `matchRoot/answers/<key>/evidence/<filename>`. Reference them in `answers/<key>/submit.json` as `evidence/<filename>`.
-- **Official Data First**:
-  - Fetch official test fixtures from the Match MCP QA store via `fetch_fixture`.
-  - Maintain the `.source.json` sidecar alongside fixtures. Never generate synthetic fixtures under official filenames.
-- **Pre-Change Capture**: Capture requested baseline state before code modifications. Never reconstruct baseline state from modified files.
-- **Web Session Mode**: For web UI evidence, invoke:
-  `python3 <metadata.project_runtime_path> session -- <browser command>`
-  This starts the local dev server on an ephemeral port, verifies readiness, executes capture commands, and cleans up process groups.
-- **Authentication**: Authenticate using demo/seed credentials documented in the project. Never use Game Master credentials.
-  Default credentials:
-  Email: `morpheusadam95` (or check login seed)
-  Password: `change-me-please`
-- **Reliable Playwright UI Guidelines**:
-  1. **Viewport**: Use `{ width: 1600, height: 1000 }` on desktop so responsive drawers / overlays do not obscure content.
-  2. **Page Wait Strategy**: Use `{ waitUntil: "domcontentloaded" }` (NEVER use `networkidle` because polling endpoints like `balanceSheet` or trpc prevent idle state).
-  3. **Hydration Buffer**: Always add `await page.waitForTimeout(1000)` after page navigation before clicking anything, allowing Next.js React hydration to finish.
-  4. **Radix Tabs / Button Click**: Use DOM direct click via evaluate to bypass all overlays:
-     `await page.locator('[role="tab"]').filter({ hasText: "TabName" }).evaluate(el => el.click());`
-  5. **Data-First for Screenshots**: Prefer seeding the necessary records into the database directly, then opening the browser to take screenshots of the rendered lists/tables. Do not write brittle multi-step dialog flows under strict match time limits.
-- **Time Guard & Honest Evidence**:
-  Cap UI capture at 60 seconds. If an unexpected error or timeout occurs:
-  1. Take `page.screenshot({ path: join(evidenceDir, "diagnostic-ui.png"), fullPage: true })` if possible.
-  2. Mark affected scenarios `NOT_RUN` with an honest diagnostic reason in `testResults`.
-  3. NEVER generate dummy or placeholder PNGs. Grader strictly detects placeholder PNGs and penalizes them with 0 points.
-  4. Complete `submit.json` and set `status: "PARTIAL"` (NEVER `TIMED_OUT`).
-- **Validation**: Verify that every referenced evidence file exists on disk, is non-empty, and does not contain sensitive secrets or tokens. Reject path traversal (`../`) and absolute paths.
+- **Official Data First (Zero Fixture Missing)**:
+  - Root automatically pre-fetches official QA fixtures to `answers/<key>/evidence/<key.lower()>-test-data.json` (with `.source.json` sidecar) before worker launch.
+  - Check `answers/<key>/evidence/<key.lower()>-test-data.json` FIRST. **NEVER overwrite an existing official fixture or fabricate synthetic `*-test-data.json` files!**
+- **Official Check & Seed Scripts First**:
+  - Whenever `challenge/<KEY>-run-checks.mjs` exists, ALWAYS generate `test.log` and `typecheck.log` by running `node ../challenge/<KEY>-run-checks.mjs` via `project_runtime.py ... run` so the Grader's strict `command: ...` and `exit_code: 0` format check passes 100%.
+  - Whenever `challenge/<KEY>-seed.ts` or `challenge/<KEY>-report.ts` exists, copy it to `src/prisma/` and execute it via `project_runtime.py ... run -- pnpm tsx prisma/<script>.ts ...` (then delete the temporary copy in `src/prisma/` before `git commit`).
+- **Ephemeral Web Session Mode (No Manual Servers)**:
+  - Only start a web session if `submit.json` requires `.png` screenshots or live HTTP checks (`BUG-01-layout-check.mjs`, `CR-01-signed-out-check.mjs`).
+  - Always invoke via:
+    `python3 "<metadata.project_runtime_path>" --match-root "<match_root>" --match-id "<metadata.match_id>" --worker-id "<worker_id>" session -- node <capture_script.mjs>`
+  - Inside `<capture_script.mjs>`, connect to `http://127.0.0.1:${process.env.PORT || 3000}`.
+- **Authentication & Fast Playwright Capture**:
+  - Default seed credentials: username/email `morpheusadam95`, password `change-me-please`.
+  - Use desktop viewport `{ width: 1440, height: 900 }` (or `{ width: 390, height: 844 }` when mobile is required).
+  - Use `{ waitUntil: "domcontentloaded" }` plus `await page.waitForTimeout(800)` instead of `networkidle` whenever possible.
+  - Seed required records directly into PostgreSQL via Prisma BEFORE running `session` so the browser only has to log in, navigate to the URL, and take screenshots in < 15 seconds.
+- **Honest Fallback**:
+  - Never generate fake/synthetic placeholder PNGs. If a browser check fails after retry, mark that specific test case `NOT_RUN` in `submit.json` (`status: "PARTIAL"`) while keeping all passing code/unit-test scenarios as `PASS`.

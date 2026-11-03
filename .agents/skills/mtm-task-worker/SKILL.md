@@ -1,29 +1,26 @@
 ---
 name: mtm-task-worker
-description: Complete an announced MTM TASK item with required checks and artifacts.
+description: Complete an announced MTM TASK item with required checks and artifacts inside the ProjectRuntime sandbox.
 ---
 
-# TASK
+# TASK (Engineering Task — Sandbox Fast Path)
 
 Follow `mtm-init` and `mtm-worker`. Root owns Start Work, integration, push, and Submit.
 
-1. Always run `pnpm exec prisma generate` in `src/` before running any test or verification command.
-2. Review definition of done and capture requested pre-change artifacts.
-3. Complete changes and run proportionate validation/regression commands:
-   - For TASK-02 (Dependency vulnerabilities): Run `node ../challenge/TASK-02-run-checks.mjs ../answers/TASK-02/evidence`.
-     In `answers/TASK-02/submit.json`, you MUST strictly map test results 1-to-1 to the exact evidence files required by Grader:
-     * `TASK-02-TC-01`: result `PASS`, evidence: `["evidence/install.log"]`
-     * `TASK-02-TC-02`: result `PASS`, evidence: `["evidence/audit.log"]`
-     * `TASK-02-TC-03`: result `PASS`, evidence: `["evidence/typecheck.log"]`
-     * `TASK-02-TC-04`: result `PASS`, evidence: `["evidence/test.log"]`
-     * `TASK-02-TC-05`: result `PASS`, evidence: `["evidence/tc-05-login-dashboard.png", "evidence/tc-05-signed-out.png"]` (capture the 2 screenshots)
-     DO NOT SHUFFLE OR MISMATCH THESE EVIDENCE PATHS. Mismatched paths result in 0 points for that test case!
-   - For TASK-01 (Card reordering position):
-     * Check `src/src/lib/position.ts`: Cards A, B, C created sequentially have positions 65536, 131072, 196608.
-     * Moving C between A and B gives midpoint `(65536 + 131072) / 2 = 98304`.
-     * Persisted database position is `"98304"`. Set `"position": "98304"` in `answers/TASK-01/submit.json`. DO NOT use `"0"`.
-4. Save deliverables under `answers/<key>/evidence/`.
-   - For TASK-03 (Heatmap logged time, deadline 08:00):
-     * If official time-entry QA fixture is missing or connector is closed, compute time from available DB records or generate diagnostic calculation log in `answers/TASK-03/evidence/calculation.log`. Set status `PARTIAL` and SUBMIT before the 08:00 deadline!
-5. Fill `answers/<key>/submit.json` and generate `worker_result.json` with status `READY_FOR_REVIEW` (or `PARTIAL` if partially completed or command outputs like audit return non-zero advisories; NEVER mark `BLOCKED` if answer files or logs were created).
-6. **Immediate Submission & Self-Correction**: Submit immediately upon completion. If gate reports missing files, create them immediately and re-submit!
+1. **Mandatory Sandbox Commands**:
+   - Run all CLI/test/check commands via:
+     `python3 "<metadata.project_runtime_path>" --match-root "<match_root>" --match-id "<metadata.match_id>" --worker-id "<worker_id>" run -- <cmd>`
+   - Only use `project_runtime.py ... session` if `submit.json` explicitly requires `.png` screenshot evidence!
+
+2. **Fast Paths by TASK Archetype**:
+   - **`TASK-01` / `TASK-04` (Code Trace / Reorder Position / Overdue Reminder Dry-Run)**:
+     - **NO browser, NO web server!**
+     - Trace or implement the requested pure logic, run the targeted vitest test via `project_runtime.py ... run`, write the exact answer fields into `answers/<key>/submit.json` and log into `answers/<key>/evidence/`, commit, and finish in < 90s.
+     - For Kanban card reorder midpoint (`Cards A=65536, B=131072, C=196608`, moving C between A and B): midpoint is `"98304"`.
+   - **`TASK-02` (Dependency Audit / Workload Heatmap)**:
+     - If `challenge/TASK-02-run-checks.mjs` exists, run `node ../challenge/TASK-02-run-checks.mjs ../answers/TASK-02/evidence` via `project_runtime.py ... run`.
+     - Map `testResults` in `answers/TASK-02/submit.json` 1-to-1 to the exact evidence files required by the template, and capture any required screenshots in a single `project_runtime.py ... session` pass.
+   - **`TASK-03` (Data Consistency / Heatmap Calculation with Official Fixture)**:
+     - **NO browser, NO web server!**
+     - Check `answers/TASK-03/evidence/task-03-test-data.json` (pre-fetched by Root from the QA store). Never overwrite an official fixture with synthetic data.
+     - Compute the exact metrics required by `challenge/TASK-03.md` and `challenge/TASK-03-submit.schema.json`, write the calculation log to `answers/TASK-03/evidence/`, populate `answers/TASK-03/submit.json` (`status: "DONE"`), commit, and finish in < 90s.

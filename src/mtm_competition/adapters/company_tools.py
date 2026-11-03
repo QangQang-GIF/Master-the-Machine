@@ -66,10 +66,43 @@ class CompanyToolsClient:
         self._tools: List[Dict[str, Any]] = []
         self._cache: Dict[str, Any] = {}
         self._rpc_id = 0
+        self._mcp_session_id: Optional[str] = None
 
     def _next_rpc_id(self) -> int:
         self._rpc_id += 1
         return self._rpc_id
+
+    @staticmethod
+    def _parse_rpc_response(raw_text: str) -> Dict[str, Any]:
+        """Parse either standard application/json or text/event-stream SSE JSON-RPC response."""
+        text = raw_text.strip()
+        if not text:
+            return {}
+        try:
+            parsed = json.loads(text)
+            if isinstance(parsed, dict):
+                return parsed
+        except Exception:
+            pass
+
+        last_obj: Dict[str, Any] = {}
+        for line in text.splitlines():
+            stripped = line.strip()
+            if stripped.startswith("data:"):
+                payload_str = stripped[5:].strip()
+                if not payload_str or payload_str == "[DONE]":
+                    continue
+                try:
+                    candidate = json.loads(payload_str)
+                    if isinstance(candidate, dict):
+                        last_obj = candidate
+                        if "result" in candidate or "error" in candidate:
+                            return candidate
+                except Exception:
+                    continue
+        if last_obj:
+            return last_obj
+        raise ValueError(f"Unable to parse Match MCP response: {text[:300]}")
 
     def _send_rpc(self, method: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         """Send JSON-RPC request to Match MCP endpoint."""
@@ -80,21 +113,30 @@ class CompanyToolsClient:
             "params": params or {},
         }
         data = json.dumps(rpc_payload).encode("utf-8")
+        headers = {
+            "Content-Type": "application/json",
+            "Accept": "application/json, text/event-stream",
+            "Authorization": f"Bearer {self.api_key}",
+            "User-Agent": "MTM-Player-TeamBridge/1.0",
+        }
+        if self._mcp_session_id:
+            headers["Mcp-Session-Id"] = self._mcp_session_id
+
         req = urllib.request.Request(
             self.endpoint,
             data=data,
-            headers={
-                "Content-Type": "application/json",
-                "Authorization": f"Bearer {self.api_key}",
-                "User-Agent": "MTM-Player-TeamBridge/1.0",
-            },
+            headers=headers,
             method="POST",
         )
 
         try:
             with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+                if hasattr(resp, "headers") and resp.headers:
+                    sid = resp.headers.get("Mcp-Session-Id") or resp.headers.get("mcp-session-id")
+                    if sid:
+                        self._mcp_session_id = sid
                 resp_bytes = resp.read()
-                return json.loads(resp_bytes.decode("utf-8"))
+                return self._parse_rpc_response(resp_bytes.decode("utf-8", errors="replace"))
         except urllib.error.HTTPError as exc:
             err_body = exc.read().decode("utf-8", errors="replace")
             raise RuntimeError(f"Match MCP HTTP {exc.code} {exc.reason}: {err_body}") from exc
@@ -162,17 +204,22 @@ class CompanyToolsClient:
             err_msg = err_info.get("message") if isinstance(err_info, dict) else str(err_info)
             raise RuntimeError(f"Tool '{name}' returned business error: {err_msg or result_obj}")
 
-        # Extract content
+        # Extract content (unwrap up to 2 nested MCP text envelopes if present)
         parsed_result: Any = result_obj
-        content_list = result_obj.get("content")
-        if isinstance(content_list, list) and content_list:
-            first = content_list[0]
-            if isinstance(first, dict) and first.get("type") == "text":
-                text_val = first.get("text", "")
-                try:
-                    parsed_result = json.loads(text_val)
-                except Exception:
-                    parsed_result = text_val
+        for _ in range(2):
+            if isinstance(parsed_result, dict) and isinstance(parsed_result.get("content"), list) and parsed_result["content"]:
+                first = parsed_result["content"][0]
+                if isinstance(first, dict) and first.get("type") == "text" and "text" in first:
+                    text_val = first.get("text", "")
+                    try:
+                        parsed_result = json.loads(text_val)
+                    except Exception:
+                        parsed_result = text_val
+                        break
+                else:
+                    break
+            else:
+                break
 
         # Calculate response hash
         res_hash = hashlib.sha256(json.dumps(parsed_result, sort_keys=True, default=str).encode("utf-8")).hexdigest()

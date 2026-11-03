@@ -1,24 +1,34 @@
 ---
 name: mtm-cr-worker
-description: Implement and verify an announced MTM change request against specification and MVS.
+description: Implement and verify an announced MTM change request against specification and MVS inside the ProjectRuntime sandbox.
 ---
 
-# CR (Change Request)
+# CR (Change Request — Sandbox Fast Path)
 
 Follow `mtm-init` and `mtm-worker`. Root owns Start Work, integration, push, and Submit.
 
-1. Always run `pnpm exec prisma generate` in `src/` before running any test or seed script.
-2. Ingestion & Official Data:
-   - Identify if the CR requires test fixtures, schemas, or seed data. Call `fetch_fixture` or query the official Match MCP QA tool.
-   - If the CR mentions company policies or standards (e.g. KB-*), query the `kb` tool via `call_company_tool` before implementing logic.
-   - NEVER generate synthetic test fixtures under official fixture filenames (`answers/<key>/evidence/*-test-data.json`).
-3. Implementation:
-   - Implement acceptance criteria cleanly extending existing controllers, routers, services, and UI components.
-   - Guard against common edge cases: international currency formatting, special characters, whitespace trimming, timezones, and null/empty handling.
-4. Verification & Testing:
-   - Verify positive, boundary, and regression cases. Run existing test suite to ensure zero regressions across other items.
-   - For UI MVS scenarios: Cap browser operations at 60s max. Use DOM evaluate click (`await page.locator(...).evaluate(el => el.click())`) to avoid navigation interception.
-   - If browser UI capture is unavailable or times out: Mark the UI scenario `NOT_RUN` with clear diagnostic notes in `testResults`. Never fabricate fake placeholder PNGs.
-5. Submission:
-   - Fill `answers/<key>/submit.json` and generate `worker_result.json` with status `READY_FOR_REVIEW` (or `PARTIAL` if partially completed).
-   - NEVER mark `BLOCKED` or `TIMED_OUT` when working code changes or logs exist. Submit before deadline to claim maximum points!
+1. **Mandatory Sandbox Commands**:
+   - Run all CLI/test/seed/check-runner commands via:
+     `python3 "<metadata.project_runtime_path>" --match-root "<match_root>" --match-id "<metadata.match_id>" --worker-id "<worker_id>" run -- <cmd>`
+   - Run all browser/HTTP checks via:
+     `python3 "<metadata.project_runtime_path>" --match-root "<match_root>" --match-id "<metadata.match_id>" --worker-id "<worker_id>" session -- <cmd>`
+   - NEVER manually spawn `pnpm dev`, `pnpm build`, or `pnpm start`.
+
+2. **Fast Paths by CR Archetype**:
+   - **`CR-01` (Invoices CSV Export / Client CSV Import)**:
+     - Verify `answers/CR-01/evidence/cr-01-test-data.json` exists (pre-fetched by Root; NEVER overwrite with synthetic data).
+     - Copy `challenge/CR-01-seed.ts` to `src/prisma/seed-cr01.ts` and run `pnpm tsx prisma/seed-cr01.ts ../answers/CR-01/evidence/cr-01-test-data.json` via `project_runtime.py ... run` to load the official fixture companies and invoices into the database. (Remove `src/prisma/seed-cr01.ts` before `git commit`).
+     - Implement the required feature and unit tests in `src/`.
+     - Run `node ../challenge/CR-01-run-checks.mjs` via `project_runtime.py ... run` to generate `answers/CR-01/evidence/test.log` and `answers/CR-01/evidence/typecheck.log`.
+     - In ONE `project_runtime.py ... session` pass:
+       1. Execute `node ../challenge/CR-01-signed-out-check.mjs http://127.0.0.1:$PORT/api/trpc/accounting.invoices ../answers/CR-01/evidence/tc-04-signed-out-request.txt`.
+       2. Export `tc-01-all-invoices.csv` (all 6 fixture invoices) and `tc-02-filtered-invoices.csv` (filtered to `OVERDUE`).
+       3. Capture `tc-01-accounting-page.png` and `tc-02-filtered-export.png` at `{ width: 1440, height: 900 }`.
+   - **`CR-02` (Accounts Receivable Aging Report) & `CR-03` (Quick-Action Contact Links)**:
+     - **CRITICAL**: Always copy `challenge/CR-02-mvs.test.ts` -> `src/tests/cr-02-mvs.test.ts` (or `challenge/CR-03-mvs.test.ts` -> `src/tests/cr-03-mvs.test.ts`) and include it in your `git commit`! The Grader checks that `src/tests/cr-02-mvs.test.ts` / `src/tests/cr-03-mvs.test.ts` is committed.
+     - Implement the pure calculation/component logic in `src/`.
+     - Run `node ../challenge/CR-02-run-checks.mjs` (or `CR-03-run-checks.mjs`) via `project_runtime.py ... run` so `test.log` and `typecheck.log` are generated with exact headers.
+     - Run ONE 15-second `project_runtime.py ... session` script at `{ width: 1440, height: 900 }` to capture `tc-01-aging-report.png` (or `tc-01-contact-links.png`).
+
+3. **Submission**:
+   - Fill `answers/<key>/submit.json` (`status: "DONE"` when all MVS pass, or `"PARTIAL"` if any scenario is `NOT_RUN`), commit all changes in your worktree, and write `worker_result.json` with `status: "READY_FOR_REVIEW"`.

@@ -430,6 +430,7 @@ class NativeTaskCoordinator:
                 if not worker_match.resolve().is_relative_to(target) or not worker_match.is_dir():
                     raise NativeCoordinationError("Assigned repository folder missing in worker worktree")
                 self._materialize_start_files(key, details, worker_match)
+                self._provision_worker_sandbox(worker_match)
             except Exception as exc:
                 # Preserve a worktree created before a filesystem/materialization failure.
                 # Never leave a silently reusable QUEUED task pointing at unknown residue.
@@ -535,6 +536,41 @@ class NativeTaskCoordinator:
                 raise NativeCoordinationError("Submit template follows an escaping symlink")
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_text(json.dumps(template, indent=2), encoding='utf-8')
+        # Copy pre-fetched official QA fixtures/sidecars from root answers/<key>/evidence if present
+        source_evidence = self.match_root / "answers" / key / "evidence"
+        if source_evidence.is_dir() and source_evidence.resolve().is_relative_to(self.match_root.resolve()):
+            for ev_file in source_evidence.iterdir():
+                if not ev_file.is_file() or ev_file.is_symlink() or ev_file.stat().st_size > 10_000_000:
+                    continue
+                target_ev = destination(f"answers/{key}/evidence/{ev_file.name}")
+                if not target_ev.exists():
+                    target_ev.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copyfile(ev_file, target_ev)
+        # Auto-stage official challenge/<KEY>-mvs.test.ts to src/tests/<key.lower()>-mvs.test.ts when src/ exists
+        mvs_challenge_test = worker_match / "challenge" / f"{key}-mvs.test.ts"
+        if mvs_challenge_test.is_file() and (worker_match / "src").is_dir():
+            mvs_dst = destination(f"src/tests/{key.lower()}-mvs.test.ts")
+            if not mvs_dst.exists():
+                mvs_dst.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(mvs_challenge_test, mvs_dst)
+
+    def _provision_worker_sandbox(self, worker_match: Path) -> None:
+        """Link shared read-only dependencies (src/node_modules) into worker worktree for zero-latency sandbox execution."""
+        src_nm = self.match_root / "src" / "node_modules"
+        dst_nm = worker_match / "src" / "node_modules"
+        if src_nm.is_dir() and (worker_match / "src").is_dir() and not dst_nm.exists() and not dst_nm.is_symlink():
+            try:
+                if os.name == "nt":
+                    subprocess.run(
+                        ["cmd", "/c", "mklink", "/J", str(dst_nm), str(src_nm)],
+                        capture_output=True,
+                        timeout=10,
+                        check=False,
+                    )
+                else:
+                    os.symlink(src_nm, dst_nm, target_is_directory=True)
+            except Exception:
+                pass
 
     def task_details(self, key: str) -> dict[str, Any]:
         with self._db() as db:

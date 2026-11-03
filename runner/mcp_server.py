@@ -224,6 +224,7 @@ class MCPHelperServer:
         backlog_item_key: str,
         tool_name: Optional[str] = None,
         arguments: Optional[Dict[str, Any]] = None,
+        write_to_disk: bool = True,
     ) -> Dict[str, Any]:
         """
         Fetch authoritative QA test data fixture from Match MCP and save with source metadata.
@@ -251,49 +252,141 @@ class MCPHelperServer:
         if not target_tool:
             return {"status": "UNAVAILABLE", "reason": "No QA test data tool found in company tools list"}
 
-        args = dict(arguments or {})
-        if "backlogItemKey" not in args and "item_id" not in args and "key" not in args:
-            args["backlogItemKey"] = backlog_item_key
-            args["item_id"] = backlog_item_key
+        tool_meta = next((t for t in tools if isinstance(t, dict) and t.get("name") == target_tool), {})
+        schema_props = ((tool_meta.get("inputSchema") or {}).get("properties") or {}) if isinstance(tool_meta, dict) else {}
 
-        try:
-            raw_data = self.company_tools_client.call_tool(target_tool, args)
-        except Exception as exc:
-            return {"status": "ERROR", "reason": f"Tool '{target_tool}' call failed: {exc}"}
+        candidate_args: List[Dict[str, Any]] = []
+        if arguments:
+            candidate_args.append(dict(arguments))
+        else:
+            if "backlogItemKey" in schema_props and "item_id" not in schema_props:
+                candidate_args.append({"backlogItemKey": backlog_item_key})
+            elif "item_id" in schema_props and "backlogItemKey" not in schema_props:
+                candidate_args.append({"item_id": backlog_item_key})
+            elif "key" in schema_props:
+                candidate_args.append({"key": backlog_item_key})
+            candidate_args.extend([
+                {"backlogItemKey": backlog_item_key},
+                {"backlogItemKey": backlog_item_key, "item_id": backlog_item_key},
+                {"item_id": backlog_item_key},
+                {"key": backlog_item_key},
+            ])
+
+        raw_data = None
+        used_args: Dict[str, Any] = candidate_args[0] if candidate_args else {"backlogItemKey": backlog_item_key}
+        last_err: Optional[Exception] = None
+        seen_arg_keys = set()
+        for cand in candidate_args:
+            sig = json.dumps(cand, sort_keys=True)
+            if sig in seen_arg_keys:
+                continue
+            seen_arg_keys.add(sig)
+            try:
+                res_data = self.company_tools_client.call_tool(target_tool, cand)
+                if res_data:
+                    raw_data = res_data
+                    used_args = cand
+                    break
+            except Exception as exc:
+                last_err = exc
+                continue
+
+        if raw_data is None and last_err is not None:
+            return {"status": "ERROR", "reason": f"Tool '{target_tool}' call failed: {last_err}"}
 
         if not raw_data:
             return {"status": "UNAVAILABLE", "reason": f"Tool '{target_tool}' returned empty payload"}
 
-        evidence_dir = Path(self.match_root) / "answers" / backlog_item_key / "evidence"
-        evidence_dir.mkdir(parents=True, exist_ok=True)
         fixture_filename = f"{backlog_item_key.lower()}-test-data.json"
-        fixture_path = evidence_dir / fixture_filename
+        rel_fixture_path = f"answers/{backlog_item_key}/evidence/{fixture_filename}"
+        rel_sidecar_path = f"answers/{backlog_item_key}/evidence/{fixture_filename}.source.json"
 
         raw_json_str = json.dumps(raw_data, indent=2, ensure_ascii=False) if isinstance(raw_data, (dict, list)) else str(raw_data)
         if "{{" in raw_json_str:
             return {"status": "INVALID", "reason": "Fetched fixture contains unrendered template placeholders '{{'"}
 
-        fixture_path.write_text(raw_json_str, encoding="utf-8")
-        file_sha = hashlib.sha256(fixture_path.read_bytes()).hexdigest()
-
-        sidecar_path = evidence_dir / f"{fixture_filename}.source.json"
+        file_sha = hashlib.sha256(raw_json_str.encode("utf-8")).hexdigest()
         sidecar_data = {
             "tool": target_tool,
-            "arguments": args,
+            "arguments": used_args,
             "sha256": file_sha,
             "fetchedAt": datetime.now(timezone.utc).isoformat(),
             "backlogItemKey": backlog_item_key,
             "official": True,
         }
-        sidecar_path.write_text(json.dumps(sidecar_data, indent=2), encoding="utf-8")
+        sidecar_json_str = json.dumps(sidecar_data, indent=2)
+
+        if write_to_disk:
+            evidence_dir = Path(self.match_root) / "answers" / backlog_item_key / "evidence"
+            evidence_dir.mkdir(parents=True, exist_ok=True)
+            fixture_path = evidence_dir / fixture_filename
+            sidecar_path = evidence_dir / f"{fixture_filename}.source.json"
+            fixture_path.write_text(raw_json_str, encoding="utf-8")
+            sidecar_path.write_text(sidecar_json_str, encoding="utf-8")
 
         return {
             "status": "FETCHED",
-            "path": str(fixture_path.relative_to(self.match_root)),
-            "sidecar": str(sidecar_path.relative_to(self.match_root)),
+            "path": rel_fixture_path,
+            "sidecar": rel_sidecar_path,
             "sha256": file_sha,
             "tool": target_tool,
+            "content": raw_json_str,
+            "sidecar_content": sidecar_json_str,
         }
+
+    def prefetch_company_context(self, backlog_item_key: str, description_text: str = "") -> Dict[str, Any]:
+        """Auto-prefetch relevant KB standards and production logs from Match MCP for a task."""
+        context: Dict[str, Any] = {"kb": [], "logs": []}
+        if not self.company_tools_client:
+            self._init_company_tools()
+        if not self.company_tools_client:
+            return context
+
+        tools = self.list_company_tools()
+        kb_tools = [t for t in tools if isinstance(t, dict) and t.get("category") == "kb"]
+        log_tools = [t for t in tools if isinstance(t, dict) and t.get("category") == "logs"]
+
+        if kb_tools:
+            kb_tool_name = kb_tools[0]["name"]
+            kb_props = ((kb_tools[0].get("inputSchema") or {}).get("properties") or {})
+            queries: List[str] = []
+            for kb_id in re.findall(r"\bKB-\d+\b", description_text or "", flags=re.IGNORECASE):
+                q = kb_id.upper()
+                if q not in queries:
+                    queries.append(q)
+            desc_lower = f"{backlog_item_key} {description_text}".lower()
+            for kw in ("currency", "invoice", "csv", "import", "aging", "contact", "overdue", "heatmap", "export", "position"):
+                if kw in desc_lower and kw not in queries:
+                    queries.append(kw)
+            if not queries:
+                queries.append(backlog_item_key)
+
+            param_key = "query"
+            for candidate_key in ("query", "keyword", "search", "id", "topic", "term"):
+                if candidate_key in kb_props:
+                    param_key = candidate_key
+                    break
+
+            for q in queries[:3]:
+                try:
+                    res = self.company_tools_client.call_tool(kb_tool_name, {param_key: q})
+                    if res:
+                        context["kb"].append({"query": q, "tool": kb_tool_name, "result": res})
+                except Exception:
+                    continue
+
+        if log_tools and (backlog_item_key.upper().startswith("PI-") or "incident" in (description_text or "").lower()):
+            log_tool_name = log_tools[0]["name"]
+            for log_args in ({"backlogItemKey": backlog_item_key}, {"query": backlog_item_key}, {}):
+                try:
+                    res = self.company_tools_client.call_tool(log_tool_name, log_args)
+                    if res:
+                        context["logs"].append({"tool": log_tool_name, "arguments": log_args, "result": res})
+                        break
+                except Exception:
+                    continue
+
+        return context
 
     def _get_backlog_title(self, key: str) -> str:
         item = self.known_backlog_items.get(key, {})
@@ -1102,9 +1195,17 @@ class MCPHelperServer:
                 if "unavailableAnnouncedFiles" in result and challenge_rel in result["unavailableAnnouncedFiles"]:
                     result["unavailableAnnouncedFiles"].remove(challenge_rel)
 
-            # Attempt official QA test fixture fetching via company tools (no synthetic generation!)
+            # Attempt official QA test fixture & company context fetching via company tools (no synthetic generation!)
             try:
-                self.fetch_fixture(backlog_item_key)
+                fixture_res = self.fetch_fixture(backlog_item_key, write_to_disk=not bool(self.native))
+                if fixture_res.get("status") == "FETCHED" and fixture_res.get("content"):
+                    result.setdefault("files", {})[fixture_res["path"]] = fixture_res["content"]
+                    if fixture_res.get("sidecar") and fixture_res.get("sidecar_content"):
+                        result["files"][fixture_res["sidecar"]] = fixture_res["sidecar_content"]
+                desc_for_kb = (result.get("files") or {}).get(challenge_rel, "")
+                company_ctx = self.prefetch_company_context(backlog_item_key, desc_for_kb)
+                if company_ctx.get("kb") or company_ctx.get("logs"):
+                    result["companyContext"] = company_ctx
             except Exception:
                 pass
 
@@ -1147,6 +1248,8 @@ class MCPHelperServer:
             delivered_files = result.get("files")
             if isinstance(delivered_files, dict):
                 for rel_path, file_content in delivered_files.items():
+                    if self.native and str(rel_path).startswith("answers/"):
+                        continue
                     try:
                         target_file = self.match_root / rel_path
                         from mtm_competition.integration.git_guard import is_forbidden_path
@@ -1505,17 +1608,45 @@ class MCPHelperServer:
             else:
                 raise
 
-        # Inject company tools catalog into TaskEnvelope metadata
+        # Inject company tools catalog and pre-fetched fixtures/KB into TaskEnvelope metadata & worker worktree
         if isinstance(res, dict) and "taskEnvelope" in res and isinstance(res["taskEnvelope"], dict):
             env = res["taskEnvelope"]
             meta = env.setdefault("metadata", {})
-            # Ensure tools catalog is refreshed
             tools = self.list_company_tools()
             meta["company_tools"] = [
                 {"name": t["name"], "category": t.get("category", "other"), "description": t.get("description", "")}
                 for t in tools
             ]
             meta["company_tools_help"] = "Use call_company_tool(name, arguments) or CLI `python -m runner.control company call <name> '<json_args>'` to query official KB, QA store, and production logs."
+
+            worker_match_str = res.get("matchRoot") or res.get("match_root")
+            if worker_match_str:
+                worker_match = Path(worker_match_str)
+                fixture_filename = f"{backlog_item_key.lower()}-test-data.json"
+                worker_fixture_path = worker_match / "answers" / backlog_item_key / "evidence" / fixture_filename
+                if not worker_fixture_path.exists():
+                    try:
+                        fx = self.fetch_fixture(backlog_item_key, write_to_disk=False)
+                        if fx.get("status") == "FETCHED" and fx.get("content"):
+                            worker_fixture_path.parent.mkdir(parents=True, exist_ok=True)
+                            worker_fixture_path.write_text(fx["content"], encoding="utf-8")
+                            if fx.get("sidecar_content"):
+                                (worker_fixture_path.parent / f"{fixture_filename}.source.json").write_text(
+                                    fx["sidecar_content"], encoding="utf-8"
+                                )
+                    except Exception:
+                        pass
+
+            start_ctx = (meta.get("start_details") or {}).get("companyContext")
+            if start_ctx:
+                meta["company_context"] = start_ctx
+            else:
+                try:
+                    ctx = self.prefetch_company_context(backlog_item_key, env.get("description", ""))
+                    if ctx.get("kb") or ctx.get("logs"):
+                        meta["company_context"] = ctx
+                except Exception:
+                    pass
         return res
 
     def record_worker_result(self, backlog_item_key: str, worker_result: Dict[str, Any]) -> Dict[str, Any]:
