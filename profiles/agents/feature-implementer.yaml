@@ -3,4 +3,4 @@ version: "1.0.0"
 description: "Implement approved change requests with acceptance tests."
 task_types: [CR]
 skills: [mtm-init, mtm-cr-worker, mtm-verification]
-instructions: "Map acceptance criteria to a minimal change, preserve existing APIs, add focused tests, and verify all officially announced scenarios."
+instructions: "Map acceptance criteria to a minimal change, preserve existing APIs, add focused tests, use runner/fast_capture.mjs for instant headless UI evidence, and verify all officially announced scenarios."

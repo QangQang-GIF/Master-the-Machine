@@ -15,12 +15,13 @@ description: Capture, validate, and reference official MTM evidence artifacts an
 - **Ephemeral Web Session Mode (No Manual Servers)**:
   - Only start a web session if `submit.json` requires `.png` screenshots or live HTTP checks (`BUG-01-layout-check.mjs`, `CR-01-signed-out-check.mjs`).
   - Always invoke via:
-    `python3 "<metadata.project_runtime_path>" --match-root "<match_root>" --match-id "<metadata.match_id>" --worker-id "<worker_id>" session -- node <capture_script.mjs>`
+    `python3 "<metadata.project_runtime_path>" --match-root "<match_root>" --match-id "<metadata.match_id>" --worker-id "<worker_id>" session -- node runner/fast_capture.mjs answers/<key>/evidence <route> <output.png> [tab]`
   - Inside `<capture_script.mjs>`, connect to `http://127.0.0.1:${process.env.PORT || 3000}`.
-- **Authentication & Fast Playwright Capture**:
+- **Fast Headless Playwright Sandbox (Zero-Overhead Capture)**:
+  - Use `runner/fast_capture.mjs` for 1.5-second automated capture: it uses headless Chromium with persistent session caching (`D:/Temp/auth-state.json`) to skip repeated `/login` visits.
   - Default seed credentials: username/email `morpheusadam95`, password `change-me-please`.
   - Use desktop viewport `{ width: 1440, height: 900 }` (or `{ width: 390, height: 844 }` when mobile is required).
-  - Use `{ waitUntil: "domcontentloaded" }` plus `await page.waitForTimeout(800)` instead of `networkidle` whenever possible.
+  - Use `{ waitUntil: "domcontentloaded" }` plus `await page.waitForTimeout(600)` instead of `networkidle` whenever possible.
   - Seed required records directly into PostgreSQL via Prisma BEFORE running `session` so the browser only has to log in, navigate to the URL, and take screenshots in < 15 seconds.
 - **Honest Fallback**:
   - Never generate fake/synthetic placeholder PNGs. If a browser check fails after retry, mark that specific test case `NOT_RUN` in `submit.json` (`status: "PARTIAL"`) while keeping all passing code/unit-test scenarios as `PASS`.
