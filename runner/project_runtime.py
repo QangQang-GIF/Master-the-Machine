@@ -100,6 +100,15 @@ class ProjectRuntime:
     def _build_env(self) -> dict[str, str]:
         # Shell/process configuration is the caller's final override over files.
         env = {**self._raw_env, **os.environ}
+        d_temp = Path("D:/Temp")
+        if d_temp.is_dir():
+            env["TEMP"] = str(d_temp)
+            env["TMP"] = str(d_temp)
+            env["TMPDIR"] = str(d_temp)
+            env.setdefault("PRISMA_ENGINES_CACHE_DIR", str(d_temp / "prisma"))
+            env.setdefault("npm_config_cache", str(d_temp / "npm-cache"))
+            env.setdefault("UV_CACHE_DIR", str(d_temp / "uv"))
+            env.setdefault("PIP_CACHE_DIR", str(d_temp / "pip"))
         if self._placeholder(env.get("AUTH_SECRET", "")):
             env["AUTH_SECRET"] = secrets.token_urlsafe(48)
         port_hash = hashlib.sha256(f"{self.match_id}:{self.worker_id}".encode()).digest()
