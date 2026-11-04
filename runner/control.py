@@ -43,7 +43,8 @@ class ControlBridge:
         names = {"backlogItemKey": "backlog_item_key", "workerId": "worker_id",
                  "estimatedSeconds": "estimated_seconds", "workerResult": "worker_result",
                  "clientSubmissionId": "client_submission_id", "gitRevision": "git_revision",
-                 "timeoutMs": "timeout_ms", "confirmedStopped": "confirmed_stopped"}
+                 "timeoutMs": "timeout_ms", "confirmedStopped": "confirmed_stopped",
+                 "forcePartial": "force_partial"}
         return getattr(self.server, operation)(**{names.get(k, k): v for k, v in args.items()})
 
     def reply(self, request: dict[str, Any]) -> str:

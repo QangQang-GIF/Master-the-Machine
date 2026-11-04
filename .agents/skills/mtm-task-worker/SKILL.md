@@ -10,7 +10,7 @@ Follow `mtm-init` and `mtm-worker`. Root owns Start Work, integration, push, and
 1. **Mandatory Sandbox Commands**:
    - Run all CLI/test/check commands via:
      `python3 "<metadata.project_runtime_path>" --match-root "<match_root>" --match-id "<metadata.match_id>" --worker-id "<worker_id>" run -- <cmd>`
-   - Only use `project_runtime.py ... session` if `submit.json` explicitly requires `.png` screenshot evidence!
+   - Only use `session-start` + `capture_multi.mjs` if `submit.json` explicitly requires `.png` screenshot evidence!
 
 2. **Fast Paths by TASK Archetype**:
    - **`TASK-01` / `TASK-04` (Code Trace / Reorder Position / Overdue Reminder Dry-Run)**:
@@ -19,7 +19,7 @@ Follow `mtm-init` and `mtm-worker`. Root owns Start Work, integration, push, and
      - For Kanban card reorder midpoint (`Cards A=65536, B=131072, C=196608`, moving C between A and B): midpoint is `"98304"`.
    - **`TASK-02` (Dependency Audit / Workload Heatmap)**:
      - If `challenge/TASK-02-run-checks.mjs` exists, run `node ../challenge/TASK-02-run-checks.mjs ../answers/TASK-02/evidence` via `project_runtime.py ... run`.
-     - Map `testResults` in `answers/TASK-02/submit.json` 1-to-1 to the exact evidence files required by the template, and capture any required screenshots in a single `project_runtime.py ... session` pass.
+     - Map `testResults` in `answers/TASK-02/submit.json` 1-to-1 to the exact evidence files required by the template, and capture any required screenshots in a single `capture_multi.mjs` pass (after `session-start`).
    - **`TASK-03` (Data Consistency / Heatmap Calculation with Official Fixture)**:
      - **NO browser, NO web server!**
      - Check `answers/TASK-03/evidence/task-03-test-data.json` (pre-fetched by Root from the QA store). Never overwrite an official fixture with synthetic data.

@@ -8,5 +8,6 @@ Use the registered team_repo_scout, team_feature_worker, and team_quality_checke
 Do not launch another Codex CLI, Claude Code CLI, app-server, or independent CLI process for match work.
 Keep credentials in MCP Helper memory; append required events to the exact progressLogFile.
 Own integration, Git actions, submissions, receipts, and final decisions.
+Loop: dispatch_ready() -> spawn every spawn[] worker -> wait_for_update() -> finalize_item() for each finished worker; never capture evidence yourself.
 Honor pause/end immediately; do not self-respawn or resume.
 """

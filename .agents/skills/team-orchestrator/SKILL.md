@@ -9,35 +9,24 @@ Player owns this single Codex session. Use only native subagents for match worke
 
 For PREPARE/RESUME, follow `game-preparation`/`team-recovery`. For `START_GAME`, call `configure_session(descriptor)`, `login_match()` as needed, then `refresh_match()`. Use native MCP or the same persistent `runner.control` stdio bridge described in preparation; keep its session alive across phases. Missing MCP discovery does not mean contest APIs are unavailable. Both transports use identical deterministic guards, journal and progress logger. Never handwrite unvalidated status or fabricate readiness. Append validated events to the exact progress log with business keys.
 
-## Scheduling loop
+## Scheduling loop (code decides, root spawns)
 
-1. Refresh the public match projection throughout play; new items can appear at any time. Trust server status/time, including pause-adjusted deadlines. Discover all visible items and report status. Continue until FINISHED, even when the current queue is empty.
-2. **4-Worker Architecture & Deadline-First Scheduling (`plan_tasks()`)**:
-   - Total capacity is 4 concurrent workers (`max_workers=4`, `normal_workers=3`).
-   - **Slot 1 (Dedicated PI / Fast-track)**: 1 worker slot is strictly reserved for Product Incidents (PI). Because PI scores decay with time and compete for the 1st place badge, any incoming PI task is dispatched immediately into this reserved slot with 0 wait time.
-   - **3 General Workers (Open Parallel Pool)**: The remaining 3 workers run at 100% capacity on the general backlog. Eliminate all score/ROI-based prioritization: all general tasks are of equal value since the objective is 1000/1000 points within the match limit.
-   - **Preemptive Deadline Priority on Worker Completion**: When any general worker finishes and frees up a slot, if the backlog contains any task with an active countdown deadline (e.g. `BUG-02`, `TASK-03`), the orchestrator MUST dispatch that deadline task FIRST before any timeless task.
-   - Do not wait for long workers or a batch to finish before checking releases or submitting ready items. Wait only with bounded `wait_for_update(timeoutMs)`/native waits that return before the next dispatch/deadline check.
-3. For each selected OPEN item, call `start_work(backlogItemKey)` and retain its exact template/MVS. The helper resolves only that item's publicly announced paths, including post-clone documents; never scan or checkout other tasks. `unavailableAnnouncedFiles` reports a declared path absent from the assigned branch without inventing its content. If official MVS/checkers and the task brief provide sufficient requirements, proceed from those; otherwise report the precise missing input. Then `claim_task(backlogItemKey, workerId, estimatedSeconds)` returns ownership/worktree and TaskEnvelope. Spawn the selected native worker with `fork_turns="none"`, sanitized envelope, owned paths/result location and needed skills. Never forward credentials. Source/answers use `worktreeRoot/repository.folder`; preserve the Git prefix and isolate test resources.
-4. Workers investigate, implement, verify, and return WorkerResult; they do not push or call Submit. Root calls `record_worker_result(backlogItemKey, workerResult)`.
-   - **Pipelined Dispatch (Mandatory)**: BEFORE integrating or submitting the completed item, immediately call `plan_tasks()`. If slots are available, immediately call `start_work` + `claim_task` and spawn the next worker. Always keep all worker slots 100% occupied. Workers must never wait for submissions to take on new tasks.
-   - For `overdueWorkers`, checkpoint/interrupt with native tools, confirm the worker stopped, then call `reconcile_worker` before retry/reassignment. Failed attempts report real diagnostics; retry only within budget. Never release a live worker's capacity or discard artifacts.
+1. **Lanes are enforced by code.** 5 workers: 3 normal slots for every ordinary item (deadline items first, then arrival order; no score/ROI ordering, all items get done) and 2 reserved slots used only by PI and Heavy items (`[Heavy Task]` title prefix or flagged by the planner). An idle reserved slot may be lent to an ordinary item whose deadline is within 180 seconds. Never re-order or override lanes by hand.
+2. **Dispatch:** call `dispatch_ready()`. For every `spawn[]` entry, immediately spawn one native worker with `fork_turns="none"`, passing its `taskEnvelope` (owned paths, result location, `selected_skills`). Spawn all entries before doing anything else. Items in `errors[]` are retried by the next dispatch. Never forward credentials. Source/answers use `worktreeRoot/repository.folder`. (`plan_tasks` → `start_work` → `claim_task` remain available only as a manual fallback.)
+3. **Wait:** block only in `wait_for_update(timeoutMs=55000)`. When it returns `UPDATED`, handle it in this order, then wait again:
+   - `dispatch.spawn[]` present → spawn each worker now.
+   - `worker_result_file` event → call `finalize_item(backlogItemKey)` immediately.
+   - `autoFinalized[]` → the item was already submitted by code before its deadline/match end; if `stopWorker` is true, stop that native worker now.
+   - `deadline_near` → no action needed; code finalizes at the cutoff.
+   Continue until FINISHED, even when the queue is empty.
+4. Workers investigate, implement, verify, commit in their worktree and write `worker_result.json`; they never push or submit.
+5. For `overdueWorkers`, checkpoint/interrupt with native tools, confirm the worker stopped, then call `reconcile_worker` before retry/reassignment. Failed attempts report real diagnostics; retry only within budget.
 
 ## Integration and submission
 
-**STRICT ROLE BOUNDARY & IMMEDIATE SUBMISSION (Root Orchestrator)**:
-- **No Idle Queues**: Con nào làm xong là phải nộp liền! As soon as a worker returns a result, immediately integrate and submit. Never let a completed worker wait in an integration queue while deadlines expire.
-- **Immediate Remediation on Submission Feedback**: If `submit_work` or Game Master returns ANY error (e.g. missing evidence file, schema mismatch, or parity error), DO NOT mark `BLOCKED` or abandon the task! Immediately remedy the issue: synthesize/capture the missing evidence file, update `submit.json`, commit, and re-submit immediately.
-- **Mandatory Submission Before Slot Reassignment**: An item MUST be successfully submitted (server receipt received) before reassigning that worker or releasing the item.
-- The Orchestrator integrates git: merge/cherry-pick -> verify/auto-heal submit.json & evidence -> git push -> `submit_work` RPC -> receive receipt.
-- The integration lock has an 8-second ceiling to ensure fast, pipelined submission without deadlocks.
-
-Serialize integration/push/Submit; workers continue independent work. Prioritize urgent ready items. Acquire `integration_gate(backlogItemKey, action="begin")` before integration. The root alone holds this lock through verification, push, and Submit. On failure, do not abandon: resolve missing files, auto-heal evidence, reconcile Git/push state, and re-submit; successful `submit_work` releases it on the real receipt. Verify the patch is confined to permitted paths, integrate into the assigned branch, resolve conflicts. Source, answers, and evidence stay under `matchRoot = checkoutRoot/repository.folder`.
-
-For every item, cover all required acceptance/MVS scenarios and exact evidence requirements, including requested before-change captures. All declared evidence files MUST exist as nonempty files in `answers/<key>/evidence/`. If browser capture times out or cannot settle, capture a diagnostic screenshot of the current app or write a diagnostic report; NEVER omit required evidence files from the commit.
-
-Fill `answers/<key>/submit.json` exactly from the received template. Before dispatch, deterministic guards verify answer/payload parity, complete passing required results, nonempty contained evidence in the exact commit tree, permitted diff, full SHA, assigned branch, ordinary push, and remote ref parity. Never force-push or alter immutable/secret/agent files.
-
-As soon as the item is verified, committed, and pushed, call `submit_work(clientSubmissionId, backlogItemKey, gitRevision, answer)` immediately without waiting for other items. Preserve the journal's canonical request bytes and idempotency identity across uncertainty; reconcile rather than submit a second solution. Record a real server receipt; ACCEPTED is not graded PASSED. Track grading and all item outcomes. A solved item left unsubmitted is unfinished work.
+- **`finalize_item(backlogItemKey)` is the only submission path for worker output.** It snapshots the worktree, makes `answers/<key>/submit.json` honest against the files on disk (missing evidence → that test `NOT_RUN`, item `PARTIAL`), cherry-picks into the assigned branch, pushes, and calls Submit under the integration lock. An unresolved in-flight journal entry is replayed byte-for-byte, never resubmitted with a new identity.
+- **Strict role boundary:** root never runs browsers, Playwright, dev servers or tests, never captures, regenerates or edits evidence, and never works in the main checkout on a worker's behalf. A worker result with missing evidence is submitted as PARTIAL by `finalize_item`; do not try to "fix" it.
+- If `finalize_item` reports a cherry-pick conflict or a guard rejection, keep the item visible: resolve the Git conflict minimally or re-dispatch the item to a worker; never fabricate files.
+- Deterministic guards verify answer/payload parity, passing required results, nonempty contained evidence in the exact commit tree, permitted diff, full SHA, assigned branch, ordinary push, and remote ref parity. Never force-push or alter immutable/secret/agent files. Record a real server receipt; ACCEPTED is not graded PASSED. A solved item left unsubmitted is unfinished work.
 
 On PAUSED, halt new work/submission dispatches and honor Player controls; on FINISHED stop descendants and finalize logs. CLOSED items are terminal; record and advance without retry loops. Keep unresolved blockers visible while other eligible tasks continue.

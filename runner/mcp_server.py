@@ -57,6 +57,34 @@ from runner.telemetry import (
 _SESSION_MEMORY: Dict[tuple[str, str], Dict[str, Any]] = {}
 
 
+def _lane_settings_from_env() -> Dict[str, Any]:
+    """Lane mode (reserved PI/Heavy slots) is enabled only when MTM_NATIVE_RESERVED_WORKERS > 0."""
+    def _int(name: str) -> Optional[int]:
+        raw = os.environ.get(name, "").strip()
+        try:
+            return int(raw) if raw else None
+        except ValueError:
+            return None
+    reserved = _int("MTM_NATIVE_RESERVED_WORKERS")
+    settings: Dict[str, Any] = {}
+    if reserved and reserved > 0:
+        settings["reserved_workers"] = reserved
+        settings["allow_reserved_borrow"] = os.environ.get("MTM_NATIVE_ALLOW_RESERVED_BORROW", "1") != "0"
+    keys = [k for k in os.environ.get("MTM_HEAVY_KEYS", "").split(",") if k.strip()]
+    if keys:
+        settings["heavy_keys"] = keys
+    raw_diff = os.environ.get("MTM_HEAVY_MIN_DIFFICULTY", "").strip()
+    if raw_diff:
+        try:
+            settings["heavy_min_difficulty"] = float(raw_diff)
+        except ValueError:
+            pass
+    heavy_max = _int("MTM_HEAVY_MAX_SECONDS")
+    if heavy_max and heavy_max > 0:
+        settings["heavy_max_seconds"] = heavy_max
+    return settings
+
+
 def _epoch(value: Any) -> Optional[float]:
     if isinstance(value, (int, float)) and not isinstance(value, bool):
         return float(value) / 1000 if value > 1e12 else float(value)
@@ -614,6 +642,7 @@ class MCPHelperServer:
                 repository_folder=folder, match_id=str(self.match_code),
                 max_workers=int(os.environ.get("MTM_NATIVE_MAX_WORKERS", "4")),
                 normal_workers=int(os.environ.get("MTM_NATIVE_NORMAL_WORKERS", "3")),
+                **_lane_settings_from_env(),
             )
             self._reconcile_native_receipts()
 
@@ -1326,14 +1355,25 @@ class MCPHelperServer:
                         git_revision = rev_res.stdout.strip()
 
                 if not self.descriptor.get("offline"):
-                    subprocess.run(
-                        ["git", "-C", str(self.checkout_root), "pull", "--rebase", "origin", assigned_branch],
-                        capture_output=True, text=True, timeout=30
-                    )
-                    subprocess.run(
+                    # Push first; only rebase when the remote moved (saves a network round trip).
+                    pushed = subprocess.run(
                         ["git", "-C", str(self.checkout_root), "push", "origin", assigned_branch],
-                        capture_output=True, text=True, timeout=30
+                        capture_output=True, text=True, timeout=20
                     )
+                    if pushed.returncode != 0:
+                        subprocess.run(
+                            ["git", "-C", str(self.checkout_root), "pull", "--rebase", "origin", assigned_branch],
+                            capture_output=True, text=True, timeout=30
+                        )
+                        subprocess.run(
+                            ["git", "-C", str(self.checkout_root), "push", "origin", assigned_branch],
+                            capture_output=True, text=True, timeout=30
+                        )
+                        # A rebase rewrites the commit; submit the SHA that was actually pushed.
+                        rev_res = subprocess.run(["git", "-C", str(self.checkout_root), "rev-parse", "HEAD"],
+                                                 capture_output=True, text=True, timeout=10)
+                        if rev_res.returncode == 0 and rev_res.stdout.strip():
+                            git_revision = rev_res.stdout.strip()
             except Exception as e:
                 sys.stderr.write(f"Notice: Auto-commit/push before submit: {e}\n")
 
@@ -1597,6 +1637,195 @@ class MCPHelperServer:
         self.refresh_match()
         return self._native_coordinator().plan_tasks()
 
+    def dispatch_ready(self, estimated_seconds: int = 420) -> Dict[str, Any]:
+        """Start Work + claim every item the planner selects, in one call.
+
+        The root only has to spawn one native worker per returned envelope. Failures
+        on one item are reported in ``errors`` and never block the others.
+        """
+        native = self._native_coordinator()
+        self.refresh_match()
+        plan = native.plan_tasks()
+        spawn: List[Dict[str, Any]] = []
+        errors: List[Dict[str, Any]] = []
+        for task in plan.get("selected", []):
+            key = task["key"]
+            try:
+                details = native.task_details(key)
+                if not details.get("started"):
+                    self.start_work(key)
+                attempt = int(details["data"].get("attempt_number", 1))
+                worker_id = f"w-{key}-{attempt}"
+                estimate = int(task.get("estimated_seconds") or estimated_seconds)
+                claim = self.claim_task(key, worker_id, estimate)
+                envelope = claim.get("taskEnvelope", {})
+                spawn.append({"backlogItemKey": key, "workerId": worker_id,
+                              "lane": envelope.get("lane"), "heavy": envelope.get("heavy", False),
+                              "worktreeRoot": claim.get("worktreeRoot"), "matchRoot": claim.get("matchRoot"),
+                              "taskEnvelope": envelope})
+            except Exception as exc:
+                errors.append({"backlogItemKey": key, "reason": str(exc)[:300]})
+        after = native.plan_tasks()
+        return {"matchStatus": after.get("matchStatus"), "spawn": spawn, "errors": errors,
+                "availableSlots": after.get("availableSlots"), "lanes": after.get("lanes"),
+                "nextDeadlineSlack": after.get("nextDeadlineSlack"),
+                "active": after.get("active", []), "readyToIntegrate": after.get("readyToIntegrate", []),
+                "overdueWorkers": after.get("overdueWorkers", []),
+                "instruction": "Spawn one native worker per spawn[] entry now (fork_turns='none'), then wait_for_update."}
+
+    # ------------------------------------------------------------------ finalize_item
+
+    @staticmethod
+    def _git_run(cwd: Path, *args: str, timeout: int = 30) -> subprocess.CompletedProcess:
+        return subprocess.run(["git", "-C", str(cwd), *args], capture_output=True, text=True, timeout=timeout)
+
+    @staticmethod
+    def normalize_submit_answer(answer: Dict[str, Any], answers_dir: Path, force_partial: bool = False) -> Dict[str, Any]:
+        """Make submit.json honest against what is on disk; never invent evidence.
+
+        Evidence references to missing/empty files are dropped, the affected tests become
+        NOT_RUN, and the item is PARTIAL unless every test still passes.
+        """
+        answer = json.loads(json.dumps(answer or {}))
+
+        def present(rel: Any) -> bool:
+            if not isinstance(rel, str) or not rel or rel.startswith("/") or ".." in Path(rel).parts:
+                return False
+            target = answers_dir / rel
+            return target.is_file() and target.stat().st_size > 0
+
+        not_run: List[str] = []
+        if isinstance(answer.get("evidenceFiles"), list):
+            answer["evidenceFiles"] = [f for f in answer["evidenceFiles"] if present(f)]
+        all_pass = True
+        for test in answer.get("testResults") or []:
+            if not isinstance(test, dict):
+                continue
+            refs = test.get("evidence")
+            if isinstance(refs, list):
+                kept = [r for r in refs if present(r)]
+                if len(kept) != len(refs):
+                    test["evidence"] = kept
+                    if str(test.get("result", "")).upper() == "PASS" or not kept:
+                        test["result"] = "NOT_RUN"
+            if str(test.get("result", "")).upper() != "PASS":
+                all_pass = False
+                not_run.append(str(test.get("id", "")))
+        claimed = str(answer.get("status", "")).upper()
+        answer["status"] = "DONE" if (all_pass and not force_partial and claimed in ("DONE", "")) else "PARTIAL"
+        answer["_notRun"] = not_run
+        return answer
+
+    def _snapshot_worktree(self, worktree: Path, folder: str, key: str) -> Optional[str]:
+        """Commit the worker's current deliverables (tracked edits, src/, answers/<key>/)."""
+        paths = [f"{folder}/answers/{key}", f"{folder}/src"]
+        self._git_run(worktree, "add", "-u", "--", folder)
+        for p in paths:
+            if (worktree / p).exists():
+                self._git_run(worktree, "add", "-A", "--", p,
+                              f":(exclude){folder}/src/node_modules", f":(exclude){folder}/src/.next")
+        staged = self._git_run(worktree, "diff", "--cached", "--name-only")
+        if staged.stdout.strip():
+            self._git_run(worktree, "-c", "user.email=mtm-root@local", "-c", "user.name=MTM Root",
+                          "commit", "-m", f"{key}: finalize snapshot")
+        head = self._git_run(worktree, "rev-parse", "HEAD")
+        return head.stdout.strip() if head.returncode == 0 else None
+
+    def _stop_worker_session(self, worker_match: Path) -> None:
+        """Reap a background evidence server left by `project_runtime.py session-start`."""
+        try:
+            from runner.web_session import stop_recorded_session
+            stop_recorded_session(worker_match)
+        except Exception:
+            pass
+
+    def finalize_item(self, backlog_item_key: str, force_partial: bool = False) -> Dict[str, Any]:
+        """Snapshot worker -> honest submit.json -> cherry-pick -> push -> submit, in one call.
+
+        Used when a worker finishes (worker_result.json written) and, with force_partial,
+        automatically before a deadline: whatever is committed is submitted, missing
+        captures become NOT_RUN. An unresolved IN_FLIGHT journal entry is replayed exactly.
+        """
+        native = self._native_coordinator()
+        key = backlog_item_key
+        details = native.task_details(key)
+        phase = details["phase"]
+        if phase == "SUBMITTED":
+            return {"backlogItemKey": key, "status": "ALREADY_SUBMITTED", "receiptId": details.get("receiptId")}
+        if self.journal and self.match_uuid:
+            pending = self.journal.get_in_flight(self.match_uuid, key)
+            if pending and pending.get("request_body_bytes"):
+                body = json.loads(bytes(pending["request_body_bytes"]).decode("utf-8"))
+                receipt = self.submit_work(body["clientSubmissionId"], key, body["gitRevision"], body["answer"])
+                return {"backlogItemKey": key, "status": "SUBMITTED", "replayed": True, "receipt": receipt}
+        worktree_raw = details.get("worktreeRoot")
+        if not worktree_raw:
+            raise ValueError(f"{key} has no worker worktree to finalize (phase {phase})")
+        worktree = Path(worktree_raw)
+        folder = native.repository_folder
+        worker_match = worktree / folder
+        was_running = phase == "RUNNING"
+        answers_dir = worker_match / "answers" / key
+        answers_dir.mkdir(parents=True, exist_ok=True)
+        submit_path = answers_dir / "submit.json"
+        start_details = details["data"].get("start_details", {})
+        if submit_path.is_file():
+            try:
+                raw_answer = json.loads(submit_path.read_text(encoding="utf-8"))
+            except ValueError:
+                raw_answer = dict(start_details.get("submitTemplate") or {})
+                force_partial = True
+        else:
+            raw_answer = dict(start_details.get("submitTemplate") or {"schemaVersion": 1, "backlogId": key})
+            force_partial = True
+        answer = self.normalize_submit_answer(raw_answer, answers_dir, force_partial)
+        not_run = answer.pop("_notRun", [])
+        submit_path.write_text(json.dumps(answer, indent=2), encoding="utf-8")
+        self._stop_worker_session(worker_match)
+        worker_head = self._snapshot_worktree(worktree, folder, key)
+
+        if phase in ("RUNNING",):
+            result_file = worker_match / "worker_result.json"
+            recorded = False
+            if result_file.is_file() and not force_partial:
+                try:
+                    native.record_worker_result(key, json.loads(result_file.read_text(encoding="utf-8")))
+                    recorded = True
+                except Exception:
+                    recorded = False
+            if not recorded:
+                evidence_dir = answers_dir / "evidence"
+                evidence = sorted(f"answers/{key}/evidence/{p.name}" for p in evidence_dir.glob("*")
+                                  if p.is_file() and p.stat().st_size > 0) if evidence_dir.is_dir() else []
+                native.record_worker_result(key, {
+                    "task_id": key, "worker_id": details.get("workerId"), "status": "PARTIAL",
+                    "skill_ids": ["mtm-finalize-item"], "changed_files": [f"answers/{key}/submit.json"],
+                    "test_results": [], "evidence_paths": evidence, "elapsed_seconds": 0,
+                    "note": "finalize_item snapshot" + (" (forced before deadline)" if force_partial else "")})
+        elif phase == "NEEDS_ATTENTION":
+            raise ValueError(f"{key} worker failed without deliverables; reconcile_worker before retry")
+
+        self.refresh_match()
+        native.begin_integration(key)
+        try:
+            base = self._git_run(self.checkout_root, "merge-base", "HEAD", worker_head or "HEAD").stdout.strip()
+            commits = [c for c in self._git_run(self.checkout_root, "rev-list", "--reverse", f"{base}..{worker_head}").stdout.split() if c]
+            if not commits:
+                raise ValueError(f"{key} worker produced no commit to integrate")
+            picked = self._git_run(self.checkout_root, "-c", "user.email=mtm-root@local", "-c", "user.name=MTM Root",
+                                   "cherry-pick", "--allow-empty", *commits, timeout=60)
+            if picked.returncode != 0:
+                self._git_run(self.checkout_root, "cherry-pick", "--abort")
+                raise ValueError(f"cherry-pick conflict for {key}: {(picked.stderr or picked.stdout).strip()[:300]}")
+        except Exception:
+            native.end_integration(key, success=False)
+            raise
+        sha = self._git_run(self.checkout_root, "rev-parse", "HEAD").stdout.strip()
+        receipt = self.submit_work(str(uuid.uuid4()), key, sha, answer)
+        return {"backlogItemKey": key, "status": "SUBMITTED", "answerStatus": answer.get("status"),
+                "notRun": not_run, "stopWorker": was_running, "receipt": receipt,
+                "instruction": "If stopWorker is true, stop that native worker now; its later writes are ignored."}
+
     def claim_task(self, backlog_item_key: str, worker_id: str, estimated_seconds: int = 420) -> Dict[str, Any]:
         try:
             res = self._native_coordinator().claim_task(backlog_item_key, worker_id, estimated_seconds)
@@ -1662,7 +1891,15 @@ class MCPHelperServer:
         raise ValueError("integration_gate action must be begin or failed")
 
     def reconcile_worker(self, backlog_item_key: str, confirmed_stopped: bool, reason: str, requeue: bool = True) -> Dict[str, Any]:
-        return self._native_coordinator().reconcile_worker(
+        native = self._native_coordinator()
+        if confirmed_stopped is True:
+            try:
+                wt = native.task_details(backlog_item_key).get("worktreeRoot")
+                if wt:
+                    self._stop_worker_session(Path(wt) / native.repository_folder)
+            except Exception:
+                pass
+        return native.reconcile_worker(
             backlog_item_key, confirmed_stopped=confirmed_stopped, reason=reason, requeue=requeue)
 
     def wait_for_update(self, timeout_ms: int = 5000) -> Dict[str, Any]:
@@ -1671,6 +1908,8 @@ class MCPHelperServer:
         start_time = time.time()
         elapsed_ms = 0
         poll_interval = 2.0
+        if self.native and self.adapter:
+            return self._wait_for_native_events(bounded_ms)
 
         while elapsed_ms < bounded_ms:
             # Poll match state and waves
@@ -1708,9 +1947,70 @@ class MCPHelperServer:
         return {"status": "TIMEOUT", "elapsedMs": elapsed_ms, "matchState": self.match_state}
 
 
+    def _auto_finalize_settings(self) -> tuple[Optional[float], Optional[float]]:
+        def read(name: str, default: str) -> Optional[float]:
+            raw = os.environ.get(name, default).strip()
+            try:
+                value = float(raw)
+            except ValueError:
+                return None
+            return value if value > 0 else None
+        return read("MTM_AUTO_FINALIZE_SLACK", "150"), read("MTM_AUTO_FINALIZE_MATCH_SLACK", "240")
+
+    def _wait_for_native_events(self, bounded_ms: int) -> Dict[str, Any]:
+        """Return as soon as anything needs a root decision.
+
+        Files are checked every second, the Game Master board every two. Items near
+        their deadline (or the match end) are finalized here by code, not by the LLM.
+        """
+        native = self._native_coordinator()
+        start = time.time()
+        last_refresh = 0.0
+        finalize_slack, match_slack = self._auto_finalize_settings()
+        new_items: List[Any] = []
+        old_wave = self.current_wave
+        while True:
+            now = time.time()
+            if now - last_refresh >= 2.0:
+                res = self.refresh_match()
+                last_refresh = now
+                new_items.extend(res.get("newlyDiscovered", []))
+                if self.match_state in ("FINISHED", "PAUSED"):
+                    return {"status": self.match_state, "matchState": self.match_state,
+                            "elapsedMs": int((time.time() - start) * 1000)}
+            events = native.poll_events(finalize_slack, match_slack)
+            if new_items or self.current_wave > old_wave:
+                events.insert(0, {"type": "new_items", "newItems": new_items, "wave": self.current_wave})
+            if events:
+                finalized = []
+                for ev in [e for e in events if e["type"] == "auto_finalize"]:
+                    try:
+                        finalized.append(self.finalize_item(ev["backlogItemKey"], force_partial=True))
+                    except Exception as exc:
+                        finalized.append({"backlogItemKey": ev["backlogItemKey"], "status": "FAILED",
+                                          "reason": str(exc)[:300]})
+                out: Dict[str, Any] = {"status": "UPDATED", "matchState": self.match_state,
+                                       "wave": self.current_wave, "newItems": new_items, "events": events,
+                                       "autoFinalized": finalized,
+                                       "elapsedMs": int((time.time() - start) * 1000)}
+                if any(e["type"] in ("slot_free", "new_items") for e in events) or finalized:
+                    out["dispatch"] = self.dispatch_ready()
+                out["instruction"] = ("Spawn every dispatch.spawn[] worker; call finalize_item for each "
+                                      "worker_result_file event; stop workers whose autoFinalized entry has stopWorker=true.")
+                return out
+            if (time.time() - start) * 1000 >= bounded_ms:
+                return {"status": "TIMEOUT", "matchState": self.match_state,
+                        "elapsedMs": int((time.time() - start) * 1000)}
+            time.sleep(1.0)
+
+
 def get_tool_definitions() -> List[Dict[str, Any]]:
     native_tools = [
         ("plan_tasks", "Refresh server board and return eligible native tasks, reserved urgent capacity, and ready integrations.", {}, []),
+        ("dispatch_ready", "Start Work + claim every task the planner selects (3 normal slots, 2 reserved PI/Heavy slots) and return ready TaskEnvelopes. Root only spawns one native worker per spawn[] entry.",
+         {"estimatedSeconds": {"type": "integer", "minimum": 10, "default": 420}}, []),
+        ("finalize_item", "Root-only: snapshot a worker's worktree, make submit.json honest (missing evidence -> NOT_RUN, PARTIAL), cherry-pick, push and submit in one call. Never fabricates evidence.",
+         {"backlogItemKey": {"type": "string"}, "forcePartial": {"type": "boolean", "default": False}}, ["backlogItemKey"]),
         ("claim_task", "Reserve an eligible task after Start Work; return isolated worktree and sanitized TaskEnvelope for native spawn.",
          {"backlogItemKey": {"type": "string"}, "workerId": {"type": "string"}, "estimatedSeconds": {"type": "integer", "minimum": 10, "default": 420}}, ["backlogItemKey", "workerId"]),
         ("record_worker_result", "Validate completed native WorkerResult and required local artifacts before root integration.",
@@ -1892,6 +2192,10 @@ def run_mcp_stdio_server():
                     val = server.wait_for_update(tool_args.get("timeoutMs", 5000))
                 elif tool_name == "plan_tasks":
                     val = server.plan_tasks()
+                elif tool_name == "dispatch_ready":
+                    val = server.dispatch_ready(tool_args.get("estimatedSeconds", 420))
+                elif tool_name == "finalize_item":
+                    val = server.finalize_item(tool_args["backlogItemKey"], bool(tool_args.get("forcePartial", False)))
                 elif tool_name == "claim_task":
                     val = server.claim_task(tool_args["backlogItemKey"], tool_args["workerId"], tool_args.get("estimatedSeconds", 420))
                 elif tool_name == "record_worker_result":

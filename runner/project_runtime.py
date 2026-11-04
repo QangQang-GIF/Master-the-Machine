@@ -382,7 +382,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     session_parser.add_argument("--server-script", default="dev")
     session_parser.add_argument("--url")
     session_parser.add_argument("--timeout", type=float, default=300)
+    session_parser.add_argument("--routes", default="", help="Comma-separated routes to pre-warm, e.g. /accounting,/boards")
     session_parser.add_argument("command", nargs=argparse.REMAINDER)
+    start_parser = sub.add_parser("session-start", help="Start this worker's dev server in the background and pre-warm routes")
+    start_parser.add_argument("--server-script", default="dev")
+    start_parser.add_argument("--url")
+    start_parser.add_argument("--routes", default="", help="Comma-separated routes to pre-warm")
+    start_parser.add_argument("--readiness-timeout", type=float, default=90)
+    sub.add_parser("session-stop", help="Stop the background server started by session-start")
     args = parser.parse_args(argv)
     runtime = ProjectRuntime(args.match_root, args.match_id, args.worker_id)
     if args.action == "prepare":
@@ -393,9 +400,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             if result.stderr: print(result.stderr, file=sys.stderr, end="" if result.stderr.endswith("\n") else "\n")
             if not result.ok: return result.returncode or 1
         return 0
-    command = list(args.command)
-    if command[:1] == ["--"]: command = command[1:]
-    if args.action == "session":
+    def server_argv() -> list[str]:
         scripts = runtime._manifest().get("scripts", {})
         if args.server_script not in scripts:
             raise ValueError("Server script must be declared by the current project")
@@ -405,9 +410,28 @@ def main(argv: Sequence[str] | None = None) -> int:
             if runtime._package_manager() == "npm":
                 server.append("--")
             server.extend(["--hostname", "127.0.0.1", "--port", runtime.env["PORT"]])
+        return server
+
+    if args.action in ("session-start", "session-stop"):
+        import json as _json
+        sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+        from runner.web_session import start_background_server, stop_recorded_session
+        if args.action == "session-stop":
+            info = stop_recorded_session(runtime.match_root)
+        else:
+            routes = [r for r in args.routes.split(",") if r.strip()]
+            info = start_background_server(runtime, server_argv(), routes=routes, readiness_url=args.url,
+                                           readiness_timeout=args.readiness_timeout)
+        print(_json.dumps(info))
+        return 0 if info.get("status") in ("READY", "ALREADY_RUNNING", "STOPPED", "NOT_RUNNING") else 1
+    command = list(args.command)
+    if command[:1] == ["--"]: command = command[1:]
+    if args.action == "session":
         sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
         from runner.web_session import run_web_session
-        result = run_web_session(runtime, server, command, readiness_url=args.url, timeout=args.timeout)
+        routes = [r for r in args.routes.split(",") if r.strip()]
+        result = run_web_session(runtime, server_argv(), command, readiness_url=args.url, timeout=args.timeout,
+                                 routes=routes)
     else:
         result = runtime.run(command, args.cwd, args.timeout)
     print(result.stdout, end="")

@@ -26,9 +26,23 @@ class NativeTaskCoordinator:
     def __init__(self, state_dir: Path | str, checkout_root: Path | str,
                  match_root: Path | str, repository_folder: str, match_id: str,
                  max_workers: int = 2, normal_workers: int = 1,
-                 integration_reserve_seconds: int = 90, clock_max_age_seconds: int = 120):
+                 integration_reserve_seconds: int = 90, clock_max_age_seconds: int = 120,
+                 reserved_workers: int | None = None, allow_reserved_borrow: bool = True,
+                 heavy_keys: list[str] | set[str] | None = None,
+                 heavy_min_difficulty: float | None = None,
+                 heavy_max_seconds: int | None = None):
         if not 1 <= normal_workers < max_workers <= 16:
             raise NativeCoordinationError("Require 1 <= normal_workers < max_workers <= 16")
+        # Lane mode: `normal_workers` slots for ordinary items plus `reserved_workers`
+        # slots that only PI and Heavy items may use. None keeps the legacy policy.
+        if reserved_workers is not None and not (1 <= reserved_workers and normal_workers + reserved_workers <= max_workers):
+            raise NativeCoordinationError("Require 1 <= reserved_workers and normal_workers + reserved_workers <= max_workers")
+        self.reserved_workers = reserved_workers
+        self.lane_mode = reserved_workers is not None
+        self.allow_reserved_borrow = bool(allow_reserved_borrow)
+        self.heavy_keys = {str(k).strip().upper() for k in (heavy_keys or []) if str(k).strip()}
+        self.heavy_min_difficulty = heavy_min_difficulty
+        self.heavy_max_seconds = int(heavy_max_seconds) if heavy_max_seconds else None
         if not re.fullmatch(r"[A-Za-z0-9_-]{1,80}", match_id):
             raise NativeCoordinationError("Invalid match ID")
         folder = PurePosixPath(repository_folder)
@@ -189,6 +203,45 @@ class NativeTaskCoordinator:
 
         return max(0.5, base_diff + ui_penalty + mvs_penalty)
 
+    EVIDENCE_DEADLINE_MARGIN = 150   # auto-finalize slack for deadline items
+    EVIDENCE_MATCH_MARGIN = 240      # auto-finalize slack before match end
+
+    def _evidence_cutoff(self, deadline, now, remaining, budget) -> float | None:
+        """Server epoch after which captures must stop so finalize_item can still submit."""
+        if now is None:
+            return None
+        limits = [now + budget]
+        if deadline is not None:
+            limits.append(float(deadline) - self.EVIDENCE_DEADLINE_MARGIN)
+        if remaining is not None:
+            limits.append(now + float(remaining) - self.EVIDENCE_MATCH_MARGIN)
+        return round(max(now, min(limits)), 1)
+
+    HEAVY_PREFIX = "[heavy task]"
+
+    def _is_heavy(self, task: dict) -> bool:
+        """Heavy = explicit Warm-up title prefix, operator override, or difficulty threshold."""
+        if task.get("heavy") is True:
+            return True
+        title = str(task.get("title") or task.get("name") or "").strip().lower()
+        if title.startswith(self.HEAVY_PREFIX):
+            return True
+        if str(task.get("key", "")).upper() in self.heavy_keys:
+            return True
+        if self.heavy_min_difficulty is not None and str(task.get("type", "")).upper() != "PI":
+            return self._calculate_task_difficulty(task) >= float(self.heavy_min_difficulty)
+        return False
+
+    def _lane(self, task: dict) -> str:
+        """Lane an item belongs to: 'reserved' (PI/Heavy) or 'normal'."""
+        if str(task.get("type", "")).upper() == "PI" or self._is_heavy(task):
+            return "reserved"
+        return "normal"
+
+    def _slot_of(self, task: dict) -> str:
+        """Slot a running item occupies (a borrowed reserved slot stays reserved)."""
+        return task.get("lease", {}).get("lane_slot") or self._lane(task)
+
     def _plan(self, db) -> dict:
         planning_time = time.monotonic()
         status, now, remaining = self._clock(db)
@@ -213,6 +266,10 @@ class NativeTaskCoordinator:
                     "selected": [], "active": [public_row(r) for r in active], "readyToIntegrate": [],
                     "readyDiagnostics": [], "skippedReady": [], "integrationOwner": owner, "integrationBlocked": [],
                     "overdueWorkers": []}
+        if clock_ready:
+            slacks = [float(json.loads(r["data"])["deadline_epoch"]) - now for r in rows
+                      if r["phase"] in ("QUEUED", "RUNNING") and json.loads(r["data"]).get("deadline_epoch") is not None]
+            response["nextDeadlineSlack"] = min(slacks) if slacks else None
         # Emergency Deadline Flush: auto-promote active tasks with <= 120s remaining before deadline
         for row in list(active):
             task = json.loads(row["data"])
@@ -316,6 +373,9 @@ class NativeTaskCoordinator:
             return response
         terminal = {r["key"] for r in rows if r["phase"] == "SUBMITTED"}
         busy_paths = {p for r in [*active, *ready] if r["phase"] != "CLOSED" for p in json.loads(r["data"]).get("claimed_paths", [])}
+        if self.lane_mode:
+            self._select_lanes(rows, active, busy_paths, terminal, now, remaining, response)
+            return response
         normals = sum(not self._urgent(json.loads(r["data"]), now) for r in active)
         candidates = []
         for row in rows:
@@ -370,9 +430,129 @@ class NativeTaskCoordinator:
             normals += not urgent
         return response
 
+    def _select_lanes(self, rows, active, busy_paths, terminal, now, remaining, response) -> None:
+        """Lane-mode selection: 3 normal slots in arrival order (deadlines first),
+        reserved slots for PI then Heavy. No score/ROI ordering."""
+        used = {"normal": 0, "reserved": 0}
+        for r in active:
+            used[self._slot_of(json.loads(r["data"]))] += 1
+        caps = {"normal": self.normal_workers, "reserved": self.reserved_workers}
+        candidates = []
+        for row in rows:
+            task = json.loads(row["data"])
+            if row["phase"] != "QUEUED" or task["status"] not in ("OPEN", "IN_PROGRESS", "WORKING", "STARTED"):
+                continue
+            if not set(task.get("dependencies", [])).issubset(terminal):
+                continue
+            if self._overlap(busy_paths, task.get("claimed_paths", [])):
+                continue
+            deadline = task.get("deadline_epoch")
+            slack = min(remaining, float(deadline) - now if deadline is not None else remaining)
+            if slack <= self.reserve + 10:
+                continue
+            lane = self._lane(task)
+            if lane == "reserved":
+                # PI before Heavy; inside each, nearest deadline then arrival order.
+                tier = 0 if str(task.get("type", "")).upper() == "PI" else 1
+            elif deadline is not None and slack <= 180:
+                tier = 0
+            elif deadline is not None or task.get("deadlineMinutes") is not None:
+                tier = 1
+            else:
+                tier = 2
+            sub = slack if deadline is not None else float("inf")
+            candidates.append(((tier, sub, float(row["discovered"]), row["key"]), task, lane, slack))
+        candidates.sort(key=lambda c: c[0])
+        reserved_waiting = any(c[2] == "reserved" for c in candidates)
+        for (tier, *_), task, lane, slack in candidates:
+            if len(response["selected"]) >= response["availableSlots"]:
+                break
+            if self._overlap(busy_paths, task.get("claimed_paths", [])):
+                continue
+            slot = None
+            if used[lane] < caps[lane]:
+                slot = lane
+            elif (lane == "normal" and self.allow_reserved_borrow and tier == 0
+                    and not reserved_waiting and used["reserved"] < caps["reserved"]):
+                # Safety valve: an imminent deadline item may borrow an idle reserved slot.
+                slot = "reserved"
+            if slot is None:
+                continue
+            used[slot] += 1
+            busy_paths.update(task.get("claimed_paths", []))
+            response["selected"].append({**task, "urgent": lane == "reserved" or tier == 0,
+                                         "slackSeconds": slack, "lane": lane, "laneSlot": slot,
+                                         "heavy": self._is_heavy(task)})
+        response["lanes"] = {"normal": {"running": used["normal"], "capacity": caps["normal"]},
+                             "reserved": {"running": used["reserved"], "capacity": caps["reserved"]}}
+
+    def _lane_slot_available(self, db, task: dict) -> str | None:
+        used = {"normal": 0, "reserved": 0}
+        for r in db.execute("SELECT data FROM tasks WHERE phase='RUNNING'").fetchall():
+            used[self._slot_of(json.loads(r["data"]))] += 1
+        lane = self._lane(task)
+        caps = {"normal": self.normal_workers, "reserved": self.reserved_workers}
+        return lane if used[lane] < caps[lane] else None
+
     def plan_tasks(self) -> dict[str, Any]:
         with self._db() as db:
             return self._plan(db)
+
+    DEADLINE_THRESHOLDS = (300, 150)
+
+    def poll_events(self, finalize_slack: float | None = None,
+                    match_finalize_slack: float | None = None) -> list[dict[str, Any]]:
+        """Decision-worthy events, each reported once: a worker wrote worker_result.json,
+        planner has dispatchable work, a deadline crosses 300/150s, or an item must be
+        auto-finalized (its deadline or the match end is near)."""
+        events: list[dict[str, Any]] = []
+        with self._db() as db:
+            seen = set(self._meta(db, "reported_events", []) or [])
+            status, now, remaining = self._clock(db)
+            rows = db.execute("SELECT * FROM tasks ORDER BY key").fetchall()
+            for row in rows:
+                task = json.loads(row["data"])
+                key, attempt = row["key"], int(task.get("attempt_number", 1))
+                if row["phase"] == "RUNNING" and row["worktree"]:
+                    marker = Path(row["worktree"]) / self.repository_folder / "worker_result.json"
+                    tag = f"result:{key}:{attempt}"
+                    if tag not in seen and marker.is_file():
+                        seen.add(tag)
+                        events.append({"type": "worker_result_file", "backlogItemKey": key, "path": str(marker)})
+                if now is None or row["phase"] not in ("QUEUED", "RUNNING", "READY_TO_INTEGRATE"):
+                    continue
+                deadline = task.get("deadline_epoch")
+                if deadline is not None:
+                    slack = float(deadline) - now
+                    for threshold in self.DEADLINE_THRESHOLDS:
+                        tag = f"deadline:{key}:{attempt}:{threshold}"
+                        if 0 < slack <= threshold and tag not in seen:
+                            seen.add(tag)
+                            events.append({"type": "deadline_near", "backlogItemKey": key, "phase": row["phase"],
+                                           "slackSeconds": round(slack, 1), "threshold": threshold})
+                    if (finalize_slack is not None and row["phase"] in ("RUNNING", "READY_TO_INTEGRATE")
+                            and 0 < slack <= finalize_slack):
+                        tag = f"finalize:{key}:{attempt}"
+                        if tag not in seen:
+                            seen.add(tag)
+                            events.append({"type": "auto_finalize", "backlogItemKey": key,
+                                           "reason": "deadline", "slackSeconds": round(slack, 1)})
+                if (match_finalize_slack is not None and remaining is not None
+                        and row["phase"] in ("RUNNING", "READY_TO_INTEGRATE") and 0 < remaining <= match_finalize_slack):
+                    tag = f"finalize:{key}:{attempt}"
+                    if tag not in seen:
+                        seen.add(tag)
+                        events.append({"type": "auto_finalize", "backlogItemKey": key,
+                                       "reason": "match_end", "remainingSeconds": round(remaining, 1)})
+            plan = self._plan(db)
+            if plan["selected"]:
+                signature = "slot:" + ",".join(sorted(t["key"] for t in plan["selected"]))
+                if signature not in seen:
+                    seen.add(signature)
+                    events.append({"type": "slot_free", "selected": [t["key"] for t in plan["selected"]],
+                                   "availableSlots": plan["availableSlots"]})
+            self._set_meta(db, "reported_events", sorted(seen))
+        return events
 
     def _git(self, *args: str, cwd: Path | None = None) -> str:
         res = subprocess.run(["git", "-C", str(cwd or self.checkout_root), *args], capture_output=True, text=True, timeout=30)
@@ -392,6 +572,14 @@ class NativeTaskCoordinator:
                 raise NativeCoordinationError("Worker already owns an active task")
             plan = self._plan(db)
             eligible = next((t for t in plan["selected"] if t["key"] == key), None)
+            if eligible is None and self.lane_mode:
+                task_data = json.loads(row["data"])
+                slot = self._lane_slot_available(db, task_data)
+                if (plan.get("matchStatus") in ("RUNNING", "IN_PROGRESS", "STARTED")
+                        and plan["availableSlots"] > 0 and row["phase"] == "QUEUED" and slot):
+                    eligible = {**task_data, "laneSlot": slot}
+                else:
+                    raise NativeCoordinationError("Task not eligible under current lane capacity/deadline policy")
             if eligible is None:
                 task_data = json.loads(row["data"])
                 status_clk, now_clk, rem_clk = self._clock(db)
@@ -447,6 +635,10 @@ class NativeTaskCoordinator:
             if slack is None:
                 slack = min(remaining, float(deadline) - now if deadline is not None else remaining) if (now is not None and remaining is not None) else (remaining or 2400)
             budget = min(max(10, int(estimated_seconds)), max(10, int(slack - self.reserve)))
+            heavy = self._is_heavy(eligible)
+            if heavy and self.heavy_max_seconds:
+                budget = min(budget, max(10, self.heavy_max_seconds))
+            lane_slot = eligible.get("laneSlot") or (self._lane(eligible) if self.lane_mode else None)
             worker_model = os.environ.get("MTM_WORKER_MODEL", "gpt-6.1-sol" if os.environ.get("MTM_ENV") == "production" else "gpt-6-luna")
             worker_effort = os.environ.get("MTM_WORKER_EFFORT", "medium" if os.environ.get("MTM_ENV") == "production" else "low")
             envelope = {"task_id": key, "task_type": task_type, "title": eligible.get("title", key),
@@ -458,9 +650,14 @@ class NativeTaskCoordinator:
                         "evidence_required": details.get("evidence_required", eligible.get("evidence_required", [])),
                         "mvs": self._mvs_list(details.get("minimumVerificationScenarios", details.get("mvs"))),
                         "submit_template": details.get("submitTemplate"), "allowed_paths": [str(worker_match)],
-                        "worker_id": worker_id,
+                        "worker_id": worker_id, "heavy": heavy, "lane": lane_slot,
+                        "evidence_cutoff_epoch": self._evidence_cutoff(deadline, now, remaining, budget),
+                        # Same cutoff on this machine's clock: pass to capture_multi.mjs --cutoff-epoch.
+                        "evidence_cutoff_local_epoch": (round(time.time() + self._evidence_cutoff(deadline, now, remaining, budget) - now, 1)
+                                                        if now is not None else None),
                         "metadata": {"match_root": str(worker_match), "start_details": details,
                                      "project_runtime_path": str(Path(__file__).resolve().parents[3] / "runner" / "project_runtime.py"),
+                                     "capture_multi_path": str(Path(__file__).resolve().parents[3] / "scripts" / "capture_multi.mjs"),
                                      "match_id": self.match_id, "worker_id": worker_id,
                                      "submit_template": details.get("submitTemplate"),
                                      "worker_result_path": str(worker_match / "worker_result.json")}}
@@ -468,6 +665,8 @@ class NativeTaskCoordinator:
             _, server_now, server_remaining = self._clock(db)
             stored["lease"] = {"start_server_epoch": server_now, "start_remaining_seconds": server_remaining,
                                "budget_seconds": budget}
+            if lane_slot:
+                stored["lease"]["lane_slot"] = lane_slot
             db.execute("UPDATE tasks SET phase='RUNNING',worker_id=?,worktree=?,data=? WHERE key=?",
                        (worker_id, str(target), json.dumps(stored), key))
             return {"taskEnvelope": envelope, "worktreeRoot": str(target), "matchRoot": str(worker_match), "match_root": str(worker_match), "workerId": worker_id}
@@ -576,6 +775,7 @@ class NativeTaskCoordinator:
         with self._db() as db:
             row = self._task(db, self._key(key))
             return {"key": key, "phase": row["phase"], "workerId": row["worker_id"],
+                    "started": bool(row["started"]),
                     "worktreeRoot": row["worktree"], "data": json.loads(row["data"]),
                     "workerResult": json.loads(row["result"]) if row["result"] else None,
                     "receiptId": row["receipt"]}
@@ -637,6 +837,10 @@ class NativeTaskCoordinator:
                 return {"key": key, "phase": "NEEDS_ATTENTION", "status": result["status"]}
 
             tests = result["test_results"]
+            partial = result["status"] == "PARTIAL"
+            if partial and isinstance(tests, list):
+                # PARTIAL may report honest failures/NOT_RUN; only claimed passes must be proven.
+                tests = [t for t in tests if isinstance(t, dict) and t.get("passed") is True]
             if not isinstance(tests, list) or any(not isinstance(t, dict) or not isinstance(t.get("command"), str)
                                 or not t["command"].strip() or t.get("passed") is not True
                                 or type(t.get("exit_code")) is not int or t["exit_code"] != 0 for t in tests):
@@ -666,8 +870,12 @@ class NativeTaskCoordinator:
                     raise NativeCoordinationError("Evidence must exist, be nonempty, and belong to current task")
             task = json.loads(row["data"])
             required_evidence = task.get("start_details", {}).get("evidence_required", task.get("evidence_required", []))
-            if not set(required_evidence).issubset(evidence):
+            missing = sorted(set(required_evidence) - set(evidence))
+            if missing and not partial:
                 raise NativeCoordinationError("Required evidence missing from worker result")
+            if missing:
+                # Honest PARTIAL: missing captures are submitted as NOT_RUN, never fabricated.
+                result["missing_evidence"] = missing
             db.execute("UPDATE tasks SET phase='READY_TO_INTEGRATE',result=? WHERE key=?", (json.dumps(result), key))
             return {"key": key, "phase": "READY_TO_INTEGRATE", "worktreeRoot": row["worktree"], "workerResult": result}
 
