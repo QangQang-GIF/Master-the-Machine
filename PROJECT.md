@@ -26,7 +26,7 @@
 | M1 | Repository & Workspace Sync | Synchronize `Master-the-Machine-main`, `Thi\Workspace`, and verify `player-workspace.json` | none | DONE |
 | M2 | Local Env & Shell Permissions | Disable Store `pwsh.exe`, verify System32 PowerShell, check PostgreSQL 5433, verify MCP bridge | M1 | DONE |
 | M3 | Model Profile Configuration | Enforce `gpt-6.1-sol` and `medium` across all `.codex/config.toml` in workspace & team-sdlc-pack | M1, M2 | DONE |
-| M4 | Readiness & Doctor Verification | Run `check-distribution.py`, environment doctor, PostgreSQL test, and audit readiness | M1, M2, M3 | IN_PROGRESS |
+| M4 | Readiness & Doctor Verification | Run `check-distribution.py`, environment doctor, PostgreSQL test, and audit readiness | M1, M2, M3 | DONE |
 
 ## Code Layout
 - Repository: `D:\Working\Master_the_Machine\Master-the-Machine-main\`
