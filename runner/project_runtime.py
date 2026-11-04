@@ -221,9 +221,20 @@ class ProjectRuntime:
                     env["PATH"] = str(bin_dir) + (os.pathsep + path_value if path_value else "")
             cmd_args = list(args)
             if sys.platform == "win32" and cmd_args:
-                resolved = shutil.which(cmd_args[0])
+                base_name = cmd_args[0]
+                resolved = None
+                for ext in (".cmd", ".exe", ".bat"):
+                    cand = shutil.which(base_name + ext if not base_name.lower().endswith(ext) else base_name)
+                    if cand and Path(cand).suffix.lower() in {".cmd", ".exe", ".bat"}:
+                        resolved = cand
+                        break
+                if not resolved:
+                    resolved = shutil.which(base_name)
                 if resolved:
-                    cmd_args[0] = resolved
+                    if Path(resolved).suffix.lower() in {".cmd", ".bat"}:
+                        cmd_args = ["cmd.exe", "/c", resolved] + cmd_args[1:]
+                    elif Path(resolved).suffix.lower() == ".exe":
+                        cmd_args[0] = resolved
             result = subprocess.run(cmd_args, cwd=workdir, env=env, shell=False, capture_output=True,
                                     text=True, timeout=max(0.1, timeout), check=False)
             return CommandResult(tuple(self._redact(a) for a in args), str(workdir), result.returncode, self._redact(result.stdout), self._redact(result.stderr))

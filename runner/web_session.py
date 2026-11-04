@@ -12,6 +12,7 @@ import subprocess
 import threading
 import time
 from collections import deque
+from pathlib import Path
 from urllib.error import URLError
 from urllib.request import urlopen
 from urllib.parse import urlsplit
@@ -131,9 +132,20 @@ def run_web_session(runtime: ProjectRuntime, server_argv: list[str],
     try:
         server_cmd = list(map(str, server_argv))
         if os.name == "nt" and server_cmd:
-            resolved = shutil.which(server_cmd[0])
+            base_name = server_cmd[0]
+            resolved = None
+            for ext in (".cmd", ".exe", ".bat"):
+                cand = shutil.which(base_name + ext if not base_name.lower().endswith(ext) else base_name)
+                if cand and Path(cand).suffix.lower() in {".cmd", ".exe", ".bat"}:
+                    resolved = cand
+                    break
+            if not resolved:
+                resolved = shutil.which(base_name)
             if resolved:
-                server_cmd[0] = resolved
+                if Path(resolved).suffix.lower() in {".cmd", ".bat"}:
+                    server_cmd = ["cmd.exe", "/c", resolved] + server_cmd[1:]
+                elif Path(resolved).suffix.lower() == ".exe":
+                    server_cmd[0] = resolved
         proc = subprocess.Popen(
             server_cmd, cwd=runtime.app_root,
             env=runtime.env.copy(), shell=False, stdout=subprocess.PIPE,
