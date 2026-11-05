@@ -1736,7 +1736,8 @@ class MCPHelperServer:
         except Exception:
             pass
 
-    def finalize_item(self, backlog_item_key: str, force_partial: bool = False) -> Dict[str, Any]:
+    def finalize_item(self, backlog_item_key: str, force_partial: bool = False,
+                      confirmed_stopped: bool = False) -> Dict[str, Any]:
         """Snapshot worker -> honest submit.json -> cherry-pick -> push -> submit, in one call.
 
         Used when a worker finishes (worker_result.json written) and, with force_partial,
@@ -1762,6 +1763,26 @@ class MCPHelperServer:
         folder = native.repository_folder
         worker_match = worktree / folder
         was_running = phase == "RUNNING"
+        if was_running:
+            # V2 (P1): never snapshot/integrate a worker that may still be writing.
+            stop = native.stop_state(key)
+            if confirmed_stopped:
+                native.confirm_stopped(key, "root_attested")
+            elif stop and not stop.get("confirmed"):
+                ack = worker_match / ".mtm_stopped.json"
+                try:
+                    acked = ack.is_file() and json.loads(ack.read_text(encoding="utf-8")).get("instructionId") == stop.get("instructionId")
+                except (OSError, ValueError):
+                    acked = False
+                if acked:
+                    native.confirm_stopped(key, "worker_ack")
+            if not native.is_quiesced(key):
+                req = native.request_stop(key, "finalize requested" + (" (deadline)" if force_partial else ""))
+                return {"backlogItemKey": key, "status": "STOP_PENDING" if req.get("alreadyRequested") else "STOP_REQUIRED",
+                        "stopWorker": True, "control": req.get("instruction"),
+                        "instruction": ("Stop this native worker now (deliver `control`), then call finalize_item again with "
+                                        "confirmedStopped=true once it has ended, or let the worker write .mtm_stopped.json with "
+                                        "this instructionId. Nothing was snapshotted or submitted.")}
         answers_dir = worker_match / "answers" / key
         answers_dir.mkdir(parents=True, exist_ok=True)
         submit_path = answers_dir / "submit.json"
@@ -1999,7 +2020,8 @@ class MCPHelperServer:
                 if any(e["type"] in ("slot_free", "new_items") for e in events) or finalized:
                     out["dispatch"] = self.dispatch_ready()
                 out["instruction"] = ("Spawn every dispatch.spawn[] worker; call finalize_item for each "
-                                      "worker_result_file event; stop workers whose autoFinalized entry has stopWorker=true.")
+                                      "worker_result_file event; for every autoFinalized entry with status STOP_REQUIRED/STOP_PENDING, "
+                                      "stop that native worker, then call finalize_item with confirmedStopped=true.")
                 return out
             if (time.time() - start) * 1000 >= bounded_ms:
                 return {"status": "TIMEOUT", "matchState": self.match_state,
@@ -2013,7 +2035,8 @@ def get_tool_definitions() -> List[Dict[str, Any]]:
         ("dispatch_ready", "Start Work + claim every task the planner selects (3 normal slots, 2 reserved PI/Heavy slots) and return ready TaskEnvelopes. Root only spawns one native worker per spawn[] entry.",
          {"estimatedSeconds": {"type": "integer", "minimum": 10, "default": 420}}, []),
         ("finalize_item", "Root-only: snapshot a worker's worktree, make submit.json honest (missing evidence -> NOT_RUN, PARTIAL), cherry-pick, push and submit in one call. Never fabricates evidence.",
-         {"backlogItemKey": {"type": "string"}, "forcePartial": {"type": "boolean", "default": False}}, ["backlogItemKey"]),
+         {"backlogItemKey": {"type": "string"}, "forcePartial": {"type": "boolean", "default": False},
+          "confirmedStopped": {"type": "boolean", "default": False}}, ["backlogItemKey"]),
         ("claim_task", "Reserve an eligible task after Start Work; return isolated worktree and sanitized TaskEnvelope for native spawn.",
          {"backlogItemKey": {"type": "string"}, "workerId": {"type": "string"}, "estimatedSeconds": {"type": "integer", "minimum": 10, "default": 420}}, ["backlogItemKey", "workerId"]),
         ("record_worker_result", "Validate completed native WorkerResult and required local artifacts before root integration.",
@@ -2198,7 +2221,8 @@ def run_mcp_stdio_server():
                 elif tool_name == "dispatch_ready":
                     val = server.dispatch_ready(tool_args.get("estimatedSeconds", 420))
                 elif tool_name == "finalize_item":
-                    val = server.finalize_item(tool_args["backlogItemKey"], bool(tool_args.get("forcePartial", False)))
+                    val = server.finalize_item(tool_args["backlogItemKey"], bool(tool_args.get("forcePartial", False)),
+                                           bool(tool_args.get("confirmedStopped", False)))
                 elif tool_name == "claim_task":
                     val = server.claim_task(tool_args["backlogItemKey"], tool_args["workerId"], tool_args.get("estimatedSeconds", 420))
                 elif tool_name == "record_worker_result":

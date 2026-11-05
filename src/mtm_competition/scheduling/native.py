@@ -946,6 +946,73 @@ class NativeTaskCoordinator:
                     "workerResult": json.loads(row["result"]) if row["result"] else None,
                     "receiptId": row["receipt"]}
 
+    # ---- V2: safe-stop protocol (request -> confirm -> only then snapshot/integrate) ----
+    STOP_CONFIRM_SOURCES = ("worker_ack", "native_runtime", "root_attested")
+
+    def stop_state(self, key: str) -> dict[str, Any] | None:
+        with self._db() as db:
+            return json.loads(self._task(db, self._key(key))["data"]).get("stop")
+
+    def request_stop(self, key: str, reason: str) -> dict[str, Any]:
+        """Ask a RUNNING worker to stop writing. Idempotent. The slot stays occupied until confirmed.
+
+        Returns the identified control instruction Root must deliver to the worker. The instruction is
+        also stored as a durable PENDING event so it can be replayed after a Root restart.
+        """
+        key = self._key(key)
+        if not isinstance(reason, str) or not reason.strip():
+            raise NativeCoordinationError("A stop reason is required")
+        with self._db() as db:
+            row = self._task(db, key)
+            if row["phase"] != "RUNNING":
+                raise NativeCoordinationError("Only a RUNNING worker can be asked to stop")
+            data = json.loads(row["data"])
+            if data.get("stop"):
+                return {"alreadyRequested": True, **data["stop"]}
+            from mtm_competition.scheduling.deadline_policy import build_control_instruction
+            instruction_id = f"stop:{key}:{int(data.get('attempt_number', 1))}"
+            instruction = build_control_instruction(key, data.get("deadline_epoch"), "HANDOFF", instruction_id)
+            data["stop"] = {"requested": True, "reason": reason.strip()[:200], "instructionId": instruction_id,
+                            "confirmed": False, "source": None, "requestedAt": time.time(), "instruction": instruction}
+            db.execute("UPDATE tasks SET data=? WHERE key=?", (json.dumps(data), key))
+            db.execute("INSERT OR IGNORE INTO events(event_id,type,task_key,payload,status,updated_at) VALUES(?,?,?,?,?,?)",
+                       (instruction_id, "stop_requested", key,
+                        json.dumps({"type": "stop_requested", "eventId": instruction_id, "backlogItemKey": key, "instruction": instruction}),
+                        "PENDING", time.time()))
+            return {"alreadyRequested": False, **data["stop"]}
+
+    def confirm_stopped(self, key: str, source: str) -> dict[str, Any]:
+        """Record that the worker has stopped writing. Slot release/snapshot may only follow this.
+
+        `worker_ack` requires a prior stop request (the worker answers a specific instruction);
+        `native_runtime` / `root_attested` mean Root observed or caused the native agent to end.
+        A result file alone is never a confirmation.
+        """
+        key = self._key(key)
+        if source not in self.STOP_CONFIRM_SOURCES:
+            raise NativeCoordinationError(f"Unknown stop confirmation source {source!r}")
+        with self._db() as db:
+            row = self._task(db, key)
+            if row["phase"] != "RUNNING":
+                raise NativeCoordinationError("Only a RUNNING worker can be confirmed stopped")
+            data = json.loads(row["data"])
+            stop = data.get("stop")
+            if stop is None:
+                if source == "worker_ack":
+                    raise NativeCoordinationError("worker_ack requires a prior stop request")
+                stop = data["stop"] = {"requested": False, "reason": "confirmed without request", "instructionId": None,
+                                       "confirmed": False, "source": None, "requestedAt": None}
+            if not stop["confirmed"]:
+                stop.update(confirmed=True, source=source, confirmedAt=time.time())
+                db.execute("UPDATE tasks SET data=? WHERE key=?", (json.dumps(data), key))
+                if stop.get("instructionId"):
+                    db.execute("UPDATE events SET status='ACKED',updated_at=? WHERE event_id=?", (time.time(), stop["instructionId"]))
+            return dict(stop)
+
+    def is_quiesced(self, key: str) -> bool:
+        stop = self.stop_state(key)
+        return bool(stop and stop.get("confirmed"))
+
     def reconcile_worker(self, key: str, *, confirmed_stopped: bool,
                          reason: str, requeue: bool = False) -> dict[str, Any]:
         """Never automatically expire a lease while its native agent may still be writing.

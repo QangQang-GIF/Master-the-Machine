@@ -43,3 +43,11 @@ Follow `mtm-init` boundaries, TaskEnvelope constraints, and returned submit temp
    - Commit early and often: root's `finalize_item` snapshots and submits your worktree automatically at the cutoff, so committed work is never lost.
    - Always `git add` and `git commit` all modified source files, `src/tests/<key.lower()>-mvs.test.ts`, `answers/<key>/submit.json`, and `answers/<key>/evidence/*` inside your worktree before writing `worker_result.json`. Writing `worker_result.json` is your final step; root submits as soon as it appears.
    - **Heavy items** (`taskEnvelope.heavy == true`): your `time_budget_seconds` is capped. Do the announced MVS scenarios first, avoid exploring outside the task scope, commit after each passing scenario.
+
+## Stop / Handoff Instruction (V2 safe stop)
+
+If Root sends a control instruction with `state: HANDOFF` (or `CODE_FREEZE_REQUESTED`), stop nonessential work immediately:
+commit what exists, write an honest `worker_result.json`, STOP writing any file, and then write
+`.mtm_stopped.json` in your match root containing `{"instructionId": "<the instructionId from the instruction>"}`.
+Write it last. Root snapshots your worktree only after it sees this acknowledgement (or has ended you natively), so any
+write after the acknowledgement is ignored. Never write `submit.json` after a handoff instruction.

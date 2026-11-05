@@ -150,13 +150,13 @@ def test_finalize_full_evidence_submits_done(tmp_path):
     s = build(tmp_path, [item("TASK-01")])
     entry = s.dispatch_ready()["spawn"][0]
     worker_writes(entry)
-    out = s.finalize_item("TASK-01")
+    out = s.finalize_item("TASK-01", confirmed_stopped=True)
     assert out["status"] == "SUBMITTED" and out["answerStatus"] == "DONE" and out["notRun"] == []
     assert s.native.task_details("TASK-01")["phase"] == "SUBMITTED"
     assert (s.match_root / "README.md").read_text() == "After\n"
     remote_head = git(s.checkout_root, "ls-remote", "origin", "main").split()[0]
     assert remote_head == git(s.checkout_root, "rev-parse", "HEAD")
-    assert s.finalize_item("TASK-01")["status"] == "ALREADY_SUBMITTED"
+    assert s.finalize_item("TASK-01", confirmed_stopped=True)["status"] == "ALREADY_SUBMITTED"
     assert len(s.adapter.calls) == 1
 
 
@@ -166,7 +166,7 @@ def test_finalize_missing_screenshot_is_not_submitted_fail_closed(tmp_path):
     entry = s.dispatch_ready()["spawn"][0]
     worker_writes(entry, evidence=("check.txt",), status="DONE")
     with pytest.raises(SubmissionGateError):
-        s.finalize_item("TASK-01")
+        s.finalize_item("TASK-01", confirmed_stopped=True)
     assert s.adapter.calls == []
     assert s.native.task_details("TASK-01")["phase"] != "SUBMITTED"
     # No placeholder image was fabricated, and the integration lock was released.
@@ -180,7 +180,7 @@ def test_finalize_uncommitted_running_worker_is_snapshotted(tmp_path):
     entry = s.dispatch_ready()["spawn"][0]
     worker_writes(entry, evidence=("check.txt",), commit=False, result_file=False)
     with pytest.raises(SubmissionGateError):
-        s.finalize_item("TASK-01", force_partial=True)
+        s.finalize_item("TASK-01", force_partial=True, confirmed_stopped=True)
     assert s.adapter.calls == []
     assert s.native.task_details("TASK-01")["phase"] != "SUBMITTED"
     with s.native._db() as db:
@@ -194,7 +194,7 @@ def test_finalize_conflict_releases_lock_and_keeps_checkout_clean(tmp_path):
     (s.match_root / "README.md").write_text("Root version\n")
     git(s.checkout_root, "commit", "-am", "conflicting root change")
     with pytest.raises(ValueError, match="cherry-pick conflict"):
-        s.finalize_item("TASK-01")
+        s.finalize_item("TASK-01", confirmed_stopped=True)
     assert git(s.checkout_root, "status", "--porcelain", "--untracked-files=no") == ""
     with s.native._db() as db:
         assert s.native._meta(db, "integration_owner") is None
@@ -212,10 +212,10 @@ def test_finalize_replays_in_flight_submission_exactly(tmp_path):
         raise TimeoutError("gateway timeout")
     s.adapter.submit_work = flaky
     with pytest.raises(TimeoutError):
-        s.finalize_item("TASK-01")
+        s.finalize_item("TASK-01", confirmed_stopped=True)
     pending = s.journal.get_in_flight(s.match_uuid, "TASK-01")
     assert pending is not None
-    out = s.finalize_item("TASK-01")
+    out = s.finalize_item("TASK-01", confirmed_stopped=True)
     assert out["replayed"] is True
     assert s.adapter.calls[-1]["client_submission_id"] == pending["client_submission_id"]
 
@@ -264,6 +264,11 @@ def test_wait_auto_finalizes_item_near_deadline(tmp_path, monkeypatch):
     out = s.wait_for_update(5000)
     assert any(e["type"] == "auto_finalize" for e in out["events"])
     fin = out["autoFinalized"][0]
-    # V2 (P0): forced-PARTIAL results are never submitted by the gate; the failure is reported honestly.
-    assert fin["status"] == "FAILED"
+    # V2 (P1): the worker is still running, so nothing is snapshotted; Root must stop it first.
+    assert fin["status"] == "STOP_REQUIRED" and fin["stopWorker"] is True
+    assert fin["control"]["instructionId"].startswith("stop:TASK-03")
+    assert s.adapter.calls == []
+    # After Root confirms the stop, the forced-PARTIAL result is still refused by the fail-closed gate.
+    with pytest.raises(SubmissionGateError):
+        s.finalize_item("TASK-03", force_partial=True, confirmed_stopped=True)
     assert s.adapter.calls == []
