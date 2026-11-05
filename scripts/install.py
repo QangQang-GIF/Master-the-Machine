@@ -241,8 +241,8 @@ multi_agent_v2 = true
 [agents]
 enabled = true
 max_concurrent_threads_per_session = 6
-default_subagent_model = "gpt-6.1-sol"
-default_subagent_reasoning_effort = "medium"
+default_subagent_model = "gpt-6-luna"
+default_subagent_reasoning_effort = "low"
 
 [mcp_servers.mtm_minimal]
 command = "{python_exe}"
