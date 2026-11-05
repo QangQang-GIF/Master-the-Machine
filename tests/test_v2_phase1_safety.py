@@ -124,3 +124,33 @@ def test_no_blanket_git_add_in_submit_path():
     src = inspect.getsource(m.MCPHelperServer.submit_work)
     assert '"add", "-A"' not in src
     assert "Auto-heal" not in src
+
+
+def test_effective_capacity_config_is_single_source():
+    """V2 (P1 config drift): production.yaml must match the installer's native capacity."""
+    import re
+    from pathlib import Path
+    import yaml
+    root = Path(__file__).resolve().parents[1]
+    inst = (root / "scripts" / "install.py").read_text(encoding="utf-8")
+    get = lambda n: int(re.search(rf'^{n} = "(\d+)"', inst, re.M).group(1))
+    cfg = yaml.safe_load((root / "config" / "production.yaml").read_text(encoding="utf-8"))["runtime"]
+    assert cfg["concurrency_limit"] == get("MTM_NATIVE_MAX_WORKERS")
+    assert cfg["normal_workers"] == get("MTM_NATIVE_NORMAL_WORKERS")
+    assert cfg["urgent_reserved_workers"] == get("MTM_NATIVE_RESERVED_WORKERS")
+    assert re.search(r'^MTM_NATIVE_ALLOW_RESERVED_BORROW = "0"', inst, re.M)
+
+
+def test_events_are_durable_until_acknowledged(tmp_path):
+    """Phase 2: an event delivered but not acknowledged survives a coordinator restart and is replayable."""
+    repo, c = _coordinator(tmp_path, [{"key": "BUG-01", "type": "BUG", "status": "OPEN", "points": 10}])
+    events = c.poll_events()
+    assert [e["type"] for e in events] == ["slot_free"]
+    assert c.poll_events() == []  # reported once, as before
+    # Root "crashes" before acting: a fresh coordinator on the same state still knows the event.
+    c2 = NativeTaskCoordinator(tmp_path / "state", repo, repo / "source", "source", "MATCH")
+    pending = c2.unacked_events()
+    assert [e["eventId"] for e in pending] == [events[0]["eventId"]]
+    assert c2.ack_event(events[0]["eventId"]) is True
+    assert c2.ack_event(events[0]["eventId"]) is False  # idempotent
+    assert c2.unacked_events() == []

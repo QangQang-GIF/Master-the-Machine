@@ -15,9 +15,10 @@ skills:
   verify_checksums: true
 runtime:
   default_timeout_seconds: 420
-  concurrency_limit: 2
-  normal_workers: 1
-  urgent_reserved_workers: 1
+  # V2: single effective capacity config; must match scripts/install.py MTM_NATIVE_* (tests enforce it).
+  concurrency_limit: 5
+  normal_workers: 3
+  urgent_reserved_workers: 2
   log_level: INFO
   trace_logging: true
   submission:

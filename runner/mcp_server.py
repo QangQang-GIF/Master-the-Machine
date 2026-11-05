@@ -69,7 +69,7 @@ def _lane_settings_from_env() -> Dict[str, Any]:
     settings: Dict[str, Any] = {}
     if reserved and reserved > 0:
         settings["reserved_workers"] = reserved
-        settings["allow_reserved_borrow"] = os.environ.get("MTM_NATIVE_ALLOW_RESERVED_BORROW", "1") != "0"
+        settings["allow_reserved_borrow"] = False  # V2: PI reserve is never borrowable (env ignored)
     keys = [k for k in os.environ.get("MTM_HEAVY_KEYS", "").split(",") if k.strip()]
     if keys:
         settings["heavy_keys"] = keys

@@ -1,4 +1,4 @@
-"""Lane mode: 3 normal slots + 2 reserved slots that only PI and Heavy items may use."""
+"""V2 lane mode: 3 normal slots (Normal + Heavy) + 2 reserved slots that only PI may use and nobody may borrow."""
 import subprocess
 
 import pytest
@@ -49,7 +49,7 @@ def keys(plan):
     return [t['key'] for t in plan['selected']]
 
 
-def test_reserved_lane_only_for_pi_and_heavy(lanes):
+def test_reserved_lane_only_for_pi(lanes):
     project(lanes, item('BUG-01'), item('BUG-02'), item('CR-01'), item('CR-02'), item('TASK-04'))
     plan = lanes.plan_tasks()
     # Five free slots but only three normal ones: ordinary items never take reserved slots.
@@ -57,26 +57,37 @@ def test_reserved_lane_only_for_pi_and_heavy(lanes):
     assert {t['laneSlot'] for t in plan['selected']} == {'normal'}
 
 
-def test_pi_and_heavy_dispatch_immediately_while_normals_busy(lanes):
+def test_pi_dispatches_immediately_while_normals_busy_but_heavy_waits(lanes):
     project(lanes, item('BUG-01'), item('BUG-02'), item('CR-01'), item('CR-02'))
     for k in ('BUG-01', 'BUG-02', 'CR-01'):
         run(lanes, k)
     assert keys(lanes.plan_tasks()) == []
     project(lanes, item('PI-01'), item('TASK-05', title='[Heavy Task] Rebuild reporting'))
     plan = lanes.plan_tasks()
-    assert keys(plan) == ['PI-01', 'TASK-05']
-    assert all(t['laneSlot'] == 'reserved' for t in plan['selected'])
-    assert plan['selected'][1]['heavy'] is True
-
-
-def test_pi_precedes_heavy_and_reserved_cap(lanes):
-    project(lanes, item('TASK-05', title='[Heavy Task] A'), item('TASK-06', title='[heavy task] B'), item('PI-01'))
-    plan = lanes.plan_tasks()
-    assert [t['key'] for t in plan['selected'] if t['laneSlot'] == 'reserved'] == ['PI-01', 'TASK-05']
-    run(lanes, 'PI-01'); run(lanes, 'TASK-05')
-    assert 'TASK-06' not in keys(lanes.plan_tasks())
+    # V2: Heavy is no longer allowed to use the PI reserve; only PI starts.
+    assert keys(plan) == ['PI-01']
+    assert plan['selected'][0]['laneSlot'] == 'reserved'
     with pytest.raises(NativeCoordinationError):
-        run(lanes, 'TASK-06')
+        run(lanes, 'TASK-05')
+
+
+def test_heavy_uses_normal_lane_and_second_pi_uses_second_reserved_slot(lanes):
+    project(lanes, item('TASK-05', title='[Heavy Task] A'), item('PI-01'), item('PI-02'))
+    plan = lanes.plan_tasks()
+    by_key = {t['key']: t['laneSlot'] for t in plan['selected']}
+    assert by_key == {'PI-01': 'reserved', 'PI-02': 'reserved', 'TASK-05': 'normal'}
+    assert plan['selected'][-1]['heavy'] is True
+
+
+def test_pi_may_expand_into_idle_normal_slot_but_total_cap_holds(lanes):
+    project(lanes, item('PI-01'), item('PI-02'), item('PI-03'), item('CR-01'))
+    plan = lanes.plan_tasks()
+    slots = {t['key']: t['laneSlot'] for t in plan['selected']}
+    assert slots['PI-01'] == slots['PI-02'] == 'reserved'
+    assert slots['PI-03'] == 'normal'  # reserve full -> idle normal slot
+    for k in ('PI-01', 'PI-02', 'PI-03'):
+        run(lanes, k)
+    assert len(lanes.plan_tasks()['active']) <= 5
 
 
 def test_arrival_order_not_score(lanes):
@@ -94,31 +105,27 @@ def test_deadline_items_first_in_normal_lane(lanes):
     assert keys(lanes.plan_tasks())[0] == 'TASK-03'
 
 
-def test_imminent_deadline_borrows_idle_reserved_slot(lanes):
+def test_imminent_deadline_item_can_never_borrow_pi_reserve(lanes):
     project(lanes, item('CR-01'), item('CR-02'), item('CR-03'))
     for k in ('CR-01', 'CR-02', 'CR-03'):
         run(lanes, k)
     project(lanes, item('TASK-03', deadline_epoch=NOW + 170))
-    plan = lanes.plan_tasks()
-    assert keys(plan) == ['TASK-03']
-    assert plan['selected'][0]['laneSlot'] == 'reserved'
-    claim = run(lanes, 'TASK-03')
-    assert claim['taskEnvelope']['lane'] == 'reserved'
-    # The borrowed slot counts against the reserved lane.
-    assert lanes.plan_tasks()['lanes']['reserved']['running'] == 1
+    assert keys(lanes.plan_tasks()) == []
+    with pytest.raises(NativeCoordinationError):
+        run(lanes, 'TASK-03')
 
 
-def test_no_borrow_when_pi_or_heavy_waiting(lanes):
+def test_only_pi_selected_when_pi_and_heavy_waiting(lanes):
     project(lanes, item('CR-01'), item('CR-02'), item('CR-03'))
     for k in ('CR-01', 'CR-02', 'CR-03'):
         run(lanes, k)
     project(lanes, item('TASK-03', deadline_epoch=NOW + 170), item('PI-01'), item('TASK-05', title='[Heavy Task] X'))
-    plan = lanes.plan_tasks()
-    assert keys(plan) == ['PI-01', 'TASK-05']
+    assert keys(lanes.plan_tasks()) == ['PI-01']
 
 
-def test_borrow_can_be_disabled(tmp_path):
-    c = make(tmp_path, allow_reserved_borrow=False)
+def test_borrow_flag_is_ignored(tmp_path):
+    c = make(tmp_path, allow_reserved_borrow=True)
+    assert c.allow_reserved_borrow is False
     project(c, item('CR-01'), item('CR-02'), item('CR-03'))
     for k in ('CR-01', 'CR-02', 'CR-03'):
         run(c, k)
@@ -130,7 +137,7 @@ def test_heavy_by_operator_key_and_budget_cap(tmp_path):
     c = make(tmp_path, heavy_keys=['CR-09'], heavy_max_seconds=300)
     project(c, item('CR-09'))
     plan = c.plan_tasks()
-    assert plan['selected'][0]['laneSlot'] == 'reserved'
+    assert plan['selected'][0]['laneSlot'] == 'normal'
     claim = run(c, 'CR-09')
     assert claim['taskEnvelope']['heavy'] is True
     assert claim['taskEnvelope']['time_budget_seconds'] <= 300
@@ -140,8 +147,9 @@ def test_heavy_by_difficulty_threshold(tmp_path):
     c = make(tmp_path, heavy_min_difficulty=3.5)
     project(c, item('CR-01', title='Add aging report with screenshot', minimumVerificationScenarios=[{'id': f'TC-{i}'} for i in range(6)]),
             item('BUG-03', title='Fix status precedence'))
-    lanes_by_key = {t['key']: t['laneSlot'] for t in c.plan_tasks()['selected']}
-    assert lanes_by_key == {'CR-01': 'reserved', 'BUG-03': 'normal'}
+    sel = {t['key']: t for t in c.plan_tasks()['selected']}
+    assert sel['CR-01']['heavy'] is True and sel['BUG-03']['heavy'] is False
+    assert {t['laneSlot'] for t in sel.values()} == {'normal'}
 
 
 def test_invalid_lane_capacity_rejected(tmp_path):

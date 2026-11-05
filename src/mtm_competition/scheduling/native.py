@@ -39,7 +39,9 @@ class NativeTaskCoordinator:
             raise NativeCoordinationError("Require 1 <= reserved_workers and normal_workers + reserved_workers <= max_workers")
         self.reserved_workers = reserved_workers
         self.lane_mode = reserved_workers is not None
-        self.allow_reserved_borrow = bool(allow_reserved_borrow)
+        # V2 (P1): the PI reserve can never be borrowed by Normal/Heavy work. The argument is kept
+        # only for API compatibility and is deliberately ignored.
+        self.allow_reserved_borrow = False
         self.heavy_keys = {str(k).strip().upper() for k in (heavy_keys or []) if str(k).strip()}
         self.heavy_min_difficulty = heavy_min_difficulty
         self.heavy_max_seconds = int(heavy_max_seconds) if heavy_max_seconds else None
@@ -70,6 +72,9 @@ class NativeTaskCoordinator:
                   key TEXT PRIMARY KEY,data TEXT NOT NULL,phase TEXT NOT NULL DEFAULT 'QUEUED',
                   started INTEGER NOT NULL DEFAULT 0,worker_id TEXT,worktree TEXT,
                   discovered REAL NOT NULL,result TEXT,receipt TEXT);
+                CREATE TABLE IF NOT EXISTS events(
+                  event_id TEXT PRIMARY KEY,type TEXT NOT NULL,task_key TEXT,payload TEXT NOT NULL,
+                  status TEXT NOT NULL DEFAULT 'PENDING',updated_at REAL NOT NULL);
             """)
             identity = json.dumps([str(self.checkout_root), str(self.match_root), repository_folder, match_id])
             old = self._meta(db, "identity")
@@ -233,8 +238,11 @@ class NativeTaskCoordinator:
         return False
 
     def _lane(self, task: dict) -> str:
-        """Lane an item belongs to: 'reserved' (PI/Heavy) or 'normal'."""
-        if str(task.get("type", "")).upper() == "PI" or self._is_heavy(task):
+        """Lane an item belongs to: 'reserved' (PI only) or 'normal' (Normal and Heavy).
+
+        V2: Heavy no longer uses the PI reserve; it consumes normal capacity.
+        """
+        if str(task.get("type", "")).upper() == "PI":
             return "reserved"
         return "normal"
 
@@ -457,8 +465,7 @@ class NativeTaskCoordinator:
                 continue
             lane = self._lane(task)
             if lane == "reserved":
-                # PI before Heavy; inside each, nearest deadline then arrival order.
-                tier = 0 if str(task.get("type", "")).upper() == "PI" else 1
+                tier = 0  # PI: hard priority; nearest deadline then arrival order.
             elif deadline is not None and slack <= 180:
                 tier = 0
             elif deadline is not None or task.get("deadlineMinutes") is not None:
@@ -477,10 +484,10 @@ class NativeTaskCoordinator:
             slot = None
             if used[lane] < caps[lane]:
                 slot = lane
-            elif (lane == "normal" and self.allow_reserved_borrow and tier == 0
-                    and not reserved_waiting and used["reserved"] < caps["reserved"]):
-                # Safety valve: an imminent deadline item may borrow an idle reserved slot.
-                slot = "reserved"
+            elif lane == "reserved" and used["normal"] < caps["normal"]:
+                # PI may expand into an idle normal slot (total active stays <= max_workers).
+                # The reverse never happens: Normal/Heavy cannot take the PI reserve.
+                slot = "normal"
             if slot is None:
                 continue
             used[slot] += 1
@@ -497,7 +504,11 @@ class NativeTaskCoordinator:
             used[self._slot_of(json.loads(r["data"]))] += 1
         lane = self._lane(task)
         caps = {"normal": self.normal_workers, "reserved": self.reserved_workers}
-        return lane if used[lane] < caps[lane] else None
+        if used[lane] < caps[lane]:
+            return lane
+        if lane == "reserved" and used["normal"] < caps["normal"]:
+            return "normal"  # PI may use an idle normal slot; never the other way round
+        return None
 
     def plan_tasks(self) -> dict[str, Any]:
         with self._db() as db:
@@ -523,7 +534,7 @@ class NativeTaskCoordinator:
                     tag = f"result:{key}:{attempt}"
                     if tag not in seen and marker.is_file():
                         seen.add(tag)
-                        events.append({"type": "worker_result_file", "backlogItemKey": key, "path": str(marker)})
+                        events.append({"type": "worker_result_file", "eventId": tag, "backlogItemKey": key, "path": str(marker)})
                 if now is None or row["phase"] not in ("QUEUED", "RUNNING", "READY_TO_INTEGRATE"):
                     continue
                 deadline = task.get("deadline_epoch")
@@ -533,31 +544,53 @@ class NativeTaskCoordinator:
                         tag = f"deadline:{key}:{attempt}:{threshold}"
                         if 0 < slack <= threshold and tag not in seen:
                             seen.add(tag)
-                            events.append({"type": "deadline_near", "backlogItemKey": key, "phase": row["phase"],
+                            events.append({"type": "deadline_near", "eventId": tag, "backlogItemKey": key, "phase": row["phase"],
                                            "slackSeconds": round(slack, 1), "threshold": threshold})
                     if (finalize_slack is not None and row["phase"] in ("RUNNING", "READY_TO_INTEGRATE")
                             and 0 < slack <= finalize_slack):
                         tag = f"finalize:{key}:{attempt}"
                         if tag not in seen:
                             seen.add(tag)
-                            events.append({"type": "auto_finalize", "backlogItemKey": key,
+                            events.append({"type": "auto_finalize", "eventId": tag, "backlogItemKey": key,
                                            "reason": "deadline", "slackSeconds": round(slack, 1)})
                 if (match_finalize_slack is not None and remaining is not None
                         and row["phase"] in ("RUNNING", "READY_TO_INTEGRATE") and 0 < remaining <= match_finalize_slack):
                     tag = f"finalize:{key}:{attempt}"
                     if tag not in seen:
                         seen.add(tag)
-                        events.append({"type": "auto_finalize", "backlogItemKey": key,
+                        events.append({"type": "auto_finalize", "eventId": tag, "backlogItemKey": key,
                                        "reason": "match_end", "remainingSeconds": round(remaining, 1)})
             plan = self._plan(db)
             if plan["selected"]:
                 signature = "slot:" + ",".join(sorted(t["key"] for t in plan["selected"]))
                 if signature not in seen:
                     seen.add(signature)
-                    events.append({"type": "slot_free", "selected": [t["key"] for t in plan["selected"]],
+                    events.append({"type": "slot_free", "eventId": signature, "selected": [t["key"] for t in plan["selected"]],
                                    "availableSlots": plan["availableSlots"]})
             self._set_meta(db, "reported_events", sorted(seen))
+            # V2 (Q15/Q23): minimal durable lifecycle PENDING -> DELIVERED -> ACKED on the existing SQLite.
+            for ev in events:
+                db.execute("INSERT OR IGNORE INTO events(event_id,type,task_key,payload,status,updated_at) VALUES(?,?,?,?,?,?)",
+                           (ev["eventId"], ev["type"], ev.get("backlogItemKey"), json.dumps(ev), "DELIVERED", time.time()))
         return events
+
+    def ack_event(self, event_id: str) -> bool:
+        """Root calls this only after the action for the event was applied. Idempotent."""
+        with self._db() as db:
+            cur = db.execute("UPDATE events SET status='ACKED',updated_at=? WHERE event_id=? AND status!='ACKED'",
+                             (time.time(), event_id))
+            return cur.rowcount > 0
+
+    def unacked_events(self, reset_to_pending: bool = False) -> list[dict[str, Any]]:
+        """Events delivered but never acknowledged (e.g. Root crashed mid-action), oldest first.
+
+        Callers must make the corresponding actions idempotent; the event is replayed, not the side effect.
+        """
+        with self._db() as db:
+            rows = db.execute("SELECT event_id,payload FROM events WHERE status!='ACKED' ORDER BY updated_at,event_id").fetchall()
+            if reset_to_pending and rows:
+                db.execute("UPDATE events SET status='PENDING',updated_at=? WHERE status!='ACKED'", (time.time(),))
+            return [json.loads(r["payload"]) for r in rows]
 
     def _git(self, *args: str, cwd: Path | None = None) -> str:
         res = subprocess.run(["git", "-C", str(cwd or self.checkout_root), *args], capture_output=True, text=True, timeout=30)
