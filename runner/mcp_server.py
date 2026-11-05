@@ -73,6 +73,8 @@ def _lane_settings_from_env() -> Dict[str, Any]:
     # V2 feature flags (Plan section 15): both must be on; default off keeps V1 ordering.
     if os.environ.get("MTM_ORCH_V2_ENABLED", "0") == "1" and os.environ.get("MTM_V2_ADAPTIVE_SCHEDULER", "0") == "1":
         settings["adaptive"] = True
+    if os.environ.get("MTM_ORCH_V2_ENABLED", "0") == "1" and os.environ.get("MTM_V2_DEADLINE_CONTROL", "0") == "1":
+        settings["deadline_control"] = True
     keys = [k for k in os.environ.get("MTM_HEAVY_KEYS", "").split(",") if k.strip()]
     if keys:
         settings["heavy_keys"] = keys

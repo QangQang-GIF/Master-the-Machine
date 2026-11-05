@@ -30,9 +30,12 @@ class NativeTaskCoordinator:
                  reserved_workers: int | None = None, allow_reserved_borrow: bool = True,
                  heavy_keys: list[str] | set[str] | None = None,
                  heavy_min_difficulty: float | None = None,
-                 heavy_max_seconds: int | None = None, adaptive: bool = False):
+                 heavy_max_seconds: int | None = None, adaptive: bool = False,
+                 deadline_control: bool = False):
         # V2 (MTM_V2_ADAPTIVE_SCHEDULER): order non-PI work by expected score per time and explain decisions.
         self.adaptive = bool(adaptive)
+        # V2 (MTM_V2_DEADLINE_CONTROL): emit identified code-freeze/evidence-priority control events.
+        self.deadline_control = bool(deadline_control)
         if not 1 <= normal_workers < max_workers <= 16:
             raise NativeCoordinationError("Require 1 <= normal_workers < max_workers <= 16")
         # Lane mode: `normal_workers` slots for ordinary items plus `reserved_workers`
@@ -559,6 +562,20 @@ class NativeTaskCoordinator:
                 deadline = task.get("deadline_epoch")
                 if deadline is not None:
                     slack = float(deadline) - now
+                    if self.deadline_control and row["phase"] == "RUNNING":
+                        from mtm_competition.scheduling.deadline_policy import (
+                            RemainingWork, build_control_instruction, deadline_state)
+                        from mtm_competition.tasks.triage import triage_task
+                        tri = triage_task(task)
+                        work = RemainingWork(verification_seconds=30.0, evidence_seconds=float(tri.estimatedEvidenceSeconds))
+                        dstate = deadline_state(slack, work)
+                        ctl_tag = f"ctl:{key}:{attempt}:{dstate}"
+                        if dstate != "NORMAL" and ctl_tag not in seen:
+                            seen.add(ctl_tag)
+                            instr = build_control_instruction(key, float(deadline), dstate, ctl_tag)
+                            events.append({**instr, "eventId": ctl_tag, "type": "deadline_control",
+                                           "controlType": instr["type"], "slackSeconds": round(slack, 1),
+                                           "requiredRemainingSeconds": round(work.required_remaining_time(), 1)})
                     for threshold in self.DEADLINE_THRESHOLDS:
                         tag = f"deadline:{key}:{attempt}:{threshold}"
                         if 0 < slack <= threshold and tag not in seen:
