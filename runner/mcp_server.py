@@ -153,8 +153,15 @@ def announced_test_ids(details: Dict[str, Any]) -> List[str]:
         elif isinstance(value, str):
             ids.update(re.findall(r"\b(?:[A-Z0-9]+-)*(?:TC|MVS|SCENARIO|TEST)-\d+(?:-[A-Za-z0-9]+)*\b", value))
     walk(details.get("submitTemplate", {}))
-    walk(details.get("minimumVerificationScenarios", details.get("mvs")), True)
-    return sorted(ids)
+    template_ids = set(ids)
+    if not template_ids:
+        # No structured template: fall back to the MVS text, but only to fully qualified ids
+        # (e.g. BUG-01-TC-01). Prose such as "the same conditions as TC-01" is a cross-reference,
+        # not a separate requirement the answer schema can ever satisfy.
+        walk(details.get("minimumVerificationScenarios", details.get("mvs")), True)
+        ids = {i for i in ids if re.search(r"[A-Z0-9]+-(?:TC|MVS|SCENARIO|TEST)-\d", i)} or ids
+    # The submit template's own testResults ids are authoritative; never add bare aliases of them.
+    return sorted(i for i in ids if not any(o != i and o.endswith("-" + i) for o in ids))
 
 
 def resolve_stored_session_credentials(workspace_root: Path, match_code: Optional[str]) -> Dict[str, Any]:
