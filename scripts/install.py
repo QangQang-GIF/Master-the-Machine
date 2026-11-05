@@ -236,6 +236,8 @@ MTM_HEAVY_MAX_SECONDS = "900"
 MTM_AUTO_FINALIZE_SLACK = "150"
 MTM_AUTO_FINALIZE_MATCH_SLACK = "240"
 MTM_ENV = "production"
+MTM_WORKER_MODEL = "gpt-6-luna"  # practice match: cheap model
+MTM_WORKER_EFFORT = "low"
 """
     (codex_dir / "config.toml").write_text(codex_toml, encoding="utf-8")
     (target_pack_dir / ".codex").mkdir(parents=True, exist_ok=True)
