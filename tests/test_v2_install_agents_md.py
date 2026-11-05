@@ -25,3 +25,10 @@ def test_repo_agents_md_states_four_plus_one():
     text = (ROOT / "AGENTS.md").read_text(encoding="utf-8")
     assert "4 normal slots" in text and "1 reserved slot" in text
     assert "1 normal worker slot" not in text
+
+
+def test_both_skill_copies_match_and_state_four_plus_one():
+    a = (ROOT / ".agents/skills/team-orchestrator/SKILL.md").read_text(encoding="utf-8")
+    b = (ROOT / "skills/team-orchestrator/SKILL.md").read_text(encoding="utf-8")
+    assert a == b  # install overlays skills/ onto .agents/skills/, so a stale copy would win
+    assert "4 normal slots" in a and "3 normal slots" not in a
