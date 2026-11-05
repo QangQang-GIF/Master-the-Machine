@@ -1,15 +1,17 @@
 {
   "assumptions": {
-    "normal": 3,
-    "perChildOverheadSeconds": 30,
+    "calibration": "CR-01 real duration 864s from match G97MQB4T; overhead still an assumption",
+    "dagTotalSeconds": 864,
+    "normal": 4,
+    "perChildOverheadSeconds": 30.0,
     "piArrivalSeconds": 100.0,
-    "reserved": 2,
+    "reserved": 1,
     "slots": 5
   },
   "comparison": {
     "caveat": "Model only. Real acceptance needs measured end-to-end replay and Practice Match data (Plan 14).",
-    "heavyMedianReductionPercent": -5.88,
-    "meets20PercentHeavyTarget_IN_MODEL": false,
+    "heavyMedianReductionPercent": 24.31,
+    "meets20PercentHeavyTarget_IN_MODEL": true,
     "piWaitP95_v2_not_worse": true
   },
   "model": "slot-policy model, NOT measured execution",
@@ -18,20 +20,20 @@
   "v1": {
     "heavyDegradedRate": 0.0,
     "heavySeconds": {
-      "median": 510.0,
-      "p95": 510.0
+      "median": 864.0,
+      "p95": 864.0
     },
     "piWaitSeconds": {
-      "max": 674.7012507291399,
-      "median": 0.0,
-      "p95": 440.5545123743609
+      "max": 697.9030006834748,
+      "median": 299.6218265545558,
+      "p95": 679.1564522309646
     }
   },
   "v2": {
-    "heavyDegradedRate": 0.69,
+    "heavyDegradedRate": 0.345,
     "heavySeconds": {
-      "median": 540.0,
-      "p95": 540.0
+      "median": 654.0,
+      "p95": 894.0
     },
     "piWaitSeconds": {
       "max": 0.0,

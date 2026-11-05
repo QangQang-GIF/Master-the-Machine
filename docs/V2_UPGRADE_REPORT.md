@@ -45,3 +45,11 @@ with `scripts/update_checksums.py` and verify clean.
    TASK/PI contract permits a partial submission must be wired from the announced contract before that can return.
 5. Rollout stages (shadow scheduler, canary) are not built: only the feature flags exist.
 6. The 5 baseline failures need a run on the project's Windows machine.
+
+## Update: gap-fix round
+- Emergency flush now requests a stop first and promotes only after a confirmed stop; begin_integration requires quiescence under V2.
+- Model routing wired into claim envelope (requested model only; actual model reported as unreported).
+- Config/manifest aligned to 5 = 4 normal + 1 PI reserve; new schemas; fault-injection tests.
+- Benchmark model recalibrated with real match G97MQB4T durations (CR-01 864s, BUG-01 1614s, PI-01 210s, CR-02 371s, CR-03 374s, TASK-03 151s, BUG-03 235s). Result is still a model: Heavy -24% at 30s/child overhead, -14% at 60s; gate NOT demonstrated.
+- Real-match observation: losses came from unfinished items (BUG-02, BUG-04, TASK-04 never submitted/started) and PARTIAL scores (CR-01 20/140, CR-03 35/100), more than from raw speed.
+- Still unbuilt/unverified: see V2_PRODUCTION_READINESS_CHECKLIST.md.

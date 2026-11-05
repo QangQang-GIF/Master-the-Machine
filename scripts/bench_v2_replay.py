@@ -24,12 +24,15 @@ from mtm_competition.tasks.heavy_plan import HeavyPlan, critical_path  # noqa: E
 PLAN = {
     "planVersion": 1, "parentBacklogItemKey": "CR-05", "parentAgentId": "heavy-CR-05", "baseRevision": "x", "deadlineEpoch": 1,
     "subtasks": [
-        {"subtaskId": "A", "description": "a", "dependsOn": [], "ownedPaths": ["a/"], "expectedOutputs": [], "estimatedSeconds": 180},
-        {"subtaskId": "B", "description": "b", "dependsOn": [], "ownedPaths": ["b/"], "expectedOutputs": [], "estimatedSeconds": 210},
-        {"subtaskId": "C", "description": "c", "dependsOn": ["A", "B"], "ownedPaths": ["c/"], "expectedOutputs": [], "estimatedSeconds": 120},
+        {"subtaskId": "A", "description": "a", "dependsOn": [], "ownedPaths": ["a/"], "expectedOutputs": [], "estimatedSeconds": 300},
+        {"subtaskId": "B", "description": "b", "dependsOn": [], "ownedPaths": ["b/"], "expectedOutputs": [], "estimatedSeconds": 330},
+        {"subtaskId": "C", "description": "c", "dependsOn": ["A", "B"], "ownedPaths": ["c/"], "expectedOutputs": [], "estimatedSeconds": 234},
     ],
 }
-TOTAL_SLOTS, NORMAL, RESERVED = 5, 3, 2
+# Calibrated from real match G97MQB4T: CR-01 (largest feature) took 864s start->submit; PI-01 210s; CR-02 371s; CR-03 374s.
+# DAG estimates below sum to 864s (CR-01). Real DAG split/overhead is NOT measured.
+TOTAL_SLOTS, NORMAL, RESERVED = 5, 4, 1
+OVERHEAD = 30.0
 PI_ARRIVAL = 100.0
 
 
@@ -57,7 +60,8 @@ def pi_wait(policy: str, rng: random.Random) -> float:
     return max(0.0, start - PI_ARRIVAL)
 
 
-def heavy_makespan(policy: str, rng: random.Random, overhead: float = 30.0) -> dict:
+def heavy_makespan(policy: str, rng: random.Random, overhead: float = None) -> dict:
+    overhead = OVERHEAD if overhead is None else overhead
     plan = HeavyPlan.from_dict(PLAN)
     sequential = sum(s["estimatedSeconds"] for s in PLAN["subtasks"])
     if policy == "v1":
@@ -76,7 +80,7 @@ def heavy_makespan(policy: str, rng: random.Random, overhead: float = 30.0) -> d
 
 def run(seed: int, runs: int) -> dict:
     out = {"model": "slot-policy model, NOT measured execution", "seed": seed, "runs": runs,
-           "assumptions": {"slots": TOTAL_SLOTS, "normal": NORMAL, "reserved": RESERVED, "perChildOverheadSeconds": 30,
+           "assumptions": {"slots": TOTAL_SLOTS, "normal": NORMAL, "reserved": RESERVED, "perChildOverheadSeconds": OVERHEAD, "dagTotalSeconds": 864, "calibration": "CR-01 real duration 864s from match G97MQB4T; overhead still an assumption",
                            "piArrivalSeconds": PI_ARRIVAL}}
     for policy in ("v1", "v2"):
         rng = random.Random(f"{seed}:{policy}")
@@ -100,14 +104,16 @@ def run(seed: int, runs: int) -> dict:
 
 
 def main() -> int:
-    global NORMAL, RESERVED, TOTAL_SLOTS
+    global NORMAL, RESERVED, TOTAL_SLOTS, OVERHEAD
     ap = argparse.ArgumentParser()
     ap.add_argument("--seed", type=int, default=20261105)
     ap.add_argument("--runs", type=int, default=200)
     ap.add_argument("--out", default="")
-    ap.add_argument("--normal", type=int, default=3, help="Normal+Heavy slots (sensitivity analysis)")
-    ap.add_argument("--reserved", type=int, default=2, help="PI-only reserved slots (>=1)")
+    ap.add_argument("--normal", type=int, default=4, help="Normal+Heavy slots (sensitivity analysis)")
+    ap.add_argument("--reserved", type=int, default=1, help="PI-only reserved slots (>=1)")
+    ap.add_argument("--overhead", type=float, default=30.0, help="per-child overhead seconds (assumption)")
     a = ap.parse_args()
+    OVERHEAD = a.overhead
     NORMAL, RESERVED = a.normal, max(1, a.reserved)
     TOTAL_SLOTS = NORMAL + RESERVED
     res = run(a.seed, a.runs)

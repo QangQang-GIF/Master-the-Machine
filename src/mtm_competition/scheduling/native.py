@@ -31,11 +31,13 @@ class NativeTaskCoordinator:
                  heavy_keys: list[str] | set[str] | None = None,
                  heavy_min_difficulty: float | None = None,
                  heavy_max_seconds: int | None = None, adaptive: bool = False,
-                 deadline_control: bool = False):
+                 deadline_control: bool = False, model_routing: bool = False):
         # V2 (MTM_V2_ADAPTIVE_SCHEDULER): order non-PI work by expected score per time and explain decisions.
         self.adaptive = bool(adaptive)
         # V2 (MTM_V2_DEADLINE_CONTROL): emit identified code-freeze/evidence-priority control events.
         self.deadline_control = bool(deadline_control)
+        # V2 (MTM_V2_MODEL_ROUTING): choose model/effort per task inside the allowlist and record requested vs actual.
+        self.model_routing = bool(model_routing)
         if not 1 <= normal_workers < max_workers <= 16:
             raise NativeCoordinationError("Require 1 <= normal_workers < max_workers <= 16")
         # Lane mode: `normal_workers` slots for ordinary items plus `reserved_workers`
@@ -280,7 +282,7 @@ class NativeTaskCoordinator:
         response = {"matchStatus": status, "availableSlots": max(0, self.max_workers - len(active)),
                     "selected": [], "active": [public_row(r) for r in active], "readyToIntegrate": [],
                     "readyDiagnostics": [], "skippedReady": [], "integrationOwner": owner, "integrationBlocked": [],
-                    "overdueWorkers": []}
+                    "overdueWorkers": [], "emergencyStops": []}
         if clock_ready:
             slacks = [float(json.loads(r["data"])["deadline_epoch"]) - now for r in rows
                       if r["phase"] in ("QUEUED", "RUNNING") and json.loads(r["data"]).get("deadline_epoch") is not None]
@@ -303,6 +305,15 @@ class NativeTaskCoordinator:
                 except Exception:
                     pass
                 if ans_file.is_file() or has_changes:
+                    # V2 (P1): never write into, or snapshot, a worktree whose worker may still be writing.
+                    stop = task.get("stop")
+                    if not stop:
+                        req = self._request_stop_db(db, key, f"emergency cutoff at {int(slack)}s before deadline")
+                        response["emergencyStops"].append({"key": key, "instructionId": req["instructionId"],
+                                                           "slackSeconds": round(slack, 1)})
+                        continue
+                    if not stop.get("confirmed"):
+                        continue  # stop requested, waiting for the worker's acknowledgement
                     if not ans_file.is_file():
                         ans_file.parent.mkdir(parents=True, exist_ok=True)
                         tpl = task.get("start_details", {}).get("submitTemplate") or {
@@ -356,6 +367,7 @@ class NativeTaskCoordinator:
             expired = status == "FINISHED" or (running and clock_ready and slack <= 0)
             closed = task.get("status") == "CLOSED" or expired
             record = {**public_row(row), "type": task["type"], "taskStatus": task.get("status"),
+                      "quiesced": bool((task.get("stop") or {}).get("confirmed")),
                       "deadlineEpoch": deadline, "slackSeconds": slack,
                       "urgent": self._urgent(task, now) if now is not None else task["type"] == "PI"}
             if closed and row["phase"] == "READY_TO_INTEGRATE" and owner != row["key"]:
@@ -827,6 +839,18 @@ class NativeTaskCoordinator:
                                      "match_id": self.match_id, "worker_id": worker_id,
                                      "submit_template": details.get("submitTemplate"),
                                      "worker_result_path": str(worker_match / "worker_result.json")}}
+            if self.model_routing:
+                try:
+                    from mtm_competition.scheduling.model_policy import load_policy, select_model
+                    from mtm_competition.tasks.triage import triage_task
+                    policy = load_policy(Path(__file__).resolve().parents[3] / "config" / "model_profiles.yaml")
+                    tri = triage_task(eligible)
+                    sel = select_model(policy, tri.recommendedModelTier, "codex", seconds_left=remaining,
+                                       estimated_seconds=float(tri.estimatedWorkSeconds + tri.estimatedEvidenceSeconds))
+                    envelope["model"], envelope["reasoning_effort"] = sel["model"], sel["effort"]
+                    envelope["model_selection"] = {**sel, "triage": tri.to_dict()}
+                except Exception as exc:  # never block a claim on routing; keep runtime defaults and say so
+                    envelope["model_selection"] = {"error": str(exc)[:200], "actualModel": None, "actualSource": "unreported"}
             stored = json.loads(row["data"])
             _, server_now, server_remaining = self._clock(db)
             stored["lease"] = {"start_server_epoch": server_now, "start_remaining_seconds": server_remaining,
@@ -953,6 +977,25 @@ class NativeTaskCoordinator:
         with self._db() as db:
             return json.loads(self._task(db, self._key(key))["data"]).get("stop")
 
+    def _request_stop_db(self, db, key: str, reason: str) -> dict[str, Any]:
+        row = self._task(db, key)
+        if row["phase"] != "RUNNING":
+            raise NativeCoordinationError("Only a RUNNING worker can be asked to stop")
+        data = json.loads(row["data"])
+        if data.get("stop"):
+            return {"alreadyRequested": True, **data["stop"]}
+        from mtm_competition.scheduling.deadline_policy import build_control_instruction
+        instruction_id = f"stop:{key}:{int(data.get('attempt_number', 1))}"
+        instruction = build_control_instruction(key, data.get("deadline_epoch"), "HANDOFF", instruction_id)
+        data["stop"] = {"requested": True, "reason": reason.strip()[:200], "instructionId": instruction_id,
+                        "confirmed": False, "source": None, "requestedAt": time.time(), "instruction": instruction}
+        db.execute("UPDATE tasks SET data=? WHERE key=?", (json.dumps(data), key))
+        db.execute("INSERT OR IGNORE INTO events(event_id,type,task_key,payload,status,updated_at) VALUES(?,?,?,?,?,?)",
+                   (instruction_id, "stop_requested", key,
+                    json.dumps({"type": "stop_requested", "eventId": instruction_id, "backlogItemKey": key, "instruction": instruction}),
+                    "PENDING", time.time()))
+        return {"alreadyRequested": False, **data["stop"]}
+
     def request_stop(self, key: str, reason: str) -> dict[str, Any]:
         """Ask a RUNNING worker to stop writing. Idempotent. The slot stays occupied until confirmed.
 
@@ -963,23 +1006,7 @@ class NativeTaskCoordinator:
         if not isinstance(reason, str) or not reason.strip():
             raise NativeCoordinationError("A stop reason is required")
         with self._db() as db:
-            row = self._task(db, key)
-            if row["phase"] != "RUNNING":
-                raise NativeCoordinationError("Only a RUNNING worker can be asked to stop")
-            data = json.loads(row["data"])
-            if data.get("stop"):
-                return {"alreadyRequested": True, **data["stop"]}
-            from mtm_competition.scheduling.deadline_policy import build_control_instruction
-            instruction_id = f"stop:{key}:{int(data.get('attempt_number', 1))}"
-            instruction = build_control_instruction(key, data.get("deadline_epoch"), "HANDOFF", instruction_id)
-            data["stop"] = {"requested": True, "reason": reason.strip()[:200], "instructionId": instruction_id,
-                            "confirmed": False, "source": None, "requestedAt": time.time(), "instruction": instruction}
-            db.execute("UPDATE tasks SET data=? WHERE key=?", (json.dumps(data), key))
-            db.execute("INSERT OR IGNORE INTO events(event_id,type,task_key,payload,status,updated_at) VALUES(?,?,?,?,?,?)",
-                       (instruction_id, "stop_requested", key,
-                        json.dumps({"type": "stop_requested", "eventId": instruction_id, "backlogItemKey": key, "instruction": instruction}),
-                        "PENDING", time.time()))
-            return {"alreadyRequested": False, **data["stop"]}
+            return self._request_stop_db(db, key, reason)
 
     def confirm_stopped(self, key: str, source: str) -> dict[str, Any]:
         """Record that the worker has stopped writing. Slot release/snapshot may only follow this.
@@ -1134,11 +1161,17 @@ class NativeTaskCoordinator:
         with self._db() as db:
             self._assert_can_submit(db, key)
 
-    def begin_integration(self, key: str) -> dict[str, Any]:
+    def begin_integration(self, key: str, require_quiesced: bool = False) -> dict[str, Any]:
+        """Take the exclusive integration lock. With `require_quiesced` (V2), the worker must have been
+        confirmed stopped (or have been integrated through the finalize path) so its worktree cannot change."""
         key = self._key(key)
         with self._db() as db:
             row = self._task(db, key)
             self._assert_can_submit(db, key)
+            if require_quiesced and row["phase"] == "READY_TO_INTEGRATE":
+                stop = json.loads(row["data"]).get("stop")
+                if not (stop and stop.get("confirmed")):
+                    raise NativeCoordinationError("Worker has not been confirmed stopped; request_stop/confirm_stopped first")
             owner = self._meta(db, "integration_owner")
             if owner and owner != key:
                 raise NativeCoordinationError("Another task owns the integration/submission lock")

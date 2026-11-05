@@ -88,6 +88,21 @@
     },
     "notes": {
       "type": "string"
+    },
+    "emergencyFlush": {
+      "type": "boolean",
+      "description": "V2: result synthesized by the deadline flush"
+    },
+    "verified": {
+      "type": "boolean",
+      "description": "V2: false when no verification ran; gates must not treat it as passed"
+    },
+    "missing_evidence": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "subtask_id": {
+      "type": ["string", "null"]
     }
   }
 }

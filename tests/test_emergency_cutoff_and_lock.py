@@ -52,10 +52,20 @@ def test_emergency_cutoff_at_120s(tmp_path):
         "items": items,
     })
     plan = c.plan_tasks()
-    
+
     # BUG-01 has 150s slack -> stays RUNNING
     assert c.task_details("BUG-01")["phase"] == "RUNNING"
-    # BUG-02 has 90s slack <= 120s -> auto-promoted to READY_TO_INTEGRATE with emergency cutoff
+    # V2 (P1): BUG-02 has 90s slack <= 120s -> a stop is REQUESTED; nothing is written to the live worktree.
+    assert [e["key"] for e in plan["emergencyStops"]] == ["BUG-02"]
+    assert c.task_details("BUG-02")["phase"] == "RUNNING"
+    assert not (Path(claim_2["worktreeRoot"]) / "source" / "answers" / "BUG-02" / "submit.json").exists()
+    # Still waiting for the worker's acknowledgement -> still not promoted.
+    assert c.plan_tasks()["emergencyStops"] == []
+    assert c.task_details("BUG-02")["phase"] == "RUNNING"
+
+    # Once the worker is confirmed stopped, the honest, unverified PARTIAL result is promoted.
+    c.confirm_stopped("BUG-02", "worker_ack")
+    c.plan_tasks()
     assert c.task_details("BUG-02")["phase"] == "READY_TO_INTEGRATE"
     res = c.task_details("BUG-02")["workerResult"]
     assert res["status"] == "PARTIAL"
@@ -64,6 +74,7 @@ def test_emergency_cutoff_at_120s(tmp_path):
     assert res["test_results"] == []
     assert res["verified"] is False
     assert all(t.get("command") != "emergency-deadline-cutoff" for t in res["test_results"])
+    assert (Path(claim_2["worktreeRoot"]) / "source" / "answers" / "BUG-02" / "submit.json").exists()
 
 
 def test_claim_outside_planner_is_rejected_without_slack(tmp_path):

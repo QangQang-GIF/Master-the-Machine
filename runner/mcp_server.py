@@ -75,6 +75,8 @@ def _lane_settings_from_env() -> Dict[str, Any]:
         settings["adaptive"] = True
     if os.environ.get("MTM_ORCH_V2_ENABLED", "0") == "1" and os.environ.get("MTM_V2_DEADLINE_CONTROL", "0") == "1":
         settings["deadline_control"] = True
+    if os.environ.get("MTM_ORCH_V2_ENABLED", "0") == "1" and os.environ.get("MTM_V2_MODEL_ROUTING", "0") == "1":
+        settings["model_routing"] = True
     keys = [k for k in os.environ.get("MTM_HEAVY_KEYS", "").split(",") if k.strip()]
     if keys:
         settings["heavy_keys"] = keys
@@ -1909,7 +1911,7 @@ class MCPHelperServer:
         native = self._native_coordinator()
         if action == "begin":
             self.refresh_match()
-            return native.begin_integration(backlog_item_key)
+            return native.begin_integration(backlog_item_key, require_quiesced=os.environ.get("MTM_ORCH_V2_ENABLED", "0") == "1")
         if action == "failed":
             return native.end_integration(backlog_item_key, success=False)
         raise ValueError("integration_gate action must be begin or failed")

@@ -124,6 +124,23 @@
     },
     "model_profile": {
       "type": ["string", "null"]
+    },
+    "model_selection": {
+      "type": "object",
+      "description": "V2: requested model/effort with fallback reasons; actualModel stays null unless the runtime reports it"
+    },
+    "parent_task_id": {
+      "type": ["string", "null"],
+      "description": "V2: Heavy parent backlog item for a child envelope"
+    },
+    "subtask_id": {
+      "type": ["string", "null"],
+      "description": "V2: DAG subtask this child owns"
+    },
+    "owned_paths": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "V2: paths a Heavy child may change"
     }
   }
 }
