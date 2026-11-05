@@ -123,6 +123,8 @@ def test_mcp_server_submit_work_terminal_rejection_cleanup(tmp_path):
     server.git_guard = MagicMock()
     server.journal = MagicMock()
     server.telemetry = MagicMock()
+    # V2: a failed push is no longer ignored, and this fixture repo has no remote -> run offline.
+    server.descriptor = {**getattr(server, "descriptor", {}), "offline": True}
 
     # Configure adapter to raise 409 BACKLOG_ITEM_CLOSED
     class GMTerminalError(Exception):

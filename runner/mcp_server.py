@@ -43,7 +43,7 @@ from mtm_competition.adapters.official_game_master import (
     OfficialGameMasterAdapter,
     build_match_page_url,
 )
-from mtm_competition.integration.git_guard import PreSubmissionGitGuard
+from mtm_competition.integration.git_guard import PreSubmissionGitGuard, SubmissionGateError
 from mtm_competition.tasks.journal import SubmissionJournal
 from mtm_competition.scheduling.native import NativeTaskCoordinator
 from mtm_knowledge.bootstrap import KnowledgeBootstrap, detect_tech_stack
@@ -1339,6 +1339,8 @@ class MCPHelperServer:
             self.native.assert_can_submit(backlog_item_key)
             # Rechecking an existing lock is idempotent; another item cannot push in between.
             self.native.begin_integration(backlog_item_key)
+            # V2 (P1): push+submit are about to run; the lock must not be auto-reclaimed meanwhile.
+            self.native.set_submit_inflight(backlog_item_key, True)
             details = self.native.task_details(backlog_item_key)["data"].get("start_details", {})
             required_test_ids = announced_test_ids(details)
 
@@ -1348,7 +1350,10 @@ class MCPHelperServer:
                 # Auto-commit any pending evidence or answer files on disk before push
                 status_res = subprocess.run(["git", "-C", str(self.checkout_root), "status", "--porcelain"], capture_output=True, text=True, timeout=10)
                 if status_res.stdout.strip():
-                    subprocess.run(["git", "-C", str(self.checkout_root), "add", "-A"], capture_output=True, timeout=15)
+                    # V2 (P1): stage only this item's answers/evidence, never the whole checkout.
+                    item_dir = Path(self.match_root) / "answers" / backlog_item_key if self.match_root else None
+                    if item_dir is not None and item_dir.exists():
+                        subprocess.run(["git", "-C", str(self.checkout_root), "add", "--", str(item_dir)], capture_output=True, timeout=15)
                     subprocess.run(["git", "-C", str(self.checkout_root), "commit", "-m", f"Auto-capture evidence for {backlog_item_key}"], capture_output=True, timeout=15)
                     rev_res = subprocess.run(["git", "-C", str(self.checkout_root), "rev-parse", "HEAD"], capture_output=True, text=True, timeout=10)
                     if rev_res.returncode == 0 and rev_res.stdout.strip():
@@ -1365,10 +1370,13 @@ class MCPHelperServer:
                             ["git", "-C", str(self.checkout_root), "pull", "--rebase", "origin", assigned_branch],
                             capture_output=True, text=True, timeout=30
                         )
-                        subprocess.run(
+                        retry_push = subprocess.run(
                             ["git", "-C", str(self.checkout_root), "push", "origin", assigned_branch],
                             capture_output=True, text=True, timeout=30
                         )
+                        if retry_push.returncode != 0:
+                            # V2 (P1): a failed push is never ignored; submitting an unpushed SHA is invalid.
+                            raise RuntimeError(f"git push failed for {backlog_item_key}: {(retry_push.stderr or retry_push.stdout).strip()[:300]}")
                         # A rebase rewrites the commit; submit the SHA that was actually pushed.
                         rev_res = subprocess.run(["git", "-C", str(self.checkout_root), "rev-parse", "HEAD"],
                                                  capture_output=True, text=True, timeout=10)
@@ -1376,6 +1384,8 @@ class MCPHelperServer:
                             git_revision = rev_res.stdout.strip()
             except Exception as e:
                 sys.stderr.write(f"Notice: Auto-commit/push before submit: {e}\n")
+                if str(e).startswith("git push failed"):
+                    raise
 
         # 1. Pre-submission Git Invariant Verification (GIT-01..05) with Self-Healing Retry
         try:
@@ -1391,28 +1401,10 @@ class MCPHelperServer:
                 required_test_ids=required_test_ids,
             )
         except Exception as gate_err:
-            sys.stderr.write(f"Submission Gate auto-healing retry for {backlog_item_key}: {gate_err}\n")
-            if isinstance(answer, dict):
-                answer["status"] = "PARTIAL"
-            if self.checkout_root:
-                subprocess.run(["git", "-C", str(self.checkout_root), "add", "-A"], capture_output=True, timeout=15)
-                subprocess.run(["git", "-C", str(self.checkout_root), "commit", "-m", f"Auto-heal evidence for {backlog_item_key}"], capture_output=True, timeout=15)
-                rev_res = subprocess.run(["git", "-C", str(self.checkout_root), "rev-parse", "HEAD"], capture_output=True, text=True, timeout=10)
-                if rev_res.returncode == 0 and rev_res.stdout.strip():
-                    git_revision = rev_res.stdout.strip()
-                if not self.descriptor.get("offline"):
-                    subprocess.run(["git", "-C", str(self.checkout_root), "push", "origin", assigned_branch], capture_output=True, text=True, timeout=30)
-            self.git_guard.validate_pre_submission(
-                target_commit_sha=git_revision,
-                assigned_branch_ref=assigned_branch,
-                backlog_item_key=backlog_item_key,
-                answer_payload=answer,
-                match_root=self.match_root,
-                checkout_root=self.checkout_root,
-                require_remote=False if self.descriptor.get("offline") else True,
-                raise_on_error=False,
-                required_test_ids=required_test_ids,
-            )
+            # V2 (P0): the submission gate is fail-closed. No auto-heal, no forced PARTIAL,
+            # no blanket `git add -A`, and no second validation whose result is ignored.
+            sys.stderr.write(f"Submission gate rejected {backlog_item_key}; not submitting: {gate_err}\n")
+            raise
 
         # 2. Record In-Flight Submission Journal with canonical serialized bytes (API-06, API-07)
         payload = {
@@ -1821,7 +1813,13 @@ class MCPHelperServer:
             native.end_integration(key, success=False)
             raise
         sha = self._git_run(self.checkout_root, "rev-parse", "HEAD").stdout.strip()
-        receipt = self.submit_work(str(uuid.uuid4()), key, sha, answer)
+        try:
+            receipt = self.submit_work(str(uuid.uuid4()), key, sha, answer)
+        except SubmissionGateError:
+            # V2 (P0): fail-closed. A gate rejection must not leave the global integration lock held,
+            # otherwise one unsubmittable item blocks every other item until timeout.
+            native.end_integration(key, success=False)
+            raise
         return {"backlogItemKey": key, "status": "SUBMITTED", "answerStatus": answer.get("status"),
                 "notRun": not_run, "stopWorker": was_running, "receipt": receipt,
                 "instruction": "If stopWorker is true, stop that native worker now; its later writes are ignored."}

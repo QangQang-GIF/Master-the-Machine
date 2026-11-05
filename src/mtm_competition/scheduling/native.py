@@ -256,8 +256,10 @@ class NativeTaskCoordinator:
         clock_ready = not stale and now is not None and remaining is not None
         owner = self._meta(db, "integration_owner")
         acquired_at = self._meta(db, "integration_acquired_at", 0)
-        if owner and acquired_at and (planning_time - float(acquired_at)) > 8:
-            # Auto-clear stalled integration owner so ready tasks can progress (universal 8s ceiling)
+        submit_inflight = self._meta(db, "integration_inflight")
+        if owner and acquired_at and submit_inflight != owner and (planning_time - float(acquired_at)) > 8:
+            # Auto-clear stalled integration owner so ready tasks can progress (universal 8s ceiling).
+            # V2 (P1): never reclaim a lock whose owner has a push/submit in flight.
             db.execute("UPDATE tasks SET phase='READY_TO_INTEGRATE' WHERE key=? AND phase='INTEGRATING'", (owner,))
             self._set_meta(db, "integration_owner", None)
             self._set_meta(db, "integration_acquired_at", None)
@@ -298,9 +300,12 @@ class NativeTaskCoordinator:
                     emergency_result = {
                         "task_id": key, "worker_id": row["worker_id"], "status": "PARTIAL",
                         "skill_ids": ["mtm-emergency-flush"], "changed_files": [f"answers/{key}/submit.json"],
-                        "test_results": [{"command": "emergency-deadline-cutoff", "passed": True, "exit_code": 0}],
+                        # V2 (P0): never fabricate a passing test. No verification ran, so none is claimed;
+                        # downstream gates must treat this result as UNVERIFIED.
+                        "test_results": [],
                         "evidence_paths": [], "elapsed_seconds": 0,
-                        "note": f"Hard cutoff triggered at {int(slack)}s remaining before deadline"
+                        "emergencyFlush": True, "verified": False,
+                        "note": f"Hard cutoff triggered at {int(slack)}s remaining before deadline (unverified)"
                     }
                     db.execute("UPDATE tasks SET phase='READY_TO_INTEGRATE',result=? WHERE key=?",
                                (json.dumps(emergency_result), key))
@@ -560,6 +565,31 @@ class NativeTaskCoordinator:
             raise NativeCoordinationError(f"git {args[0]} failed: {res.stderr.strip()[:300]}")
         return res.stdout.strip()
 
+    def _claim_precondition_violation(self, db, row) -> str | None:
+        """Hard preconditions shared by planner-selected and fallback claims. Returns a reason or None."""
+        task = json.loads(row["data"])
+        status, now, remaining = self._clock(db)
+        clock, sample = self._meta(db, "clock"), self._meta(db, "remaining")
+        if (status not in ("RUNNING", "IN_PROGRESS", "STARTED") or now is None or remaining is None
+                or not clock or not sample):
+            return "official running clock unavailable or match not running"
+        if max(time.monotonic() - clock[1], time.monotonic() - sample[1]) > self.clock_max_age:
+            return "official clock is stale"
+        if task.get("status") not in ("OPEN", "IN_PROGRESS", "WORKING", "STARTED"):
+            return "item is not officially open"
+        terminal = {r["key"] for r in db.execute("SELECT key FROM tasks WHERE phase='SUBMITTED'").fetchall()}
+        if not set(task.get("dependencies", [])).issubset(terminal):
+            return "dependencies not satisfied"
+        busy = {p for r in db.execute("SELECT key,data FROM tasks WHERE phase IN ('RUNNING','READY_TO_INTEGRATE','INTEGRATING','INTEGRATED')").fetchall()
+                if r["key"] != row["key"] for p in json.loads(r["data"]).get("claimed_paths", [])}
+        if self._overlap(busy, task.get("claimed_paths", [])):
+            return "claimed paths overlap with active work"
+        deadline = task.get("deadline_epoch")
+        slack = min(remaining, float(deadline) - now if deadline is not None else remaining)
+        if slack <= self.reserve + 10:
+            return "insufficient time before deadline/reserve"
+        return None
+
     def claim_task(self, key: str, worker_id: str, estimated_seconds: int = 420) -> dict[str, Any]:
         key = self._key(key)
         if not isinstance(worker_id, str) or not re.fullmatch(r"[A-Za-z0-9_.:/-]{1,160}", worker_id):
@@ -572,6 +602,12 @@ class NativeTaskCoordinator:
                 raise NativeCoordinationError("Worker already owns an active task")
             plan = self._plan(db)
             eligible = next((t for t in plan["selected"] if t["key"] == key), None)
+            if eligible is None:
+                # V2 (P0): a claim outside the planner's selection must still satisfy the same
+                # dependency / path-overlap / deadline / official-status / clock-freshness rules.
+                violation = self._claim_precondition_violation(db, row)
+                if violation:
+                    raise NativeCoordinationError(f"Task not eligible: {violation}")
             if eligible is None and self.lane_mode:
                 task_data = json.loads(row["data"])
                 slot = self._lane_slot_available(db, task_data)
@@ -912,13 +948,23 @@ class NativeTaskCoordinator:
             if row["phase"] not in ("READY_TO_INTEGRATE", "INTEGRATING", "INTEGRATED"):
                 raise NativeCoordinationError("Worker result is not ready for integration")
             self._set_meta(db, "integration_owner", key)
+            # V2 (P1): record lease start so stale-lock recovery has a consistent timestamp.
+            self._set_meta(db, "integration_acquired_at", time.monotonic())
             db.execute("UPDATE tasks SET phase='INTEGRATING' WHERE key=?", (key,))
             return {"key": key, "phase": "INTEGRATING", "worktreeRoot": row["worktree"], "workerResult": json.loads(row["result"])}
+
+    def set_submit_inflight(self, key: str, inflight: bool = True) -> None:
+        """Mark that the lock owner has a push/submit in flight, so the lock must not be auto-reclaimed."""
+        with self._db() as db:
+            if self._meta(db, "integration_owner") != key:
+                raise NativeCoordinationError("Task does not own integration lock")
+            self._set_meta(db, "integration_inflight", key if inflight else None)
 
     def end_integration(self, key: str, success: bool = True) -> dict[str, Any]:
         with self._db() as db:
             if self._meta(db, "integration_owner") != key:
                 raise NativeCoordinationError("Task does not own integration lock")
+            self._set_meta(db, "integration_inflight", None)
             phase = "INTEGRATED" if success else "READY_TO_INTEGRATE"
             db.execute("UPDATE tasks SET phase=? WHERE key=?", (phase, key))
             # Keep lock through successful push+submit; releasing here permits a remote-ref race.
@@ -937,5 +983,6 @@ class NativeTaskCoordinator:
             if row["phase"] not in ("INTEGRATING", "INTEGRATED") or self._meta(db, "integration_owner") != key:
                 raise NativeCoordinationError("Submission requires current integration ownership")
             db.execute("UPDATE tasks SET phase='SUBMITTED',receipt=? WHERE key=?", (receipt_id, key))
+            self._set_meta(db, "integration_inflight", None)
             self._set_meta(db, "integration_owner", None)
             self._set_meta(db, "integration_acquired_at", None)

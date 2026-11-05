@@ -8,7 +8,7 @@ import pytest
 
 from runner.mcp_server import MCPHelperServer
 from mtm_competition.scheduling.native import NativeTaskCoordinator
-from mtm_competition.integration.git_guard import PreSubmissionGitGuard
+from mtm_competition.integration.git_guard import PreSubmissionGitGuard, SubmissionGateError
 from mtm_competition.tasks.journal import SubmissionJournal
 
 
@@ -160,28 +160,31 @@ def test_finalize_full_evidence_submits_done(tmp_path):
     assert len(s.adapter.calls) == 1
 
 
-def test_finalize_missing_screenshot_becomes_not_run(tmp_path):
+def test_finalize_missing_screenshot_is_not_submitted_fail_closed(tmp_path):
+    """V2 (P0): missing required evidence -> NOT_RUN/PARTIAL is honest, but the gate must refuse to submit."""
     s = build(tmp_path, [item("TASK-01")])
     entry = s.dispatch_ready()["spawn"][0]
     worker_writes(entry, evidence=("check.txt",), status="DONE")
-    out = s.finalize_item("TASK-01")
-    answer = submitted_answer(s)
-    assert out["answerStatus"] == "PARTIAL" and out["notRun"] == ["TC-02"]
-    assert answer["evidenceFiles"] == ["evidence/check.txt"]
-    tc02 = next(t for t in answer["testResults"] if t["id"] == "TC-02")
-    assert tc02["result"] == "NOT_RUN" and tc02["evidence"] == []
-    # No placeholder image was created.
+    with pytest.raises(SubmissionGateError):
+        s.finalize_item("TASK-01")
+    assert s.adapter.calls == []
+    assert s.native.task_details("TASK-01")["phase"] != "SUBMITTED"
+    # No placeholder image was fabricated, and the integration lock was released.
     assert not (s.match_root / "answers/TASK-01/evidence/tc-02.png").exists()
+    with s.native._db() as db:
+        assert s.native._meta(db, "integration_owner") is None
 
 
 def test_finalize_uncommitted_running_worker_is_snapshotted(tmp_path):
     s = build(tmp_path, [item("TASK-01")])
     entry = s.dispatch_ready()["spawn"][0]
     worker_writes(entry, evidence=("check.txt",), commit=False, result_file=False)
-    out = s.finalize_item("TASK-01", force_partial=True)
-    assert out["stopWorker"] is True and out["answerStatus"] == "PARTIAL"
-    assert (s.match_root / "README.md").read_text() == "After\n"
-    assert s.native.task_details("TASK-01")["phase"] == "SUBMITTED"
+    with pytest.raises(SubmissionGateError):
+        s.finalize_item("TASK-01", force_partial=True)
+    assert s.adapter.calls == []
+    assert s.native.task_details("TASK-01")["phase"] != "SUBMITTED"
+    with s.native._db() as db:
+        assert s.native._meta(db, "integration_owner") is None
 
 
 def test_finalize_conflict_releases_lock_and_keeps_checkout_clean(tmp_path):
@@ -261,5 +264,6 @@ def test_wait_auto_finalizes_item_near_deadline(tmp_path, monkeypatch):
     out = s.wait_for_update(5000)
     assert any(e["type"] == "auto_finalize" for e in out["events"])
     fin = out["autoFinalized"][0]
-    assert fin["status"] == "SUBMITTED" and fin["stopWorker"] is True
-    assert submitted_answer(s)["status"] == "PARTIAL"
+    # V2 (P0): forced-PARTIAL results are never submitted by the gate; the failure is reported honestly.
+    assert fin["status"] == "FAILED"
+    assert s.adapter.calls == []

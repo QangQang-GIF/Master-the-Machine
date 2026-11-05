@@ -23,8 +23,8 @@ def test_emergency_cutoff_at_120s(tmp_path):
     # Task 2: deadline slack = 90s (<= 120s) -> Should emergency flush
     server_now = 1000
     items = [
-        {"key": "BUG-01", "type": "BUG", "status": "OPEN", "points": 80, "deadline_epoch": 1150},
-        {"key": "BUG-02", "type": "BUG", "status": "OPEN", "points": 100, "deadline_epoch": 1090},
+        {"key": "BUG-01", "type": "BUG", "status": "OPEN", "points": 80, "deadline_epoch": 1500},
+        {"key": "BUG-02", "type": "BUG", "status": "OPEN", "points": 100, "deadline_epoch": 1440},
     ]
     c.register_projection({
         "status": "RUNNING",
@@ -43,7 +43,14 @@ def test_emergency_cutoff_at_120s(tmp_path):
     wt_2 = Path(claim_2["worktreeRoot"]) / "source"
     (wt_2 / "main.py").write_text("print(2)\n")
 
-    # Run plan_tasks
+    # V2: claims need real slack, so advance the official clock afterwards:
+    # BUG-01 slack becomes 150s (> 120s), BUG-02 slack becomes 90s (<= 120s).
+    c.register_projection({
+        "status": "RUNNING",
+        "server_epoch": 1350,
+        "remaining_seconds": 2050,
+        "items": items,
+    })
     plan = c.plan_tasks()
     
     # BUG-01 has 150s slack -> stays RUNNING
@@ -53,6 +60,27 @@ def test_emergency_cutoff_at_120s(tmp_path):
     res = c.task_details("BUG-02")["workerResult"]
     assert res["status"] == "PARTIAL"
     assert "Hard cutoff triggered at " in res["note"]
+    # V2 (P0): no fabricated passing test; the result is explicitly unverified.
+    assert res["test_results"] == []
+    assert res["verified"] is False
+    assert all(t.get("command") != "emergency-deadline-cutoff" for t in res["test_results"])
+
+
+def test_claim_outside_planner_is_rejected_without_slack(tmp_path):
+    repo = tmp_path / "checkout"
+    repo.mkdir()
+    (repo / "source").mkdir()
+    (repo / "source" / "main.py").write_text("print(1)\n")
+    for args in (["init"], ["config", "user.email", "t@t.com"], ["config", "user.name", "T"], ["add", "."], ["commit", "-m", "init"]):
+        subprocess.run(["git", "-C", str(repo), *args], check=True, capture_output=True)
+    c = NativeTaskCoordinator(tmp_path / "state", repo, repo / "source", "source", "MATCH")
+    c.register_projection({
+        "status": "RUNNING", "server_epoch": 1000, "remaining_seconds": 2400,
+        "items": [{"key": "BUG-02", "type": "BUG", "status": "OPEN", "points": 100, "deadline_epoch": 1090}],
+    })
+    c.register_started("BUG-02", {})
+    with pytest.raises(NativeCoordinationError, match="not eligible"):
+        c.claim_task("BUG-02", "worker-2")
 
 
 def test_endgame_lock_release_after_8s(tmp_path):
