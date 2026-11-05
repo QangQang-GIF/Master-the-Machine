@@ -30,3 +30,17 @@ def test_already_cherry_picked_commits_are_not_picked_again(tmp_path):
     assert srv._pending_worker_commits(commits, head) == commits       # first attempt: pick it
     assert _git(repo, "cherry-pick", *commits).returncode == 0         # integrated, then gate rejects
     assert srv._pending_worker_commits(commits, head) == []            # retry: nothing left to pick
+
+
+def test_worker_control_files_are_dropped_from_shared_checkout(tmp_path):
+    repo = tmp_path / "r"; (repo / "M").mkdir(parents=True)
+    _git(repo, "init", "-q", "-b", "main")
+    (repo / "M" / "a.txt").write_text("a")
+    (repo / "M" / "worker_result.json").write_text('{"task_id": "BUG-04"}')
+    (repo / "M" / ".mtm_stopped.json").write_text("{}")
+    _git(repo, "add", "-f", "."); _git(repo, "commit", "-qm", "integrated with control files")
+    srv = _server(repo)
+    srv._drop_control_files("M", "BUG-04")
+    tracked = _git(repo, "ls-files").stdout.split()
+    assert tracked == ["M/a.txt"]
+    assert _git(repo, "status", "--porcelain").stdout.strip() == ""

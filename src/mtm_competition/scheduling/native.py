@@ -247,6 +247,23 @@ class NativeTaskCoordinator:
             budget = min(budget, max(10, int(cap)))
         return budget
 
+    CONTROL_FILES = ("worker_result.json", ".mtm_stopped.json")
+
+    @staticmethod
+    def _own_result_file(marker: Path, key: str) -> bool:
+        """True only for a readable worker_result.json written for *this* task.
+
+        A file inherited from another item (e.g. committed by an earlier worker and carried into the
+        base checkout) must never be mistaken for this worker finishing.
+        """
+        try:
+            if not marker.is_file():
+                return False
+            data = json.loads(marker.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return False
+        return isinstance(data, dict) and str(data.get("task_id", "")).strip().upper() == str(key).strip().upper()
+
     HEAVY_PREFIX = "[heavy task]"
 
     def _is_heavy(self, task: dict) -> bool:
@@ -584,7 +601,7 @@ class NativeTaskCoordinator:
                 if row["phase"] == "RUNNING" and row["worktree"]:
                     marker = Path(row["worktree"]) / self.repository_folder / "worker_result.json"
                     tag = f"result:{key}:{attempt}"
-                    if tag not in seen and marker.is_file():
+                    if tag not in seen and self._own_result_file(marker, key):
                         seen.add(tag)
                         events.append({"type": "worker_result_file", "eventId": tag, "backlogItemKey": key, "path": str(marker)})
                 stop = task.get("stop")
@@ -709,7 +726,7 @@ class NativeTaskCoordinator:
                 key, phase = r["key"], r["phase"]
                 wt = Path(r["worktree"]) if r["worktree"] else None
                 has_dir = bool(wt and wt.exists())
-                result_file = bool(has_dir and (wt / self.repository_folder / "worker_result.json").is_file())
+                result_file = bool(has_dir and self._own_result_file(wt / self.repository_folder / "worker_result.json", key))
                 if key in inflight:
                     action = "replay_in_flight_submission_with_original_identity"
                 elif phase == "RUNNING":
@@ -844,6 +861,12 @@ class NativeTaskCoordinator:
                 worker_match = target / self.repository_folder
                 if not worker_match.resolve().is_relative_to(target) or not worker_match.is_dir():
                     raise NativeCoordinationError("Assigned repository folder missing in worker worktree")
+                # Control files belong to one worker run; an inherited copy from another item would
+                # signal "finished" for a worker that has just started.
+                for name in self.CONTROL_FILES:
+                    stale = worker_match / name
+                    if stale.is_file() or stale.is_symlink():
+                        stale.unlink()
                 self._materialize_start_files(key, details, worker_match)
                 self._provision_worker_sandbox(worker_match)
             except Exception as exc:

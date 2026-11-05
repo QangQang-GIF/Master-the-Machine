@@ -1736,7 +1736,8 @@ class MCPHelperServer:
     def _snapshot_worktree(self, worktree: Path, folder: str, key: str) -> Optional[str]:
         """Commit the worker's current deliverables (tracked edits, src/, answers/<key>/)."""
         paths = [f"{folder}/answers/{key}", f"{folder}/src"]
-        self._git_run(worktree, "add", "-u", "--", folder)
+        control = [f":(exclude){folder}/{n}" for n in self.WORKER_CONTROL_FILES]
+        self._git_run(worktree, "add", "-u", "--", folder, *control)
         for p in paths:
             if (worktree / p).exists():
                 self._git_run(worktree, "add", "-A", "--", p,
@@ -1758,6 +1759,21 @@ class MCPHelperServer:
 
     _finalize_lock = threading.RLock()
     _watchdog_started = False
+
+    WORKER_CONTROL_FILES = ("worker_result.json", ".mtm_stopped.json")
+
+    def _drop_control_files(self, folder: str, key: str) -> None:
+        """Keep per-run worker control files out of the shared checkout.
+
+        A worker may commit its own worker_result.json; once cherry-picked, every later worktree would
+        inherit it and look 'finished' at birth (CWQNKAPC: STALE-INHERITED-WORKER-RESULT).
+        """
+        tracked = [f"{folder}/{n}" for n in self.WORKER_CONTROL_FILES
+                   if self._git_run(self.checkout_root, "ls-files", "--error-unmatch", "--", f"{folder}/{n}").returncode == 0]
+        if tracked:
+            self._git_run(self.checkout_root, "rm", "-q", "-f", "--", *tracked)
+            self._git_run(self.checkout_root, "-c", "user.email=mtm-root@local", "-c", "user.name=MTM Root",
+                          "commit", "-q", "-m", f"{key}: drop worker control files")
 
     def _pending_worker_commits(self, all_commits: List[str], worker_head: str) -> List[str]:
         """Worker commits whose patch is not yet on the checkout HEAD (oldest first)."""
@@ -1932,6 +1948,7 @@ class MCPHelperServer:
                 if picked.returncode != 0:
                     self._git_run(self.checkout_root, "cherry-pick", "--abort")
                     raise ValueError(f"cherry-pick conflict for {key}: {(picked.stderr or picked.stdout).strip()[:300]}")
+            self._drop_control_files(folder, key)
         except Exception:
             native.end_integration(key, success=False)
             raise
