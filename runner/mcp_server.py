@@ -1754,6 +1754,14 @@ class MCPHelperServer:
     _finalize_lock = threading.RLock()
     _watchdog_started = False
 
+    def _pending_worker_commits(self, all_commits: List[str], worker_head: str) -> List[str]:
+        """Worker commits whose patch is not yet on the checkout HEAD (oldest first)."""
+        res = self._git_run(self.checkout_root, "cherry", "HEAD", worker_head)
+        if res.returncode != 0:
+            return list(all_commits)
+        pending = {line.split()[1] for line in res.stdout.splitlines() if line.startswith("+ ") and len(line.split()) > 1}
+        return [c for c in all_commits if c in pending]
+
     def finalize_item(self, backlog_item_key: str, force_partial: bool = False,
                       confirmed_stopped: bool = False) -> Dict[str, Any]:
         """Serialized entry point: Root and the deadline watchdog never finalize concurrently."""
@@ -1907,14 +1915,18 @@ class MCPHelperServer:
         native.begin_integration(key)
         try:
             base = self._git_run(self.checkout_root, "merge-base", "HEAD", worker_head or "HEAD").stdout.strip()
-            commits = [c for c in self._git_run(self.checkout_root, "rev-list", "--reverse", f"{base}..{worker_head}").stdout.split() if c]
-            if not commits:
+            all_commits = [c for c in self._git_run(self.checkout_root, "rev-list", "--reverse", f"{base}..{worker_head}").stdout.split() if c]
+            if not all_commits:
                 raise ValueError(f"{key} worker produced no commit to integrate")
-            picked = self._git_run(self.checkout_root, "-c", "user.email=mtm-root@local", "-c", "user.name=MTM Root",
-                                   "cherry-pick", "--allow-empty", *commits, timeout=60)
-            if picked.returncode != 0:
-                self._git_run(self.checkout_root, "cherry-pick", "--abort")
-                raise ValueError(f"cherry-pick conflict for {key}: {(picked.stderr or picked.stdout).strip()[:300]}")
+            # Idempotent retry: a previous finalize may have cherry-picked these commits and then been
+            # rejected by the gate. `git cherry` marks already-applied patches with "-"; never pick twice.
+            commits = self._pending_worker_commits(all_commits, worker_head)
+            if commits:
+                picked = self._git_run(self.checkout_root, "-c", "user.email=mtm-root@local", "-c", "user.name=MTM Root",
+                                       "cherry-pick", "--allow-empty", *commits, timeout=60)
+                if picked.returncode != 0:
+                    self._git_run(self.checkout_root, "cherry-pick", "--abort")
+                    raise ValueError(f"cherry-pick conflict for {key}: {(picked.stderr or picked.stdout).strip()[:300]}")
         except Exception:
             native.end_integration(key, success=False)
             raise
