@@ -136,8 +136,18 @@ def normalize_native_projection(projection: Dict[str, Any], adapter: Any) -> Dic
 
 
 def announced_test_ids(details: Dict[str, Any]) -> List[str]:
-    """Inventory explicit public scenario IDs, independent of a worker's answer."""
+    """Inventory explicit public scenario IDs, independent of a worker's answer.
+
+    Structured rows (``id`` / ``testCaseId`` / ``scenarioId``) always count. In free text, a fully
+    qualified id (``BUG-01-TC-01``) counts anywhere, while a bare id (``TC-01``) counts only when it is
+    the declared subject of a line (heading, bullet or table row). A bare id mentioned mid-sentence
+    ("same conditions as TC-01") is a cross-reference to a qualified row, not a new requirement.
+    """
     ids: set[str] = set()
+    qualified = re.compile(r"\b(?:[A-Z0-9]+-)+(?:TC|MVS|SCENARIO|TEST)-\d+(?:-[A-Za-z0-9]+)*\b")
+    declared_bare = re.compile(r"^[ \t]*(?:#{1,6}[ \t]*|[|][ \t`]*|[-*+][ \t`]*)?\**`?((?:TC|MVS|SCENARIO|TEST)-\d+(?:-[A-Za-z0-9]+)*)\b",
+                               re.MULTILINE)
+
     def walk(value: Any, rows: bool = False) -> None:
         if isinstance(value, list):
             for row in value:
@@ -151,16 +161,11 @@ def announced_test_ids(details: Dict[str, Any]) -> List[str]:
                 if name in value:
                     walk(value[name], True)
         elif isinstance(value, str):
-            ids.update(re.findall(r"\b(?:[A-Z0-9]+-)*(?:TC|MVS|SCENARIO|TEST)-\d+(?:-[A-Za-z0-9]+)*\b", value))
+            ids.update(m.group(0) for m in qualified.finditer(value))
+            ids.update(declared_bare.findall(value))
     walk(details.get("submitTemplate", {}))
-    template_ids = set(ids)
-    if not template_ids:
-        # No structured template: fall back to the MVS text, but only to fully qualified ids
-        # (e.g. BUG-01-TC-01). Prose such as "the same conditions as TC-01" is a cross-reference,
-        # not a separate requirement the answer schema can ever satisfy.
-        walk(details.get("minimumVerificationScenarios", details.get("mvs")), True)
-        ids = {i for i in ids if re.search(r"[A-Z0-9]+-(?:TC|MVS|SCENARIO|TEST)-\d", i)} or ids
-    # The submit template's own testResults ids are authoritative; never add bare aliases of them.
+    walk(details.get("minimumVerificationScenarios", details.get("mvs")), True)
+    # A bare alias of a qualified id that is also present is the same test (BUG-01-TC-01 vs TC-01).
     return sorted(i for i in ids if not any(o != i and o.endswith("-" + i) for o in ids))
 
 

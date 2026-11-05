@@ -492,7 +492,15 @@ class PreSubmissionGitGuard:
                     if req_ev not in declared_basenames:
                         missing_scenario_files.append(req_ev)
 
-                if missing_scenario_files:
+                # An honest PARTIAL keeps the score of the tests that did pass: a missing required
+                # screenshot only leaves its own test NOT_RUN. A DONE claim stays strict.
+                declared_status = ""
+                for _src in (committed_answer if isinstance(locals().get("committed_answer"), dict) else None, answer_payload):
+                    if isinstance(_src, dict) and _src.get("status"):
+                        declared_status = str(_src.get("status")).upper()
+                        break
+                partial_ok = bool(allow_partial) and declared_status in ("PARTIAL", "BLOCKED")
+                if missing_scenario_files and not partial_ok:
                     req_name = missing_scenario_files[0]
                     msg = f"Missing required evidence file '{req_name}' for task {backlog_item_key}"
                     if raise_on_error:

@@ -229,6 +229,24 @@ class NativeTaskCoordinator:
             limits.append(now + float(remaining) - self.EVIDENCE_MATCH_MARGIN)
         return round(max(now, min(limits)), 1)
 
+    def _worker_budget(self, estimated_seconds, slack) -> int:
+        """Seconds a worker may run before Root asks it to hand off.
+
+        DONE-first (default, ``MTM_WORKER_BUDGET_MODE=deadline``): the real limit is the item's
+        own deadline / match end minus the finalize margin, never a fixed 7-minute guess.
+        ``fixed`` restores the legacy ``min(estimated_seconds, slack - reserve)`` behaviour.
+        ``MTM_WORKER_MAX_SECONDS`` optionally caps a single worker run.
+        """
+        legacy = min(max(10, int(estimated_seconds)), max(10, int(slack - self.reserve)))
+        if os.environ.get("MTM_WORKER_BUDGET_MODE", "deadline").strip().lower() == "fixed":
+            return legacy
+        margin = max(self.reserve, self.EVIDENCE_MATCH_MARGIN)
+        budget = max(10, int(float(slack) - margin))
+        cap = os.environ.get("MTM_WORKER_MAX_SECONDS", "").strip()
+        if cap.isdigit() and int(cap) > 0:
+            budget = min(budget, max(10, int(cap)))
+        return budget
+
     HEAVY_PREFIX = "[heavy task]"
 
     def _is_heavy(self, task: dict) -> bool:
@@ -843,7 +861,7 @@ class NativeTaskCoordinator:
             slack = eligible.get("slackSeconds")
             if slack is None:
                 slack = min(remaining, float(deadline) - now if deadline is not None else remaining) if (now is not None and remaining is not None) else (remaining or 2400)
-            budget = min(max(10, int(estimated_seconds)), max(10, int(slack - self.reserve)))
+            budget = self._worker_budget(estimated_seconds, slack)
             heavy = self._is_heavy(eligible)
             if heavy and self.heavy_max_seconds:
                 budget = min(budget, max(10, self.heavy_max_seconds))
@@ -867,6 +885,7 @@ class NativeTaskCoordinator:
                         "metadata": {"match_root": str(worker_match), "start_details": details,
                                      "project_runtime_path": str(Path(__file__).resolve().parents[3] / "runner" / "project_runtime.py"),
                                      "capture_multi_path": str(Path(__file__).resolve().parents[3] / "scripts" / "capture_multi.mjs"),
+                                     "check_done_path": str(Path(__file__).resolve().parents[3] / "scripts" / "check_done.py"),
                                      "match_id": self.match_id, "worker_id": worker_id,
                                      "submit_template": details.get("submitTemplate"),
                                      "worker_result_path": str(worker_match / "worker_result.json")}}

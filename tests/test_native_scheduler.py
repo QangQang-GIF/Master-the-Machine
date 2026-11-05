@@ -390,7 +390,9 @@ def test_stale_clock_does_not_terminalize_ready_result(coordinator):
     assert c.task_details('BUG-01')['phase'] == 'READY_TO_INTEGRATE'
 
 
-def test_overdue_worker_retains_slot_until_confirmed_native_stop(coordinator):
+def test_overdue_worker_retains_slot_until_confirmed_native_stop(coordinator, monkeypatch):
+    # These test the overdue-stop machinery with a tiny explicit budget (legacy fixed mode).
+    monkeypatch.setenv('MTM_WORKER_BUDGET_MODE', 'fixed')
     c = coordinator
     projection(c, item(), item('TASK-01'))
     start(c, 'BUG-01'); c.claim_task('BUG-01', 'worker', estimated_seconds=10)
@@ -406,7 +408,9 @@ def test_overdue_worker_retains_slot_until_confirmed_native_stop(coordinator):
         c.reconcile_worker('BUG-01', confirmed_stopped=False, reason='budget exceeded', requeue=True)
 
 
-def test_overdue_budget_excludes_official_pause_duration(coordinator):
+def test_overdue_budget_excludes_official_pause_duration(coordinator, monkeypatch):
+    # These test the overdue-stop machinery with a tiny explicit budget (legacy fixed mode).
+    monkeypatch.setenv('MTM_WORKER_BUDGET_MODE', 'fixed')
     c = coordinator
     projection(c, item()); start(c, 'BUG-01'); c.claim_task('BUG-01', 'worker', estimated_seconds=10)
     c.register_projection({'status': 'PAUSED', 'server_epoch': 1_000_005,
@@ -416,3 +420,22 @@ def test_overdue_budget_excludes_official_pause_duration(coordinator):
                            'remaining_seconds': 2395, 'items': []})
     assert not c.plan_tasks()['overdueWorkers']
     assert c.task_details('BUG-01')['data']['lease']['budget_seconds'] == 10
+
+
+def test_worker_budget_follows_real_deadline_not_seven_minutes(coordinator, monkeypatch):
+    monkeypatch.delenv('MTM_WORKER_BUDGET_MODE', raising=False)
+    monkeypatch.delenv('MTM_WORKER_MAX_SECONDS', raising=False)
+    c = coordinator
+    budget = c._worker_budget(420, 1000)
+    assert budget == 1000 - max(c.reserve, c.EVIDENCE_MATCH_MARGIN)
+    assert budget > 420
+
+
+def test_worker_budget_fixed_mode_and_cap(coordinator, monkeypatch):
+    c = coordinator
+    monkeypatch.setenv('MTM_WORKER_BUDGET_MODE', 'fixed')
+    assert c._worker_budget(420, 5000) == 420
+    monkeypatch.setenv('MTM_WORKER_BUDGET_MODE', 'deadline')
+    monkeypatch.setenv('MTM_WORKER_MAX_SECONDS', '600')
+    assert c._worker_budget(420, 5000) == 600
+    assert c._worker_budget(420, 100) == 10   # never negative near the end

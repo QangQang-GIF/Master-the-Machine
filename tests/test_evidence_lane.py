@@ -147,6 +147,15 @@ def test_envelope_carries_evidence_cutoff(tmp_path):
     c = make(tmp_path)
     project(c, item("BUG-02", deadline_epoch=NOW + 1080))
     env = run(c, "BUG-02")["taskEnvelope"]
-    # deadline - 150s is earlier than the 420s budget and the match end.
-    assert env["evidence_cutoff_epoch"] == pytest.approx(min(NOW + 420, NOW + 1080 - 150, NOW + 2400 - 240), abs=2)
+    # DONE-first budget = slack - 240s margin; the cutoff is the earliest of budget end, deadline - 150s and match end.
+    budget = 1080 - max(c.reserve, c.EVIDENCE_MATCH_MARGIN)
+    assert env["evidence_cutoff_epoch"] == pytest.approx(min(NOW + budget, NOW + 1080 - 150, NOW + 2400 - 240), abs=2)
     assert env["evidence_cutoff_local_epoch"] > time.time()
+
+
+def test_envelope_exposes_check_done_tool(tmp_path):
+    from tests.test_lane_scheduler import make, project, item, run, NOW
+    c = make(tmp_path)
+    project(c, item("BUG-02", deadline_epoch=NOW + 1080))
+    path = run(c, "BUG-02")["taskEnvelope"]["metadata"]["check_done_path"]
+    assert path.endswith("check_done.py") and __import__("pathlib").Path(path).is_file()

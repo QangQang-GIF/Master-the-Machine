@@ -29,7 +29,7 @@ Follow `mtm-init` boundaries, TaskEnvelope constraints, and returned submit temp
 3. **Task-Tier Triage (Zero Over-Engineering)**:
    - **Tier 1 — Pure Logic / Unit-Test / Trace Tasks (`BUG-03`, `TASK-01`, `TASK-03`, `TASK-04`, `PI-01`)**:
      - **DO NOT launch any web server or Playwright browser** unless `submit.json` explicitly requires `.png` files in `evidenceFiles`.
-     - Edit source file(s) -> run official check runner or `pnpm test` + `pnpm typecheck` via `project_runtime.py ... run` -> write required text/log evidence -> fill `answers/<key>/submit.json` (`status: "DONE"`) -> commit and finish in under 2 minutes.
+     - Edit source file(s) -> run official check runner or `pnpm test` + `pnpm typecheck` via `project_runtime.py ... run` -> write required text/log evidence -> fill `answers/<key>/submit.json` -> run `check_done` -> commit. These tasks are usually quick, but keep going until `check_done` passes; do not stop early.
    - **Tier 2 — Logic + Official Check Runner + Single UI Pass (`BUG-04`, `CR-02`, `CR-03`, `TASK-02`)**:
      - Ensure `src/tests/<key.lower()>-mvs.test.ts` is present and committed.
      - Run `node ../challenge/<KEY>-run-checks.mjs` via `project_runtime.py ... run` to produce exact `test.log` and `typecheck.log` files (`command: pnpm ...` and `exit_code: 0`).
@@ -43,6 +43,20 @@ Follow `mtm-init` boundaries, TaskEnvelope constraints, and returned submit temp
    - Commit early and often: root's `finalize_item` snapshots and submits your worktree automatically at the cutoff, so committed work is never lost.
    - Always `git add` and `git commit` all modified source files, `src/tests/<key.lower()>-mvs.test.ts`, `answers/<key>/submit.json`, and `answers/<key>/evidence/*` inside your worktree before writing `worker_result.json`. Writing `worker_result.json` is your final step; root submits as soon as it appears.
    - **Heavy items** (`taskEnvelope.heavy == true`): your `time_budget_seconds` is capped. Do the announced MVS scenarios first, avoid exploring outside the task scope, commit after each passing scenario.
+
+## DONE-first loop (read this before you finish anything)
+
+Your goal is a genuine `DONE`: every test row `PASS` with real evidence. You are NOT rewarded for finishing quickly; the time-box
+the Root gives you runs to the item's real deadline (see `taskEnvelope.evidence_cutoff_local_epoch`), not 2 or 7 minutes.
+
+1. Capture a baseline EARLY: run the official check scripts / screenshots once before you edit, so a slow or flaky checker shows up while you still have time.
+2. After every meaningful change, re-run the checks and commit.
+3. Run `python <taskEnvelope.metadata.check_done_path> --match-root <metadata.match_root> --key <KEY> --cutoff-epoch <evidence_cutoff_local_epoch>`.
+   Exit 0 = DONE-ready. Exit 1 = read its `todo` list and fix exactly those items while `secondsLeft` > 0.
+4. **Do not write `worker_result.json` while `check_done` still lists work and time remains.** Root submits the moment that file appears,
+   so writing it early ends the item as PARTIAL. Write it only when `check_done` passes (status `DONE`) or the cutoff is reached.
+5. If the checker itself hangs or times out, retry it once or twice (fresh `session-start`, own port) before giving up; record the real command output.
+6. At the cutoff, if tests still fail, stop and write an honest `PARTIAL` (failing tests `NOT_RUN`/`FAIL`). Never mark `DONE`, never fabricate evidence.
 
 ## Stop / Handoff Instruction (V2 safe stop)
 
