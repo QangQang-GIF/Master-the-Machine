@@ -74,7 +74,7 @@ Result: 2/10 submitted (BUG-03 80/80, PI-01 0/160), 80 points. Every other item 
 DONE-first: while a fix attempt still fits (`MTM_FIX_MIN_SECONDS`, default 300 s after the 240 s margin), a non-DONE
 answer or a local gate rejection is not submitted. `finalize_item` returns `SENT_BACK_FOR_DONE`, the item is requeued,
 and the next worker resumes from the previous attempt's commit with `taskEnvelope.fix_request`
-(`MTM_DONE_FIRST_RETRIES`, default 3). PI is still submitted at once (speed race). The deadline / match-end
+(`MTM_DONE_FIRST_RETRIES`, default 3). PI is held to DONE too: a fast wrong PI scores 0 (PI-01 here), the slowest correct one still earns 60%. The deadline / match-end
 auto-finalize still submits an honest PARTIAL as the last resort. `MTM_DONE_FIRST=0` restores immediate PARTIAL.
 
 Replay (`scripts/replay_submission_gate.py`, real answers + Start Work data, placeholder evidence bytes):

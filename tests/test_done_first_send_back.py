@@ -67,11 +67,19 @@ def test_retry_cap_then_partial_is_submitted(tmp_path, monkeypatch):
     assert out["status"] == "SUBMITTED" and out["answerStatus"] == "PARTIAL"
 
 
-def test_pi_partial_is_not_held_back(tmp_path):
+def test_pi_partial_is_held_back_too(tmp_path):
+    """CWQNKAPC: PI-01 was submitted fast and scored 0/160. A slower correct PI still earns 60%."""
     s = build(tmp_path, [item("PI-01")], remaining=1200)
     worker_writes(s.dispatch_ready()["spawn"][0], evidence=("check.txt",))
     out = s.finalize_item("PI-01", confirmed_stopped=True)
-    assert out["status"] == "SUBMITTED"
+    assert out["status"] == "SENT_BACK_FOR_DONE" and s.adapter.calls == []
+
+
+def test_pi_done_is_submitted_at_once(tmp_path):
+    s = build(tmp_path, [item("PI-01")], remaining=1200)
+    worker_writes(s.dispatch_ready()["spawn"][0])
+    out = s.finalize_item("PI-01", confirmed_stopped=True)
+    assert out["status"] == "SUBMITTED" and out["answerStatus"] == "DONE"
 
 
 def test_disabled_flag_restores_immediate_partial(tmp_path, monkeypatch):

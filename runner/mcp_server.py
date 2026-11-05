@@ -1766,6 +1766,7 @@ class MCPHelperServer:
         """DONE-first: while there is real time left, an item that is not DONE (or that the local gate
         rejected) goes back to a worker that continues from this attempt's commit and fixes exactly
         the listed gaps. Only the deadline/match-end auto-finalize (force_partial) submits PARTIAL.
+        This applies to PI as well: a fast wrong PI scores 0, a slower correct one still scores.
 
         MTM_DONE_FIRST=0 disables; MTM_DONE_FIRST_RETRIES caps attempts (default 3);
         MTM_FIX_MIN_SECONDS is the minimum working time a new attempt needs (default 300).
@@ -1773,9 +1774,10 @@ class MCPHelperServer:
         if force_partial or os.environ.get("MTM_DONE_FIRST", "1") == "0":
             return None
         native = self._native_coordinator()
-        item_type = str(details.get("data", {}).get("type") or key.split("-")[0]).upper()
-        if gate_error is None and (answer_status == "DONE" or item_type == "PI"):
-            return None  # DONE goes straight in; PI is a speed race and is submitted as soon as possible
+        if gate_error is None and answer_status == "DONE":
+            return None  # DONE goes straight in
+        # PI is a speed race, but even the slowest correct PI earns 60% while a wrong one earns 0 and an item
+        # is accepted only once (CWQNKAPC: PI-01 submitted fast, scored 0/160). So PI is held to DONE too.
         try:
             cap = int(os.environ.get("MTM_DONE_FIRST_RETRIES", "3"))
             min_window = float(os.environ.get("MTM_FIX_MIN_SECONDS", str(native.FIX_MIN_SECONDS)))
