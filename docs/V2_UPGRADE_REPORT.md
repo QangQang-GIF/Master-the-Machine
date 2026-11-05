@@ -1,0 +1,47 @@
+# MTM Orchestrator V2 — Implementation Report (Phases 0-7)
+
+Branch `feat/adaptive-hierarchical-orchestrator-v2`, baseline `f4d8058`. Everything below was run in a Linux
+cloud container (Python 3.13, root) against the repo's own test suite. No live Game Master, no real worker CLI,
+no Practice Match was available, so nothing here is an end-to-end measurement.
+
+## What changed, by phase
+| Phase | Delivered | Status |
+|---|---|---|
+| 0 | Branch from baseline, checksum + test baseline (`docs/V2_BASELINE_REPORT.md`) | Done; V1 benchmark not measurable here |
+| 1 | `submit_work` fail-closed (no auto-heal / forced PARTIAL / `git add -A` / ignored 2nd validation); failed push no longer ignored; emergency flush no longer fabricates a passing test; claim fallbacks enforce dependency/overlap/deadline/status/clock; integration lock has a lease and is not reclaimed while push/submit is in flight; lock released when the gate rejects | Done, with one deferral (below) |
+| 2 | Reserve is PI-only and never borrowable; Heavy uses normal capacity; PI may expand into idle normal slots; `production.yaml` aligned with the installer (5/3/2) and a drift test; durable events table with `ack_event` / `unacked_events` | Done |
+| 3 | `tasks/triage.py`, `expected_score_priority` (with reasons), `scheduling/model_policy.py` (allowlist, fallback, effort cap, requested/actual telemetry); adaptive ordering behind `MTM_ORCH_V2_ENABLED` + `MTM_V2_ADAPTIVE_SCHEDULER` | Done as pure/flagged logic |
+| 4 | `scheduling/deadline_policy.py` (marks 300/180/90, dynamic code freeze, control instruction, `submit_decision`: CR/BUG never partial); durable `deadline_control` events behind `MTM_V2_DEADLINE_CONTROL` | Logic done; worker-side delivery/ack unverified |
+| 5 | `tasks/heavy_plan.py` (versioned DAG, validation, critical path, split-worth check, `SpawnGate`), `mtm-heavy-orchestrator` skill | Logic done; native child spawn NOT implemented/verified |
+| 6 | `record_heartbeat`, `stale_heartbeats`, `reconcile_report` (recommend-only; releases only a provably orphaned lock) | Done at the coordinator level |
+| 7 | `scripts/bench_v2_replay.py` deterministic model + `docs/V2_BENCHMARK_MODEL.json` | Model only |
+
+## Tests
+Full suite after the work: 783 passed, 4 failed, 8 skipped (15 deselected: live CLI / staging Game Master).
+All 4 failures also failed at baseline (Windows read-only/permission semantics, running as root, a timing test).
+A fifth baseline failure (`test_web_session` process-tree teardown) is intermittent: it failed in the baseline
+run and passed in later runs. Test count rose from 740 to 787 with the new V2 tests. Frozen checksums were regenerated
+with `scripts/update_checksums.py` and verify clean.
+
+## Acceptance gates (Plan section 14) — honest status
+- Safety gates: the ones covered by unit tests pass (no submit past a rejected gate, no fabricated test, no PI-reserve
+  borrowing, no slot release without confirmed stop in `SpawnGate`). "No invalid submission bypasses the guard" and
+  "official Player compatibility" are NOT proven end to end.
+- Heavy median >= 20% faster: NOT demonstrated. In the model, the 5-slot 3/2 split makes Heavy ~6% slower (69% of runs
+  degrade to sequential because the parent and other workers take the normal slots). With 4/1 or 5/1 the sample DAG
+  tops out near -17.6% at 30 s per-child overhead; 20% needs overhead below roughly 26 s. This is a design risk to
+  settle with real data, not a result.
+- PI p95 not slower than baseline: holds in the model (PI never waits for Heavy), not measured for real.
+- Score non-regression: not measurable here.
+
+## Deferred / open (explicit)
+1. Safe stop before snapshot (Plan P1): `finalize_item` still snapshots a worker that may be running. Fixing it needs a
+   stop-then-finalize protocol with worker acknowledgement, which depends on native runtime behaviour.
+2. Native runtime questions in Plan section 13 (per-agent model override, signalling an active worker, whether Root
+   counts toward the concurrency cap, nested-agent accounting) are still unverified. Child spawn is gated, not wired.
+3. `releases/prod_manifest.json` still records `native_policy` 2/1/1 and does not list the new Heavy skill; it is a
+   frozen release artifact, so it needs a deliberate re-freeze.
+4. Auto-finalize at the deadline now reports FAILED instead of submitting a forced PARTIAL (gate rejects it). Whether a
+   TASK/PI contract permits a partial submission must be wired from the announced contract before that can return.
+5. Rollout stages (shadow scheduler, canary) are not built: only the feature flags exist.
+6. The 5 baseline failures need a run on the project's Windows machine.

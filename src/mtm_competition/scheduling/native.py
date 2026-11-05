@@ -15,7 +15,7 @@ import subprocess
 import shutil
 import time
 from pathlib import Path, PurePosixPath
-from typing import Any, Iterator
+from typing import Any, Iterable, Iterator
 
 
 class NativeCoordinationError(ValueError):
@@ -609,6 +609,67 @@ class NativeTaskCoordinator:
                 db.execute("INSERT OR IGNORE INTO events(event_id,type,task_key,payload,status,updated_at) VALUES(?,?,?,?,?,?)",
                            (ev["eventId"], ev["type"], ev.get("backlogItemKey"), json.dumps(ev), "DELIVERED", time.time()))
         return events
+
+    # ---- V2 Phase 6: heartbeat + restart reconciliation (read-mostly, never spawns/merges/submits) ----
+    def record_heartbeat(self, key: str, stage: str, checkpoint: str | None = None, blocker: str | None = None) -> None:
+        """Worker/parent progress marker. Deliberately carries no transcript, credentials or source text."""
+        key = self._key(key)
+        with self._db() as db:
+            row = self._task(db, key)
+            if row["phase"] != "RUNNING":
+                raise NativeCoordinationError("Heartbeat only accepted for a RUNNING task")
+            self._set_meta(db, f"hb:{key}", {"stage": str(stage)[:64], "checkpoint": (str(checkpoint)[:64] if checkpoint else None),
+                                              "blocker": (str(blocker)[:200] if blocker else None), "at": time.time()})
+
+    def stale_heartbeats(self, max_age_seconds: float) -> list[dict[str, Any]]:
+        """RUNNING tasks whose last heartbeat is older than the limit (or missing). Informational only."""
+        out: list[dict[str, Any]] = []
+        now = time.time()
+        with self._db() as db:
+            for r in db.execute("SELECT key FROM tasks WHERE phase='RUNNING'").fetchall():
+                hb = self._meta(db, f"hb:{r['key']}")
+                age = None if not hb else now - float(hb["at"])
+                if hb is None or age > max_age_seconds:
+                    out.append({"key": r["key"], "ageSeconds": age, "lastStage": (hb or {}).get("stage")})
+        return out
+
+    def reconcile_report(self, inflight_submission_keys: Iterable[str] = ()) -> dict[str, Any]:
+        """Describe what a restarted Root must reconcile BEFORE spawning, merging or submitting again.
+
+        The only state change made here is releasing an orphaned integration lock whose owner is not
+        integrating and has no submission in flight. Everything else is returned as a recommendation.
+        """
+        inflight = set(inflight_submission_keys)
+        report: dict[str, Any] = {"tasks": [], "releasedOrphanLock": None, "unackedEvents": []}
+        with self._db() as db:
+            owner = self._meta(db, "integration_owner")
+            rows = db.execute("SELECT key,phase,worktree FROM tasks WHERE phase NOT IN ('QUEUED','CLOSED','SUBMITTED') ORDER BY key").fetchall()
+            for r in rows:
+                key, phase = r["key"], r["phase"]
+                wt = Path(r["worktree"]) if r["worktree"] else None
+                has_dir = bool(wt and wt.exists())
+                result_file = bool(has_dir and (wt / self.repository_folder / "worker_result.json").is_file())
+                if key in inflight:
+                    action = "replay_in_flight_submission_with_original_identity"
+                elif phase == "RUNNING":
+                    action = "confirm_native_agent_status_before_any_respawn" if has_dir else "worktree_missing_needs_attention"
+                elif phase in ("INTEGRATING", "INTEGRATED"):
+                    action = "resume_or_end_integration_after_checking_checkout_and_remote"
+                elif phase == "READY_TO_INTEGRATE":
+                    action = "ready_after_quiescence_confirmation"
+                else:
+                    action = "manual_review"
+                report["tasks"].append({"key": key, "phase": phase, "worktreeExists": has_dir,
+                                        "workerResultFile": result_file, "action": action})
+            if owner:
+                owner_phase = next((r["phase"] for r in rows if r["key"] == owner), None)
+                if owner_phase not in ("INTEGRATING", "INTEGRATED") and owner not in inflight:
+                    self._set_meta(db, "integration_owner", None)
+                    self._set_meta(db, "integration_acquired_at", None)
+                    self._set_meta(db, "integration_inflight", None)
+                    report["releasedOrphanLock"] = owner
+        report["unackedEvents"] = [e["eventId"] for e in self.unacked_events()]
+        return report
 
     def ack_event(self, event_id: str) -> bool:
         """Root calls this only after the action for the event was applied. Idempotent."""

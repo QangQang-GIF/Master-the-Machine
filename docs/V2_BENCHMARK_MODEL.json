@@ -1,0 +1,42 @@
+{
+  "assumptions": {
+    "normal": 3,
+    "perChildOverheadSeconds": 30,
+    "piArrivalSeconds": 100.0,
+    "reserved": 2,
+    "slots": 5
+  },
+  "comparison": {
+    "caveat": "Model only. Real acceptance needs measured end-to-end replay and Practice Match data (Plan 14).",
+    "heavyMedianReductionPercent": -5.88,
+    "meets20PercentHeavyTarget_IN_MODEL": false,
+    "piWaitP95_v2_not_worse": true
+  },
+  "model": "slot-policy model, NOT measured execution",
+  "runs": 200,
+  "seed": 20261105,
+  "v1": {
+    "heavyDegradedRate": 0.0,
+    "heavySeconds": {
+      "median": 510.0,
+      "p95": 510.0
+    },
+    "piWaitSeconds": {
+      "max": 674.7012507291399,
+      "median": 0.0,
+      "p95": 440.5545123743609
+    }
+  },
+  "v2": {
+    "heavyDegradedRate": 0.69,
+    "heavySeconds": {
+      "median": 540.0,
+      "p95": 540.0
+    },
+    "piWaitSeconds": {
+      "max": 0.0,
+      "median": 0.0,
+      "p95": 0.0
+    }
+  }
+}
