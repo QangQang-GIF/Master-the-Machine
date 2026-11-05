@@ -265,7 +265,8 @@ class NativeTaskCoordinator:
         return isinstance(data, dict) and str(data.get("task_id", "")).strip().upper() == str(key).strip().upper()
 
     # ------------------------------------------------------------------ DONE-first: send back for fix
-    FIX_MIN_SECONDS = 300        # a fix attempt needs at least this much working time after the margin
+    FIX_MIN_SECONDS = 300        # another attempt on a PARTIAL answer needs at least this much working time
+    FIX_MIN_SECONDS_ON_ERROR = 60  # after a failed submission (scores 0 unless fixed) even a short attempt is worth it
 
     def fix_window_seconds(self, key: str) -> float | None:
         """Working seconds still available for another attempt on *key* (item deadline or match end,

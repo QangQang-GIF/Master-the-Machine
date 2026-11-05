@@ -80,3 +80,9 @@ auto-finalize still submits an honest PARTIAL as the last resort. `MTM_DONE_FIRS
 Replay (`scripts/replay_submission_gate.py`, real answers + Start Work data, placeholder evidence bytes):
 deployed code rejects BUG-01/BUG-04/CR-01 with the exact match errors; current code accepts them.
 Not yet measured in a real match.
+
+## Resubmission after a failed submission
+
+- A local gate error or a Game Master 400/422 rejection no longer ends the item. The item goes back to a worker (`SENT_BACK_FOR_DONE`) with the error text in `fix_request.gateError`, and is resubmitted once the worker finishes.
+- Window needed: at least `MTM_FIX_MIN_SECONDS_ON_ERROR` (60 s) after an error. A PARTIAL answer with fewer than `MTM_FIX_MIN_SECONDS` (300 s) left is submitted as honest PARTIAL.
+- 409 closed/deadline, 404/410 and `MTM_DONE_FIRST=0` keep the old terminal behaviour.

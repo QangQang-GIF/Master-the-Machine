@@ -1533,11 +1533,22 @@ class MCPHelperServer:
 
             is_already_submitted = (status_code == 409 and ("already_submitted" in err_code_str or "already submitted" in exc_str))
 
-            # Terminal rejection: 409 [CLOSED / NOT ALLOWED / EXPIRED], 400, 404, 410, 422
+            # 400/422 = the answer itself was refused (validation). Nothing was accepted, and an item allows one
+            # *accepted* submission, so DONE-first sends it back to a worker to fix and resubmit.
+            is_fixable_rejection = (status_code in (400, 422) and bool(self.native)
+                                    and os.environ.get("MTM_DONE_FIRST", "1") != "0")
+            # Terminal rejection: 409 [CLOSED / NOT ALLOWED / EXPIRED], 404, 410 (and 400/422 when DONE-first is off)
             is_terminal_rejection = (
                 (status_code == 409 and not is_already_submitted and any(k in exc_str for k in ("closed", "not allowed", "deadline", "expired")))
-                or (status_code in (400, 404, 410, 422))
+                or (status_code in (404, 410))
+                or (status_code in (400, 422) and not is_fixable_rejection)
             )
+            if is_fixable_rejection:
+                try:
+                    exc.mtm_fixable_rejection = True
+                    exc.mtm_status_code = status_code
+                except Exception:
+                    pass
 
             if is_terminal_rejection and self.native:
                 try:
@@ -1769,7 +1780,8 @@ class MCPHelperServer:
         This applies to PI as well: a fast wrong PI scores 0, a slower correct one still scores.
 
         MTM_DONE_FIRST=0 disables; MTM_DONE_FIRST_RETRIES caps attempts (default 3);
-        MTM_FIX_MIN_SECONDS is the minimum working time a new attempt needs (default 300).
+        MTM_FIX_MIN_SECONDS is the minimum working time for another attempt on a PARTIAL answer (default 300);
+        MTM_FIX_MIN_SECONDS_ON_ERROR is the minimum after a failed submission (gate or Game Master 400/422, default 60).
         """
         if force_partial or os.environ.get("MTM_DONE_FIRST", "1") == "0":
             return None
@@ -1780,9 +1792,14 @@ class MCPHelperServer:
         # is accepted only once (CWQNKAPC: PI-01 submitted fast, scored 0/160). So PI is held to DONE too.
         try:
             cap = int(os.environ.get("MTM_DONE_FIRST_RETRIES", "3"))
-            min_window = float(os.environ.get("MTM_FIX_MIN_SECONDS", str(native.FIX_MIN_SECONDS)))
+            if gate_error:
+                # A failed submission scores 0 unless it is fixed, so even a short attempt is worth it.
+                min_window = float(os.environ.get("MTM_FIX_MIN_SECONDS_ON_ERROR", str(native.FIX_MIN_SECONDS_ON_ERROR)))
+            else:
+                min_window = float(os.environ.get("MTM_FIX_MIN_SECONDS", str(native.FIX_MIN_SECONDS)))
         except ValueError:
-            cap, min_window = 3, float(native.FIX_MIN_SECONDS)
+            cap = 3
+            min_window = float(native.FIX_MIN_SECONDS_ON_ERROR if gate_error else native.FIX_MIN_SECONDS)
         window = native.fix_window_seconds(key)
         if native.fix_attempts(key) >= cap or window is None or window < min_window:
             return None
@@ -2008,6 +2025,21 @@ class MCPHelperServer:
                                                    force_partial=deadline_forced, gate_error=str(gate_err))
             if sent_back:
                 return sent_back
+            raise
+        except Exception as gm_err:
+            if not getattr(gm_err, "mtm_fixable_rejection", False):
+                raise
+            # submit_work already released the integration lock and journaled the rejection.
+            message = f"Game Master rejected the submission (HTTP {getattr(gm_err, 'mtm_status_code', '?')}): {gm_err}"
+            sent_back = self._done_first_send_back(key, details, answer_status=str(answer.get("status", "")).upper(),
+                                                   not_run=not_run, worker_head=worker_head,
+                                                   force_partial=deadline_forced, gate_error=message)
+            if sent_back:
+                return sent_back
+            try:  # no time left for a fix: same outcome as before DONE-first
+                native.reconcile_worker(key, confirmed_stopped=True, reason=message[:600], requeue=False)
+            except Exception:
+                pass
             raise
         return {"backlogItemKey": key, "status": "SUBMITTED", "answerStatus": answer.get("status"),
                 "notRun": not_run, "stopWorker": was_running, "receipt": receipt,
