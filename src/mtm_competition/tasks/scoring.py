@@ -61,3 +61,50 @@ def calculate_expected_value(
 
     score = (p_pass * points * urgency * deadline_factor * attempt_penalty * time_factor) / expected_time
     return round(score, 4)
+
+
+def expected_score_priority(
+    task: Dict[str, Any],
+    triage: Optional[Dict[str, Any]] = None,
+    match_remaining_seconds: float = 2400.0,
+    now: Optional[float] = None,
+    integration_queue_seconds: float = 0.0,
+) -> Dict[str, Any]:
+    """V2 non-PI priority: expected_score / estimated_end_to_end_time, with an explanation.
+
+    expected_score = points * P(pass) * deadline_feasibility. Inputs are forecasts. A task that cannot
+    finish (feasibility 0) is returned with priority 0 and a skip reason instead of being hidden.
+    """
+    otype = str(task.get("type") or task.get("task_type") or "TASK").upper()
+    points = float(task.get("points") or 0.0)
+    conf = float((triage or {}).get("confidence", 0.6))
+    base_p = DEFAULT_P_PASS.get(otype, 0.75)
+    p_pass = base_p * (0.85 + 0.15 * conf)  # lower confidence slightly discounts the forecast
+    work = float((triage or {}).get("estimatedWorkSeconds", DEFAULT_EXPECTED_SECONDS.get(otype, 180.0)))
+    evid = float((triage or {}).get("estimatedEvidenceSeconds", 45.0))
+    total = max(10.0, work + evid + max(0.0, integration_queue_seconds))
+
+    t = time.time() if now is None else now
+    deadline = task.get("deadline_epoch")
+    slack = float(match_remaining_seconds)
+    if deadline is not None:
+        slack = min(slack, float(deadline) - t)
+    reasons = []
+    if slack <= 0:
+        feas, reasons = 0.0, ["no time left before deadline/match end"]
+    elif slack < total:
+        feas, reasons = 0.0, [f"needs ~{int(total)}s but only {int(slack)}s left"]
+    else:
+        feas = min(1.0, 0.5 + 0.5 * (slack - total) / max(total, 1.0))
+        reasons.append("fits before deadline")
+    expected = points * p_pass * feas
+    urgency = 1.0
+    if deadline is not None and slack < total * 2:
+        urgency = 1.3
+        reasons.append("deadline within 2x estimated time")
+    priority = (expected / total) * urgency
+    return {
+        "key": task.get("key"), "expectedScore": round(expected, 3), "priority": round(priority, 5),
+        "estimatedEndToEndSeconds": int(total), "deadlineFeasibility": round(feas, 3),
+        "pPass": round(p_pass, 3), "reasons": reasons, "estimateKind": "forecast",
+    }

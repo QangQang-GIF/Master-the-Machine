@@ -30,7 +30,9 @@ class NativeTaskCoordinator:
                  reserved_workers: int | None = None, allow_reserved_borrow: bool = True,
                  heavy_keys: list[str] | set[str] | None = None,
                  heavy_min_difficulty: float | None = None,
-                 heavy_max_seconds: int | None = None):
+                 heavy_max_seconds: int | None = None, adaptive: bool = False):
+        # V2 (MTM_V2_ADAPTIVE_SCHEDULER): order non-PI work by expected score per time and explain decisions.
+        self.adaptive = bool(adaptive)
         if not 1 <= normal_workers < max_workers <= 16:
             raise NativeCoordinationError("Require 1 <= normal_workers < max_workers <= 16")
         # Lane mode: `normal_workers` slots for ordinary items plus `reserved_workers`
@@ -450,6 +452,7 @@ class NativeTaskCoordinator:
         for r in active:
             used[self._slot_of(json.loads(r["data"]))] += 1
         caps = {"normal": self.normal_workers, "reserved": self.reserved_workers}
+        explained: dict[str, dict] = {}
         candidates = []
         for row in rows:
             task = json.loads(row["data"])
@@ -473,6 +476,17 @@ class NativeTaskCoordinator:
             else:
                 tier = 2
             sub = slack if deadline is not None else float("inf")
+            if self.adaptive and lane == "normal":
+                from mtm_competition.tasks.scoring import expected_score_priority
+                from mtm_competition.tasks.triage import triage_task
+                tri = triage_task(task).to_dict()
+                prio = expected_score_priority(task, tri, remaining, now)
+                explained[row["key"]] = {**prio, "triage": tri}
+                if prio["priority"] <= 0:
+                    explained[row["key"]]["decision"] = "skipped: " + "; ".join(prio["reasons"])
+                    continue  # forecast says it cannot finish in time: do not start it
+                if tier == 2:
+                    sub = -prio["priority"]  # replaces arrival order only inside the no-deadline tier
             candidates.append(((tier, sub, float(row["discovered"]), row["key"]), task, lane, slack))
         candidates.sort(key=lambda c: c[0])
         reserved_waiting = any(c[2] == "reserved" for c in candidates)
@@ -497,6 +511,11 @@ class NativeTaskCoordinator:
                                          "heavy": self._is_heavy(task)})
         response["lanes"] = {"normal": {"running": used["normal"], "capacity": caps["normal"]},
                              "reserved": {"running": used["reserved"], "capacity": caps["reserved"]}}
+        if self.adaptive:
+            picked = {t["key"] for t in response["selected"]}
+            for k, info in explained.items():
+                info.setdefault("decision", "selected" if k in picked else "waiting: no free slot in lane")
+            response["decisions"] = explained
 
     def _lane_slot_available(self, db, task: dict) -> str | None:
         used = {"normal": 0, "reserved": 0}

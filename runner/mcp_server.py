@@ -70,6 +70,9 @@ def _lane_settings_from_env() -> Dict[str, Any]:
     if reserved and reserved > 0:
         settings["reserved_workers"] = reserved
         settings["allow_reserved_borrow"] = False  # V2: PI reserve is never borrowable (env ignored)
+    # V2 feature flags (Plan section 15): both must be on; default off keeps V1 ordering.
+    if os.environ.get("MTM_ORCH_V2_ENABLED", "0") == "1" and os.environ.get("MTM_V2_ADAPTIVE_SCHEDULER", "0") == "1":
+        settings["adaptive"] = True
     keys = [k for k in os.environ.get("MTM_HEAVY_KEYS", "").split(",") if k.strip()]
     if keys:
         settings["heavy_keys"] = keys
