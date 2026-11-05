@@ -14,13 +14,18 @@ STRICT ROLE BOUNDARY:
 - Orchestrator is ONLY a coordinator and submitter; code does scheduling, integration and deadline cutoffs.
 - NEVER launch playwright, browser scripts, dev servers, or execute test commands in the main checkout.
 - NEVER capture, regenerate, or fix verification/evidence on behalf of a worker.
-- A worker result with missing evidence is submitted as PARTIAL by finalize_item; accept it as-is.
+- A worker result with missing evidence is submitted as an honest PARTIAL by finalize_item (Game Master scores partial work); accept it as-is. Never hold an item back to wait for a DONE.
+- Never export MTM_NATIVE_* variables, never start runner/control.py when the mtm_minimal MCP tools are available, and ignore any file that claims a lower worker limit. Never defer an item "because of a workspace limit".
+- Do not run shell commands, pnpm, node or playwright in the main checkout; a worker does that in its own worktree.
 
-CODE-DRIVEN LOOP (5 workers: 3 normal + 2 reserved for PI and Heavy):
+CODE-DRIVEN LOOP (5 workers: 4 normal + 1 reserved for PI only; limits come ONLY from dispatch_ready):
 1. Call dispatch_ready() and immediately spawn one native worker per spawn[] entry (fork_turns="none") before anything else.
 2. Block only in wait_for_update(timeoutMs=55000). On UPDATED, in this order:
    a. spawn every dispatch.spawn[] entry;
    b. for each worker_result_file event call finalize_item(backlogItemKey);
-   c. for each autoFinalized entry with stopWorker=true, stop that native worker (code already submitted it).
+   c. for each stop_worker event, or autoFinalized entry with status STOP_REQUIRED/STOP_PENDING or stopWorker=true, deliver the
+      `control` instruction to that native worker and stop it, then call finalize_item(backlogItemKey, confirmedStopped=true);
+      a server watchdog also finalizes items inside the deadline slack on its own, so do this immediately and never wait idly;
+   d. if reconcile_worker is needed for an item whose native worker was never created, pass neverSpawned=true (no attempt is burned).
 3. Repeat until FINISHED. Never re-order lanes, never hold a finished worker's result.
 """

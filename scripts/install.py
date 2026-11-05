@@ -35,6 +35,32 @@ def safe_copytree(src: Path, dst: Path) -> None:
         shutil.copytree(src, dst, dirs_exist_ok=True)
 
 
+def sync_agents_md(source_dir: Path, ws: Path) -> bool:
+    """Copy the repo's base AGENTS.md into the team workspace, preserving the Player-managed block."""
+    try:
+        src_agents = source_dir / "AGENTS.md"
+        if not src_agents.is_file():
+            return False
+        base = src_agents.read_text(encoding="utf-8")
+        dst_agents = ws / "AGENTS.md"
+        begin, end = "<!-- MTM-PLAYER:BEGIN -->", "<!-- MTM-PLAYER:END -->"
+        block = ""
+        if dst_agents.is_file():
+            old = dst_agents.read_text(encoding="utf-8")
+            if begin in old and end in old:
+                block = old[old.index(begin):old.index(end) + len(end)]
+        if begin in base and end in base:
+            base = base[:base.index(begin)].rstrip() + "\n"
+        merged = base.rstrip() + "\n" + (("\n" + block + "\n") if block else "")
+        if not dst_agents.is_file() or dst_agents.read_text(encoding="utf-8") != merged:
+            dst_agents.write_text(merged, encoding="utf-8")
+            print(f"Synced base AGENTS.md into {dst_agents} (Player block preserved: {bool(block)})")
+            return True
+    except OSError as exc:
+        sys.stderr.write(f"Warning: could not sync AGENTS.md: {exc}\n")
+    return False
+
+
 def install_pack(source_dir: Path, workspace_dir: Path) -> None:
     source_dir = source_dir.resolve()
     ws = workspace_dir.resolve()
@@ -242,6 +268,9 @@ MTM_WORKER_EFFORT = "low"
     (codex_dir / "config.toml").write_text(codex_toml, encoding="utf-8")
     (target_pack_dir / ".codex").mkdir(parents=True, exist_ok=True)
     (target_pack_dir / ".codex" / "config.toml").write_text(codex_toml, encoding="utf-8")
+
+    # 6b. Sync the base AGENTS.md (a stale copy once limited workers to 1 normal slot in a real match).
+    sync_agents_md(source_dir, ws)
 
     # 7. Run distribution check
     check_script = target_pack_dir / "scripts" / "check-distribution.py"

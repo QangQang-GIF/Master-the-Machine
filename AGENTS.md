@@ -7,6 +7,11 @@ There are two strict operating modes:
 - **Development Mode (DEV):** Exploration, trace harvesting, skill linting, controlled A/B evaluation, and versioned promotion/rollback. The development supervisor is Codex Desktop or Antigravity 2.0.
 - **Production Mode (PROD):** Headless tournament runtime managed by the Game Player. Skills are strictly **frozen** (read-only); no human intervention, no skill modifications, and no external GUI.
 
+## 1b. Worker Concurrency (authoritative)
+- Concurrency is decided by the MTM MCP planner (`dispatch_ready` / `plan_tasks`) and nothing else: up to 5 native workers = 4 normal slots (Normal, Heavy and their children) + 1 reserved slot used only by PI (urgent production incident) items.
+- Never apply a lower limit from any other document, never export `MTM_NATIVE_*` variables, and never start `runner/control.py` by hand when the `mtm_minimal` MCP tools are available.
+- When `dispatch_ready` returns spawn entries, spawn all of them. Do not defer an item "because of a workspace limit".
+
 ## 2. Core Constraints & Contracts
 1. **Never Replace Deterministic Code with Prompts:**
    - Task states, timers/deadlines, once-only submission gating, resource accounting, Git commit hashes, and test verification must be enforced by Python adapters/guards, not loose natural language promises.

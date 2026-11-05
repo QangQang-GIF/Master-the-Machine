@@ -569,6 +569,14 @@ class NativeTaskCoordinator:
                     if tag not in seen and marker.is_file():
                         seen.add(tag)
                         events.append({"type": "worker_result_file", "eventId": tag, "backlogItemKey": key, "path": str(marker)})
+                stop = task.get("stop")
+                if row["phase"] == "RUNNING" and stop and stop.get("requested") and not stop.get("confirmed"):
+                    stag = f"stopworker:{stop.get('instructionId')}"
+                    if stag not in seen:
+                        seen.add(stag)
+                        events.append({"type": "stop_worker", "eventId": stag, "backlogItemKey": key,
+                                       "control": stop.get("instruction"), "instructionId": stop.get("instructionId"),
+                                       "reason": stop.get("reason")})
                 if now is None or row["phase"] not in ("QUEUED", "RUNNING", "READY_TO_INTEGRATE"):
                     continue
                 deadline = task.get("deadline_epoch")
@@ -621,6 +629,29 @@ class NativeTaskCoordinator:
                 db.execute("INSERT OR IGNORE INTO events(event_id,type,task_key,payload,status,updated_at) VALUES(?,?,?,?,?,?)",
                            (ev["eventId"], ev["type"], ev.get("backlogItemKey"), json.dumps(ev), "DELIVERED", time.time()))
         return events
+
+    def deadline_candidates(self, finalize_slack: float | None, match_finalize_slack: float | None) -> list[dict[str, Any]]:
+        """Read-only: active items whose official deadline (or the match end) is within the slack.
+
+        Used by the server-side watchdog so the final snapshot/submit does not depend on Root's turn.
+        Nothing is marked as reported here.
+        """
+        out: list[dict[str, Any]] = []
+        with self._db() as db:
+            status, now, remaining = self._clock(db)
+            if now is None:
+                return out
+            for row in db.execute("SELECT key,phase,data FROM tasks WHERE phase IN ('RUNNING','READY_TO_INTEGRATE') ORDER BY key").fetchall():
+                task = json.loads(row["data"])
+                deadline = task.get("deadline_epoch")
+                slack = (float(deadline) - now) if deadline is not None else None
+                if finalize_slack is not None and slack is not None and 0 < slack <= finalize_slack:
+                    out.append({"key": row["key"], "phase": row["phase"], "reason": "deadline", "slackSeconds": slack,
+                                "stop": task.get("stop")})
+                elif (match_finalize_slack is not None and remaining is not None and 0 < remaining <= match_finalize_slack):
+                    out.append({"key": row["key"], "phase": row["phase"], "reason": "match_end", "slackSeconds": remaining,
+                                "stop": task.get("stop")})
+        return out
 
     # ---- V2 Phase 6: heartbeat + restart reconciliation (read-mostly, never spawns/merges/submits) ----
     def record_heartbeat(self, key: str, stage: str, checkpoint: str | None = None, blocker: str | None = None) -> None:
@@ -971,7 +1002,7 @@ class NativeTaskCoordinator:
                     "receiptId": row["receipt"]}
 
     # ---- V2: safe-stop protocol (request -> confirm -> only then snapshot/integrate) ----
-    STOP_CONFIRM_SOURCES = ("worker_ack", "native_runtime", "root_attested")
+    STOP_CONFIRM_SOURCES = ("worker_ack", "native_runtime", "root_attested", "deadline_grace")
 
     def stop_state(self, key: str) -> dict[str, Any] | None:
         with self._db() as db:
@@ -1041,7 +1072,7 @@ class NativeTaskCoordinator:
         return bool(stop and stop.get("confirmed"))
 
     def reconcile_worker(self, key: str, *, confirmed_stopped: bool,
-                         reason: str, requeue: bool = False) -> dict[str, Any]:
+                         reason: str, requeue: bool = False, never_spawned: bool = False) -> dict[str, Any]:
         """Never automatically expire a lease while its native agent may still be writing.
 
         Requeue preserves the old worktree for investigation and uses a fresh attempt path.
@@ -1054,9 +1085,14 @@ class NativeTaskCoordinator:
             if row["phase"] not in ("RUNNING", "NEEDS_ATTENTION", "READY_TO_INTEGRATE", "INTEGRATING"):
                 raise NativeCoordinationError("Only active/failed workers can be reconciled")
             data = json.loads(row["data"])
-            data["prior_attempts"] = [*data.get("prior_attempts", []),
-                                     {"worktree": row["worktree"], "worker": row["worker_id"], "reason": reason}]
-            data["attempt_number"] = int(data.get("attempt_number", 1)) + 1
+            if never_spawned and requeue:
+                # No native worker ever existed for this claim: do not burn an attempt number (the log of
+                # RLL3DYW5 showed attempts 4-5 for items that never ran) and do not record a phantom attempt.
+                data.pop("stop", None)
+            else:
+                data["prior_attempts"] = [*data.get("prior_attempts", []),
+                                         {"worktree": row["worktree"], "worker": row["worker_id"], "reason": reason}]
+                data["attempt_number"] = int(data.get("attempt_number", 1)) + 1
             phase = "QUEUED" if requeue else "CLOSED"
             db.execute("UPDATE tasks SET phase=?,data=?,worker_id=NULL,worktree=NULL WHERE key=?",
                        (phase, json.dumps(data), key))

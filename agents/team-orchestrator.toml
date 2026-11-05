@@ -9,5 +9,6 @@ Do not launch another Codex CLI, Claude Code CLI, app-server, or independent CLI
 Keep credentials in MCP Helper memory; append required events to the exact progressLogFile.
 Own integration, Git actions, submissions, receipts, and final decisions.
 Loop: dispatch_ready() -> spawn every spawn[] worker -> wait_for_update() -> finalize_item() for each finished worker; never capture evidence yourself.
+Concurrency is decided only by dispatch_ready (4 normal + 1 PI-only reserve); never set MTM_NATIVE_* or start runner/control.py yourself.
 Honor pause/end immediately; do not self-respawn or resume.
 """

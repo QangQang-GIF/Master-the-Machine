@@ -21,6 +21,7 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
 import time
 import urllib.parse
 import uuid
@@ -652,6 +653,7 @@ class MCPHelperServer:
                 **_lane_settings_from_env(),
             )
             self._reconcile_native_receipts()
+            self._start_deadline_watchdog()
 
         # Record initial items from descriptor
         for item in descriptor.get("backlogItems", []):
@@ -1395,6 +1397,9 @@ class MCPHelperServer:
                     raise
 
         # 1. Pre-submission Git Invariant Verification (GIT-01..05) with Self-Healing Retry
+        # Honest PARTIAL is a valid, scored submission (Game Master grades partial work). The answer must
+        # itself declare PARTIAL; a DONE claim stays strictly gated and nothing is ever upgraded here.
+        declares_partial = isinstance(answer, dict) and str(answer.get("status", "")).upper() == "PARTIAL"
         try:
             self.git_guard.validate_pre_submission(
                 target_commit_sha=git_revision,
@@ -1406,6 +1411,7 @@ class MCPHelperServer:
                 require_remote=False if self.descriptor.get("offline") else True,
                 raise_on_error=True,
                 required_test_ids=required_test_ids,
+                allow_partial=declares_partial,
             )
         except Exception as gate_err:
             # V2 (P0): the submission gate is fail-closed. No auto-heal, no forced PARTIAL,
@@ -1738,8 +1744,69 @@ class MCPHelperServer:
         except Exception:
             pass
 
+    _finalize_lock = threading.RLock()
+    _watchdog_started = False
+
     def finalize_item(self, backlog_item_key: str, force_partial: bool = False,
                       confirmed_stopped: bool = False) -> Dict[str, Any]:
+        """Serialized entry point: Root and the deadline watchdog never finalize concurrently."""
+        with self._finalize_lock:
+            return self._finalize_item_impl(backlog_item_key, force_partial, confirmed_stopped)
+
+    # ---- V2: server-side deadline watchdog (does not depend on Root's turn) ----
+    def _watchdog_enabled(self) -> bool:
+        if os.environ.get("MTM_DEADLINE_WATCHDOG", "1") == "0":
+            return False
+        return "PYTEST_CURRENT_TEST" not in os.environ
+
+    def _start_deadline_watchdog(self) -> None:
+        if self._watchdog_started or not self._watchdog_enabled():
+            return
+        self._watchdog_started = True
+        self._wd_state: Dict[str, Dict[str, Any]] = {}
+
+        def loop() -> None:
+            while True:
+                time.sleep(3.0)
+                try:
+                    self._watchdog_tick()
+                except Exception as exc:  # never let the watchdog die
+                    sys.stderr.write(f"Deadline watchdog error: {exc}\n")
+        threading.Thread(target=loop, name="mtm-deadline-watchdog", daemon=True).start()
+
+    def _watchdog_tick(self, now: Optional[float] = None) -> List[Dict[str, Any]]:
+        """Finalize items inside the deadline/match-end slack by code. One pass; returns what it did.
+
+        1st pass on a RUNNING worker only requests a stop (Root is told via a `stop_worker` event). After
+        MTM_STOP_GRACE_SECONDS the snapshot proceeds anyway with an honest PARTIAL: losing the item is worse
+        than a late write, and any later worker writes are ignored. Items are retried at most 4 times.
+        """
+        if not self.native or self.match_state in ("FINISHED", "PAUSED"):
+            return []
+        if not hasattr(self, "_wd_state"):
+            self._wd_state = {}
+        t = time.time() if now is None else now
+        fslack, mslack = self._auto_finalize_settings()
+        done: List[Dict[str, Any]] = []
+        for cand in self.native.deadline_candidates(fslack, mslack):
+            key = cand["key"]
+            st = self._wd_state.setdefault(key, {"fails": 0, "last": 0.0})
+            if st["fails"] >= 4 or t - st["last"] < 3.0:
+                continue
+            st["last"] = t
+            try:
+                res = self.finalize_item(key, force_partial=True)
+            except Exception as exc:
+                st["fails"] += 1
+                done.append({"backlogItemKey": key, "status": "FAILED", "reason": str(exc)[:200]})
+                continue
+            if res.get("status") not in ("STOP_REQUIRED", "STOP_PENDING"):
+                st["fails"] = 99  # finished (submitted / already submitted)
+            done.append({"backlogItemKey": key, "status": res.get("status")})
+        return done
+
+    def _finalize_item_impl(self, backlog_item_key: str, force_partial: bool = False,
+                            confirmed_stopped: bool = False) -> Dict[str, Any]:
         """Snapshot worker -> honest submit.json -> cherry-pick -> push -> submit, in one call.
 
         Used when a worker finishes (worker_result.json written) and, with force_partial,
@@ -1778,6 +1845,10 @@ class MCPHelperServer:
                     acked = False
                 if acked:
                     native.confirm_stopped(key, "worker_ack")
+            if force_partial and stop and stop.get("requested") and not stop.get("confirmed"):
+                grace = float(os.environ.get("MTM_STOP_GRACE_SECONDS", "12"))
+                if time.time() - float(stop.get("requestedAt") or time.time()) >= grace:
+                    native.confirm_stopped(key, "deadline_grace")
             if not native.is_quiesced(key):
                 req = native.request_stop(key, "finalize requested" + (" (deadline)" if force_partial else ""))
                 return {"backlogItemKey": key, "status": "STOP_PENDING" if req.get("alreadyRequested") else "STOP_REQUIRED",
@@ -1916,7 +1987,8 @@ class MCPHelperServer:
             return native.end_integration(backlog_item_key, success=False)
         raise ValueError("integration_gate action must be begin or failed")
 
-    def reconcile_worker(self, backlog_item_key: str, confirmed_stopped: bool, reason: str, requeue: bool = True) -> Dict[str, Any]:
+    def reconcile_worker(self, backlog_item_key: str, confirmed_stopped: bool, reason: str, requeue: bool = True,
+                         never_spawned: bool = False) -> Dict[str, Any]:
         native = self._native_coordinator()
         if confirmed_stopped is True:
             try:
@@ -1926,7 +1998,7 @@ class MCPHelperServer:
             except Exception:
                 pass
         return native.reconcile_worker(
-            backlog_item_key, confirmed_stopped=confirmed_stopped, reason=reason, requeue=requeue)
+            backlog_item_key, confirmed_stopped=confirmed_stopped, reason=reason, requeue=requeue, never_spawned=never_spawned)
 
     def wait_for_update(self, timeout_ms: int = 5000) -> Dict[str, Any]:
         """Bounded serial polling detecting wave releases and match status transitions."""
@@ -2023,7 +2095,9 @@ class MCPHelperServer:
                     out["dispatch"] = self.dispatch_ready()
                 out["instruction"] = ("Spawn every dispatch.spawn[] worker; call finalize_item for each "
                                       "worker_result_file event; for every autoFinalized entry with status STOP_REQUIRED/STOP_PENDING, "
-                                      "stop that native worker, then call finalize_item with confirmedStopped=true.")
+                                      "stop that native worker, then call finalize_item with confirmedStopped=true. For every `stop_worker` event, "
+                                      "deliver its `control` to that worker and close it now. A server watchdog finalizes items inside the "
+                                      "deadline slack on its own after a short stop grace; never wait for it idly.")
                 return out
             if (time.time() - start) * 1000 >= bounded_ms:
                 return {"status": "TIMEOUT", "matchState": self.match_state,
@@ -2034,7 +2108,7 @@ class MCPHelperServer:
 def get_tool_definitions() -> List[Dict[str, Any]]:
     native_tools = [
         ("plan_tasks", "Refresh server board and return eligible native tasks, reserved urgent capacity, and ready integrations.", {}, []),
-        ("dispatch_ready", "Start Work + claim every task the planner selects (3 normal slots, 2 reserved PI/Heavy slots) and return ready TaskEnvelopes. Root only spawns one native worker per spawn[] entry.",
+        ("dispatch_ready", "Start Work + claim every task the planner selects (4 normal slots + 1 PI-only reserved slot) and return ready TaskEnvelopes. Root only spawns one native worker per spawn[] entry.",
          {"estimatedSeconds": {"type": "integer", "minimum": 10, "default": 420}}, []),
         ("finalize_item", "Root-only: snapshot a worker's worktree, make submit.json honest (missing evidence -> NOT_RUN, PARTIAL), cherry-pick, push and submit in one call. Never fabricates evidence.",
          {"backlogItemKey": {"type": "string"}, "forcePartial": {"type": "boolean", "default": False},
@@ -2046,7 +2120,7 @@ def get_tool_definitions() -> List[Dict[str, Any]]:
         ("integration_gate", "Root-only exclusive integration/push/submit lock. Begin before Git mutation; failed releases after reconciliation. Submit receipt releases success.",
          {"backlogItemKey": {"type": "string"}, "action": {"type": "string", "enum": ["begin", "failed"], "default": "begin"}}, ["backlogItemKey"]),
         ("reconcile_worker", "Reconcile a stopped/completed failed native worker. Never confirm stopped while it is still writing.",
-         {"backlogItemKey": {"type": "string"}, "confirmedStopped": {"type": "boolean"}, "reason": {"type": "string"}, "requeue": {"type": "boolean", "default": True}}, ["backlogItemKey", "confirmedStopped", "reason"]),
+         {"backlogItemKey": {"type": "string"}, "confirmedStopped": {"type": "boolean"}, "reason": {"type": "string"}, "requeue": {"type": "boolean", "default": True}, "neverSpawned": {"type": "boolean", "default": False}}, ["backlogItemKey", "confirmedStopped", "reason"]),
     ]
     return [{"name": name, "description": description, "inputSchema": {"type": "object", "properties": props, "required": required, "additionalProperties": False}}
             for name, description, props, required in native_tools] + [
@@ -2232,7 +2306,7 @@ def run_mcp_stdio_server():
                 elif tool_name == "integration_gate":
                     val = server.integration_gate(tool_args["backlogItemKey"], tool_args.get("action", "begin"))
                 elif tool_name == "reconcile_worker":
-                    val = server.reconcile_worker(tool_args["backlogItemKey"], tool_args["confirmedStopped"], tool_args["reason"], tool_args.get("requeue", True))
+                    val = server.reconcile_worker(tool_args["backlogItemKey"], tool_args["confirmedStopped"], tool_args["reason"], tool_args.get("requeue", True), tool_args.get("neverSpawned", False))
                 elif tool_name == "list_company_tools":
                     val = server.list_company_tools()
                 elif tool_name == "call_company_tool":

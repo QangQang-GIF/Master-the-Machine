@@ -160,15 +160,16 @@ def test_finalize_full_evidence_submits_done(tmp_path):
     assert len(s.adapter.calls) == 1
 
 
-def test_finalize_missing_screenshot_is_not_submitted_fail_closed(tmp_path):
-    """V2 (P0): missing required evidence -> NOT_RUN/PARTIAL is honest, but the gate must refuse to submit."""
+def test_finalize_missing_screenshot_submits_honest_partial(tmp_path):
+    """Missing required evidence -> NOT_RUN + PARTIAL. An honest PARTIAL is submitted (Game Master scores it);
+    nothing is fabricated and a DONE claim is never kept."""
     s = build(tmp_path, [item("TASK-01")])
     entry = s.dispatch_ready()["spawn"][0]
     worker_writes(entry, evidence=("check.txt",), status="DONE")
-    with pytest.raises(SubmissionGateError):
-        s.finalize_item("TASK-01", confirmed_stopped=True)
-    assert s.adapter.calls == []
-    assert s.native.task_details("TASK-01")["phase"] != "SUBMITTED"
+    out = s.finalize_item("TASK-01", confirmed_stopped=True)
+    assert out["status"] == "SUBMITTED" and out["answerStatus"] == "PARTIAL"
+    assert submitted_answer(s)["status"] == "PARTIAL"
+    assert any(r.get("result") == "NOT_RUN" for r in submitted_answer(s).get("testResults", []))
     # No placeholder image was fabricated, and the integration lock was released.
     assert not (s.match_root / "answers/TASK-01/evidence/tc-02.png").exists()
     with s.native._db() as db:
@@ -179,10 +180,9 @@ def test_finalize_uncommitted_running_worker_is_snapshotted(tmp_path):
     s = build(tmp_path, [item("TASK-01")])
     entry = s.dispatch_ready()["spawn"][0]
     worker_writes(entry, evidence=("check.txt",), commit=False, result_file=False)
-    with pytest.raises(SubmissionGateError):
-        s.finalize_item("TASK-01", force_partial=True, confirmed_stopped=True)
-    assert s.adapter.calls == []
-    assert s.native.task_details("TASK-01")["phase"] != "SUBMITTED"
+    out = s.finalize_item("TASK-01", force_partial=True, confirmed_stopped=True)
+    assert out["status"] == "SUBMITTED" and out["answerStatus"] == "PARTIAL"
+    assert submitted_answer(s)["status"] == "PARTIAL"
     with s.native._db() as db:
         assert s.native._meta(db, "integration_owner") is None
 
@@ -268,7 +268,7 @@ def test_wait_auto_finalizes_item_near_deadline(tmp_path, monkeypatch):
     assert fin["status"] == "STOP_REQUIRED" and fin["stopWorker"] is True
     assert fin["control"]["instructionId"].startswith("stop:TASK-03")
     assert s.adapter.calls == []
-    # After Root confirms the stop, the forced-PARTIAL result is still refused by the fail-closed gate.
-    with pytest.raises(SubmissionGateError):
-        s.finalize_item("TASK-03", force_partial=True, confirmed_stopped=True)
-    assert s.adapter.calls == []
+    # After Root confirms the stop, the honest PARTIAL is submitted.
+    done = s.finalize_item("TASK-03", force_partial=True, confirmed_stopped=True)
+    assert done["status"] == "SUBMITTED" and done["answerStatus"] == "PARTIAL"
+    assert submitted_answer(s)["status"] == "PARTIAL"

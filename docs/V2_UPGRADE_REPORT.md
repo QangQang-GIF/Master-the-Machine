@@ -53,3 +53,8 @@ with `scripts/update_checksums.py` and verify clean.
 - Benchmark model recalibrated with real match G97MQB4T durations (CR-01 864s, BUG-01 1614s, PI-01 210s, CR-02 371s, CR-03 374s, TASK-03 151s, BUG-03 235s). Result is still a model: Heavy -24% at 30s/child overhead, -14% at 60s; gate NOT demonstrated.
 - Real-match observation: losses came from unfinished items (BUG-02, BUG-04, TASK-04 never submitted/started) and PARTIAL scores (CR-01 20/140, CR-03 35/100), more than from raw speed.
 - Still unbuilt/unverified: see V2_PRODUCTION_READINESS_CHECKLIST.md.
+
+## Update: lessons from practice match RLL3DYW5 (fixes)
+Findings: a stale workspace `AGENTS.md` limited Root to 1 normal worker (Root even exported MTM_NATIVE_MAX_WORKERS=2); the fail-closed gate refused honest PARTIAL (scored by Game Master); finalize depended on Root's turn (BUG-02 finalized after its deadline); never-spawned requeues inflated attempt numbers.
+Fixes: honest PARTIAL accepted (answer must itself declare PARTIAL; DONE stays strict); server-side deadline watchdog thread (stop request, then snapshot after MTM_STOP_GRACE_SECONDS, default 12s, source `deadline_grace`); `stop_worker` events; `neverSpawned` on reconcile_worker; AGENTS.md/orchestrator TOML/skill text corrected to 4 normal + 1 PI reserve and installer syncs workspace AGENTS.md preserving the Player block.
+Not verified: behaviour against a live Game Master and real Codex runtime (needs another practice match).
