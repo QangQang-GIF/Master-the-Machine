@@ -58,6 +58,14 @@ the Root gives you runs to the item's real deadline (see `taskEnvelope.evidence_
 5. If the checker itself hangs or times out, retry it once or twice (fresh `session-start`, own port) before giving up; record the real command output.
 6. At the cutoff, if tests still fail, stop and write an honest `PARTIAL` (failing tests `NOT_RUN`/`FAIL`). Never mark `DONE`, never fabricate evidence.
 
+## Fix attempt (`taskEnvelope.fix_request` present)
+
+This item was sent back to you on purpose: a previous attempt was not DONE, or the local submission gate rejected it.
+Your worktree already contains that attempt's commits (`fix_request.resumeFrom`), so do not start over.
+1. Read `fix_request.reason`, `fix_request.notRun` (tests still not passing) and `fix_request.gateError` (exact gate message).
+2. Fix exactly those gaps first: make the listed tests genuinely pass and produce the missing evidence files with the real commands.
+3. Then follow the DONE-first loop: re-run `check_done` until it passes, commit, and only then write `worker_result.json`.
+
 ## Stop / Handoff Instruction (V2 safe stop)
 
 If Root sends a control instruction with `state: HANDOFF` (or `CODE_FREEZE_REQUESTED`), stop nonessential work immediately:

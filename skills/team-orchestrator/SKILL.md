@@ -16,6 +16,7 @@ For PREPARE/RESUME, follow `game-preparation`/`team-recovery`. For `START_GAME`,
 3. **Wait:** block only in `wait_for_update(timeoutMs=55000)`. When it returns `UPDATED`, handle it in this order, then wait again:
    - `dispatch.spawn[]` present → spawn each worker now.
    - `worker_result_file` event → call `finalize_item(backlogItemKey)` immediately.
+   - `finalize_item` returned `SENT_BACK_FOR_DONE` → nothing was submitted on purpose: the answer was not DONE (or the local gate rejected it) and there is still time. Make sure that native worker is stopped, then call `dispatch_ready()` and spawn the new worker; it continues from the previous commit with `taskEnvelope.fix_request`. This is not a blocker; do not open one and do not submit the item yourself.
    - `autoFinalized[]` → the item was already submitted by code before its deadline/match end; if `stopWorker` is true, stop that native worker now.
    - `deadline_near` → no action needed; code finalizes at the cutoff.
    Continue until FINISHED, even when the queue is empty.
@@ -25,8 +26,8 @@ For PREPARE/RESUME, follow `game-preparation`/`team-recovery`. For `START_GAME`,
 ## Integration and submission
 
 - **`finalize_item(backlogItemKey)` is the only submission path for worker output.** It snapshots the worktree, makes `answers/<key>/submit.json` honest against the files on disk (missing evidence → that test `NOT_RUN`, item `PARTIAL`), cherry-picks into the assigned branch, pushes, and calls Submit under the integration lock. An unresolved in-flight journal entry is replayed byte-for-byte, never resubmitted with a new identity.
-- **Strict role boundary:** root never runs browsers, Playwright, dev servers or tests, never captures, regenerates or edits evidence, and never works in the main checkout on a worker's behalf. A worker result with missing evidence is submitted as PARTIAL by `finalize_item`; do not try to "fix" it.
-- If `finalize_item` reports a cherry-pick conflict or a guard rejection, keep the item visible: resolve the Git conflict minimally or re-dispatch the item to a worker; never fabricate files.
+- **Strict role boundary:** root never runs browsers, Playwright, dev servers or tests, never captures, regenerates or edits evidence, and never works in the main checkout on a worker's behalf. Fixing is a worker's job: `finalize_item` itself sends a non-DONE answer back to a worker while time remains (DONE-first) and submits an honest PARTIAL only at the deadline/match-end cutoff or when no fix attempt fits.
+- If `finalize_item` raises a cherry-pick conflict or a guard rejection (no time left for a fix attempt), keep the item visible and report the blocker with the exact message; never fabricate files.
 - Deterministic guards verify answer/payload parity, passing required results, nonempty contained evidence in the exact commit tree, permitted diff, full SHA, assigned branch, ordinary push, and remote ref parity. Never force-push or alter immutable/secret/agent files. Record a real server receipt; ACCEPTED is not graded PASSED. A solved item left unsubmitted is unfinished work.
 
 On PAUSED, halt new work/submission dispatches and honor Player controls; on FINISHED stop descendants and finalize logs. CLOSED items are terminal; record and advance without retry loops. Keep unresolved blockers visible while other eligible tasks continue.

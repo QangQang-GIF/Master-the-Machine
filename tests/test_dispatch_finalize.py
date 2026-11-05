@@ -160,9 +160,11 @@ def test_finalize_full_evidence_submits_done(tmp_path):
     assert len(s.adapter.calls) == 1
 
 
-def test_finalize_missing_screenshot_submits_honest_partial(tmp_path):
+def test_finalize_missing_screenshot_submits_honest_partial(tmp_path, monkeypatch):
     """Missing required evidence -> NOT_RUN + PARTIAL. An honest PARTIAL is submitted (Game Master scores it);
-    nothing is fabricated and a DONE claim is never kept."""
+    nothing is fabricated and a DONE claim is never kept. (DONE-first send-back is covered in
+    test_done_first_send_back.py; here it is off to test the PARTIAL pipeline itself.)"""
+    monkeypatch.setenv("MTM_DONE_FIRST", "0")
     s = build(tmp_path, [item("TASK-01")])
     entry = s.dispatch_ready()["spawn"][0]
     worker_writes(entry, evidence=("check.txt",), status="DONE")

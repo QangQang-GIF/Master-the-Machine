@@ -58,3 +58,25 @@ with `scripts/update_checksums.py` and verify clean.
 Findings: a stale workspace `AGENTS.md` limited Root to 1 normal worker (Root even exported MTM_NATIVE_MAX_WORKERS=2); the fail-closed gate refused honest PARTIAL (scored by Game Master); finalize depended on Root's turn (BUG-02 finalized after its deadline); never-spawned requeues inflated attempt numbers.
 Fixes: honest PARTIAL accepted (answer must itself declare PARTIAL; DONE stays strict); server-side deadline watchdog thread (stop request, then snapshot after MTM_STOP_GRACE_SECONDS, default 12s, source `deadline_grace`); `stop_worker` events; `neverSpawned` on reconcile_worker; AGENTS.md/orchestrator TOML/skill text corrected to 4 normal + 1 PI reserve and installer syncs workspace AGENTS.md preserving the Player block.
 Not verified: behaviour against a live Game Master and real Codex runtime (needs another practice match).
+
+## CWQNKAPC (2026-11-05) — submission fixes and DONE-first
+
+Result: 2/10 submitted (BUG-03 80/80, PI-01 0/160), 80 points. Every other item was blocked at submission.
+
+| Match blocker | Cause | Fix |
+|---|---|---|
+| BUG-01, BUG-02, CR-01 "missing required TC-01/TC-04" | `announced_test_ids` read prose cross-references ("same conditions as TC-01") as required tests | qualified ids anywhere; bare ids only when a line declares them; bare aliases dropped |
+| BUG-02 cherry-pick conflict on retry | integration re-picked already-applied commits | `git cherry` skips applied patches |
+| BUG-04 "missing required evidence file" | MVS evidence check ignored honest PARTIAL | missing file only leaves its test NOT_RUN; DONE stays strict |
+| STALE-INHERITED-WORKER-RESULT, CR-02 conflict markers | a worker committed `worker_result.json`; cherry-picked into the base, every later worktree inherited it | result counts only for its own `task_id`; control files removed from new worktrees, excluded from snapshots, dropped from the shared checkout |
+| workers stopped at ~7 min | fixed 420 s budget | budget = time to item deadline / match end minus 240 s |
+
+DONE-first: while a fix attempt still fits (`MTM_FIX_MIN_SECONDS`, default 300 s after the 240 s margin), a non-DONE
+answer or a local gate rejection is not submitted. `finalize_item` returns `SENT_BACK_FOR_DONE`, the item is requeued,
+and the next worker resumes from the previous attempt's commit with `taskEnvelope.fix_request`
+(`MTM_DONE_FIRST_RETRIES`, default 3). PI is still submitted at once (speed race). The deadline / match-end
+auto-finalize still submits an honest PARTIAL as the last resort. `MTM_DONE_FIRST=0` restores immediate PARTIAL.
+
+Replay (`scripts/replay_submission_gate.py`, real answers + Start Work data, placeholder evidence bytes):
+deployed code rejects BUG-01/BUG-04/CR-01 with the exact match errors; current code accepts them.
+Not yet measured in a real match.

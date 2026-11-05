@@ -264,6 +264,44 @@ class NativeTaskCoordinator:
             return False
         return isinstance(data, dict) and str(data.get("task_id", "")).strip().upper() == str(key).strip().upper()
 
+    # ------------------------------------------------------------------ DONE-first: send back for fix
+    FIX_MIN_SECONDS = 300        # a fix attempt needs at least this much working time after the margin
+
+    def fix_window_seconds(self, key: str) -> float | None:
+        """Working seconds still available for another attempt on *key* (item deadline or match end,
+        minus the finalize margin). None when the official clock is unknown."""
+        with self._db() as db:
+            row = self._task(db, self._key(key))
+            data = json.loads(row["data"])
+            _, now, remaining = self._clock(db)
+        if now is None or remaining is None:
+            return None
+        limit = float(remaining)
+        deadline = data.get("deadline_epoch")
+        if deadline is not None:
+            limit = min(limit, float(deadline) - float(now))
+        return limit - max(self.reserve, self.EVIDENCE_MATCH_MARGIN)
+
+    def fix_attempts(self, key: str) -> int:
+        with self._db() as db:
+            return int(json.loads(self._task(db, self._key(key))["data"]).get("fix_attempts", 0))
+
+    def send_back_for_fix(self, key: str, *, reason: str, resume_from: str | None,
+                          not_run: list[str] | None = None, gate_error: str | None = None) -> dict[str, Any]:
+        """Requeue an item whose answer is not DONE yet (or that the gate rejected) so a worker continues
+        from the previous attempt's commit and fixes exactly the listed gaps. Nothing is submitted."""
+        key = self._key(key)
+        out = self.reconcile_worker(key, confirmed_stopped=True, reason=reason, requeue=True)
+        with self._db() as db:
+            row = self._task(db, key)
+            data = json.loads(row["data"])
+            n = int(data.get("fix_attempts", 0)) + 1
+            data["fix_attempts"] = n
+            data["fix_request"] = {"fixAttempt": n, "reason": reason, "resumeFrom": resume_from,
+                                   "notRun": list(not_run or []), "gateError": gate_error}
+            db.execute("UPDATE tasks SET data=? WHERE key=?", (json.dumps(data), key))
+        return {**out, "fixAttempt": n}
+
     HEAVY_PREFIX = "[heavy task]"
 
     def _is_heavy(self, task: dict) -> bool:
@@ -858,6 +896,14 @@ class NativeTaskCoordinator:
                 self._git("worktree", "add", "--detach", "--no-checkout", str(target), base)
                 self._git("sparse-checkout", "set", "--cone", self.repository_folder, cwd=target)
                 self._git("checkout", "--detach", base, cwd=target)
+                resume = (eligible.get("fix_request") or {}).get("resumeFrom")
+                if resume:
+                    # Continue the previous attempt's work instead of starting from scratch.
+                    try:
+                        if self._git("cat-file", "-t", resume) == "commit":
+                            self._git("checkout", "--detach", resume, cwd=target)
+                    except Exception:
+                        pass
                 worker_match = target / self.repository_folder
                 if not worker_match.resolve().is_relative_to(target) or not worker_match.is_dir():
                     raise NativeCoordinationError("Assigned repository folder missing in worker worktree")
@@ -901,6 +947,7 @@ class NativeTaskCoordinator:
                         "mvs": self._mvs_list(details.get("minimumVerificationScenarios", details.get("mvs"))),
                         "submit_template": details.get("submitTemplate"), "allowed_paths": [str(worker_match)],
                         "worker_id": worker_id, "heavy": heavy, "lane": lane_slot,
+                        "fix_request": eligible.get("fix_request"),
                         "evidence_cutoff_epoch": self._evidence_cutoff(deadline, now, remaining, budget),
                         # Same cutoff on this machine's clock: pass to capture_multi.mjs --cutoff-epoch.
                         "evidence_cutoff_local_epoch": (round(time.time() + self._evidence_cutoff(deadline, now, remaining, budget) - now, 1)

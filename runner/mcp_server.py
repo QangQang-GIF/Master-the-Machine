@@ -1760,6 +1760,40 @@ class MCPHelperServer:
     _finalize_lock = threading.RLock()
     _watchdog_started = False
 
+    def _done_first_send_back(self, key: str, details: Dict[str, Any], *, answer_status: str, not_run: List[str],
+                              worker_head: Optional[str], force_partial: bool,
+                              gate_error: Optional[str] = None) -> Optional[Dict[str, Any]]:
+        """DONE-first: while there is real time left, an item that is not DONE (or that the local gate
+        rejected) goes back to a worker that continues from this attempt's commit and fixes exactly
+        the listed gaps. Only the deadline/match-end auto-finalize (force_partial) submits PARTIAL.
+
+        MTM_DONE_FIRST=0 disables; MTM_DONE_FIRST_RETRIES caps attempts (default 3);
+        MTM_FIX_MIN_SECONDS is the minimum working time a new attempt needs (default 300).
+        """
+        if force_partial or os.environ.get("MTM_DONE_FIRST", "1") == "0":
+            return None
+        native = self._native_coordinator()
+        item_type = str(details.get("data", {}).get("type") or key.split("-")[0]).upper()
+        if gate_error is None and (answer_status == "DONE" or item_type == "PI"):
+            return None  # DONE goes straight in; PI is a speed race and is submitted as soon as possible
+        try:
+            cap = int(os.environ.get("MTM_DONE_FIRST_RETRIES", "3"))
+            min_window = float(os.environ.get("MTM_FIX_MIN_SECONDS", str(native.FIX_MIN_SECONDS)))
+        except ValueError:
+            cap, min_window = 3, float(native.FIX_MIN_SECONDS)
+        window = native.fix_window_seconds(key)
+        if native.fix_attempts(key) >= cap or window is None or window < min_window:
+            return None
+        reason = (f"gate rejected: {gate_error}" if gate_error
+                  else f"answer is {answer_status}, not DONE; tests not passing: {', '.join(not_run) or 'see submit.json'}")
+        res = native.send_back_for_fix(key, reason=reason[:600], resume_from=worker_head, not_run=not_run,
+                                       gate_error=gate_error[:600] if gate_error else None)
+        return {"backlogItemKey": key, "status": "SENT_BACK_FOR_DONE", "fixAttempt": res.get("fixAttempt"),
+                "windowSeconds": round(window, 1), "reason": reason[:600], "stopWorker": True,
+                "instruction": ("Nothing was submitted. Make sure that worker is stopped, then call dispatch_ready: "
+                                "a new worker continues from this attempt's commit with taskEnvelope.fix_request "
+                                "and works until check_done passes. Do not submit this item yourself.")}
+
     WORKER_CONTROL_FILES = ("worker_result.json", ".mtm_stopped.json")
 
     def _drop_control_files(self, folder: str, key: str) -> None:
@@ -1851,6 +1885,7 @@ class MCPHelperServer:
         """
         native = self._native_coordinator()
         key = backlog_item_key
+        deadline_forced = force_partial  # only the deadline/match-end path may submit a non-DONE answer early
         details = native.task_details(key)
         phase = details["phase"]
         if phase == "SUBMITTED":
@@ -1932,6 +1967,11 @@ class MCPHelperServer:
         elif phase == "NEEDS_ATTENTION":
             raise ValueError(f"{key} worker failed without deliverables; reconcile_worker before retry")
 
+        sent_back = self._done_first_send_back(key, details, answer_status=str(answer.get("status", "")).upper(),
+                                               not_run=not_run, worker_head=worker_head, force_partial=deadline_forced)
+        if sent_back:
+            return sent_back
+
         self.refresh_match()
         native.begin_integration(key)
         try:
@@ -1955,10 +1995,17 @@ class MCPHelperServer:
         sha = self._git_run(self.checkout_root, "rev-parse", "HEAD").stdout.strip()
         try:
             receipt = self.submit_work(str(uuid.uuid4()), key, sha, answer)
-        except SubmissionGateError:
+        except SubmissionGateError as gate_err:
             # V2 (P0): fail-closed. A gate rejection must not leave the global integration lock held,
             # otherwise one unsubmittable item blocks every other item until timeout.
             native.end_integration(key, success=False)
+            # DONE-first: a local gate rejection is not the end of the item. Nothing reached Game Master,
+            # so a worker can fix the reported gap and the item is submitted later.
+            sent_back = self._done_first_send_back(key, details, answer_status=str(answer.get("status", "")).upper(),
+                                                   not_run=not_run, worker_head=worker_head,
+                                                   force_partial=deadline_forced, gate_error=str(gate_err))
+            if sent_back:
+                return sent_back
             raise
         return {"backlogItemKey": key, "status": "SUBMITTED", "answerStatus": answer.get("status"),
                 "notRun": not_run, "stopWorker": was_running, "receipt": receipt,
@@ -2151,7 +2198,7 @@ def get_tool_definitions() -> List[Dict[str, Any]]:
         ("plan_tasks", "Refresh server board and return eligible native tasks, reserved urgent capacity, and ready integrations.", {}, []),
         ("dispatch_ready", "Start Work + claim every task the planner selects (4 normal slots + 1 PI-only reserved slot) and return ready TaskEnvelopes. Root only spawns one native worker per spawn[] entry.",
          {"estimatedSeconds": {"type": "integer", "minimum": 10, "default": 420}}, []),
-        ("finalize_item", "Root-only: snapshot a worker's worktree, make submit.json honest (missing evidence -> NOT_RUN, PARTIAL), cherry-pick, push and submit in one call. Never fabricates evidence.",
+        ("finalize_item", "Root-only: snapshot a worker's worktree, make submit.json honest (missing evidence -> NOT_RUN, PARTIAL), cherry-pick, push and submit in one call. DONE-first: while time remains a non-DONE answer or a local gate rejection is not submitted; it returns SENT_BACK_FOR_DONE and the item is requeued for a worker to fix (then stop that worker and call dispatch_ready). Never fabricates evidence.",
          {"backlogItemKey": {"type": "string"}, "forcePartial": {"type": "boolean", "default": False},
           "confirmedStopped": {"type": "boolean", "default": False}}, ["backlogItemKey"]),
         ("claim_task", "Reserve an eligible task after Start Work; return isolated worktree and sanitized TaskEnvelope for native spawn.",
