@@ -322,13 +322,24 @@ def start_background_server(runtime: ProjectRuntime, server_argv: list[str], rea
     _kill_port_listeners(port)
     log_path = state_path.with_suffix(".log")
     log = open(log_path, "a", encoding="utf-8", errors="replace")
-    try:
-        proc = subprocess.Popen(
+    def _spawn(flags: int):
+        return subprocess.Popen(
             _resolve_server_cmd(server_argv), cwd=runtime.app_root, env=runtime.env.copy(), shell=False,
             stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT,
-            start_new_session=(os.name != "nt"),
-            creationflags=(getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0) if os.name == "nt" else 0),
+            start_new_session=(os.name != "nt"), creationflags=flags,
         )
+    try:
+        if os.name == "nt":
+            # Detach from the caller's console and job so the server outlives this command; fall back
+            # to a plain new process group if the job object forbids breakaway.
+            base = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0) | getattr(subprocess, "CREATE_NO_WINDOW", 0)
+            detach = base | getattr(subprocess, "DETACHED_PROCESS", 0) | 0x01000000  # CREATE_BREAKAWAY_FROM_JOB
+            try:
+                proc = _spawn(detach)
+            except OSError:
+                proc = _spawn(base)
+        else:
+            proc = _spawn(0)
     except OSError as exc:
         log.close()
         return {"status": "FAILED", "reason": runtime._redact(str(exc))}

@@ -1893,6 +1893,9 @@ def compact_root_output(server: "MCPHelperServer", tool_name: str, args: Dict[st
         meta = env.get("metadata") or {}
         summary = {k: env.get(k) for k in _ENVELOPE_SUMMARY_FIELDS if env.get(k) is not None}
         summary["full_envelope_path"] = str(path)
+        desc = str(env.get("descriptionMd") or env.get("description") or "")
+        if desc:  # a short excerpt so a worker that skips the file still knows the gist
+            summary["description_excerpt"] = desc[:1200] + ("... [truncated: read full_envelope_path]" if len(desc) > 1200 else "")
         summary["metadata"] = {k: meta.get(k) for k in ("match_root", "project_runtime_path", "match_id", "worker_id",
                                                          "worker_result_path") if meta.get(k) is not None}
         if meta.get("company_tools"):
