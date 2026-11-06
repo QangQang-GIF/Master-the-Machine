@@ -7,6 +7,8 @@ description: Unified autonomous engineering worker for MTM BUG, CR, TASK, and PI
 
 Follow `mtm-init` boundaries, TaskEnvelope constraints, and returned submit template. The root coordinator owns Start Work, integration, push, and Submit.
 
+**First step:** the Root hands you a compact TaskEnvelope. If it has `full_envelope_path`, read that JSON file before anything else: it holds the full description, `metadata.start_details` (submit template, MVS, delivered files; the files are also already written into your worktree under `challenge/`), and `metadata.company_context` (official KB / logs). Everything below that mentions TaskEnvelope fields refers to that full file.
+
 ## Core Sandbox & Anti-Over-Engineering Rules
 
 1. **Mandatory ProjectRuntime Sandbox Execution (`run` & `session`)**:
@@ -20,6 +22,13 @@ Follow `mtm-init` boundaries, TaskEnvelope constraints, and returned submit temp
      python3 "<metadata.project_runtime_path>" --match-root "<match_root>" --match-id "<metadata.match_id>" --worker-id "<worker_id>" session -- <command>
      ```
      Inside your capture script, always read `const baseUrl = \`http://127.0.0.1:\${process.env.PORT || 3000}\`;`.
+   - **Several captures or checks against the app (BUG-01, BUG-02, CR-01, CR-03 …): keep one server for the whole item** instead of one `session` per capture:
+     ```bash
+     python3 "<metadata.project_runtime_path>" --match-root "<match_root>" --match-id "<metadata.match_id>" --worker-id "<worker_id>" serve-start            # dev server, reused if already up
+     python3 "<metadata.project_runtime_path>" ... run -- node capture-all.mjs          # every screenshot / HTTP check in one script, against $PORT
+     python3 "<metadata.project_runtime_path>" ... serve-stop                           # ALWAYS before writing worker_result.json
+     ```
+     `serve-start --server-script start` runs the production server after `pnpm build` (BUG-01 production check). If `serve-start` does not print `"status": "READY"`, or a capture gets "connection refused", fall back to `session`. A `session` call stops the persistent server on the same port, so do not mix them mid-capture.
 
 2. **Pre-Fetched Official Fixtures & MVS Tests (Zero Fixture Missing)**:
    - Root automatically pre-fetches official QA fixtures (`answers/<key>/evidence/<key.lower()>-test-data.json` + `.source.json`) and company KB/Logs (`metadata.company_context`) during `start_work` / `claim_task`.

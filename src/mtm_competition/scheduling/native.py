@@ -493,7 +493,24 @@ class NativeTaskCoordinator:
             slack = eligible.get("slackSeconds")
             if slack is None:
                 slack = min(remaining, float(deadline) - now if deadline is not None else remaining) if (now is not None and remaining is not None) else (remaining or 2400)
-            budget = min(max(10, int(estimated_seconds)), max(10, int(slack - self.reserve)))
+            # Worker budget = the real hand-off point, not the Root's guess (594OYFBS: estimates of 300 s cut
+            # BUG-01 and CR-01 mid-way and forced restarts). Deadline items stop MTM_DEADLINE_HANDOFF_SECONDS
+            # before their deadline; every item stops MTM_MATCH_HANDOFF_SECONDS before the match ends, leaving
+            # time to commit, integrate and submit (PARTIAL if unfinished). MTM_WORKER_BUDGET_MODE=estimate
+            # restores min(estimate, slack - reserve).
+            if os.environ.get("MTM_WORKER_BUDGET_MODE", "handoff") == "estimate":
+                budget = min(max(10, int(estimated_seconds)), max(10, int(slack - self.reserve)))
+            else:
+                match_handoff = max(self.reserve, int(os.environ.get("MTM_MATCH_HANDOFF_SECONDS", "240")))
+                deadline_handoff = max(self.reserve, int(os.environ.get("MTM_DEADLINE_HANDOFF_SECONDS", "150")))
+                limits = []
+                if remaining is not None:
+                    limits.append(float(remaining) - match_handoff)
+                if deadline is not None and now is not None:
+                    limits.append(float(deadline) - float(now) - deadline_handoff)
+                if not limits:
+                    limits.append(float(slack) - match_handoff)
+                budget = max(10, int(min(limits)))
             worker_model = os.environ.get("MTM_WORKER_MODEL", "gpt-6.1-sol" if os.environ.get("MTM_ENV") == "production" else "gpt-6-luna")
             worker_effort = os.environ.get("MTM_WORKER_EFFORT", "medium" if os.environ.get("MTM_ENV") == "production" else "low")
             heavy = self.is_heavy(eligible)

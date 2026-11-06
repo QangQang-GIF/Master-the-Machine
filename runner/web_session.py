@@ -195,13 +195,7 @@ def run_web_session(runtime: ProjectRuntime, server_argv: list[str],
         if not readiness_error:
             # Pre-warm common Next.js routes so Playwright / checkers don't hit cold on-demand compilation timeouts
             if port:
-                for prewarm_route in ["/dashboard", "/accounting", "/boards", "/login"]:
-                    try:
-                        prewarm_url = f"http://127.0.0.1:{port}{prewarm_route}"
-                        with urlopen(prewarm_url, timeout=10) as _:
-                            pass
-                    except Exception:
-                        pass
+                prewarm_routes(port)
 
             remaining = timeout - (time.monotonic() - started)
             if remaining <= 0:
@@ -232,3 +226,153 @@ def run_web_session(runtime: ProjectRuntime, server_argv: list[str],
         runtime._redact(server_out + check_out),
         runtime._redact(server_err + check_err), timed_out,
     )
+
+
+def prewarm_routes(port: int, routes: list[str] | None = None, timeout: float = 10.0) -> None:
+    """Compile common Next.js routes in parallel (was sequential: up to 4 x 10 s per session)."""
+    if routes is None:
+        raw = os.environ.get("MTM_PREWARM_ROUTES", "/dashboard,/accounting,/boards,/login")
+        routes = [r.strip() for r in raw.split(",") if r.strip().startswith("/")]
+
+    def hit(route: str) -> None:
+        try:
+            with urlopen(f"http://127.0.0.1:{port}{route}", timeout=timeout) as _:
+                pass
+        except Exception:
+            pass
+
+    threads = [threading.Thread(target=hit, args=(r,), daemon=True) for r in routes]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout + 1)
+
+
+def _resolve_server_cmd(server_argv: list[str]) -> list[str]:
+    server_cmd = list(map(str, server_argv))
+    if os.name == "nt" and server_cmd:
+        base_name = server_cmd[0]
+        resolved = None
+        for ext in (".cmd", ".exe", ".bat"):
+            cand = shutil.which(base_name + ext if not base_name.lower().endswith(ext) else base_name)
+            if cand and Path(cand).suffix.lower() in {".cmd", ".exe", ".bat"}:
+                resolved = cand
+                break
+        if not resolved:
+            resolved = shutil.which(base_name)
+        if resolved:
+            if Path(resolved).suffix.lower() in {".cmd", ".bat"}:
+                server_cmd = ["cmd.exe", "/c", resolved] + server_cmd[1:]
+            elif Path(resolved).suffix.lower() == ".exe":
+                server_cmd[0] = resolved
+    return server_cmd
+
+
+# ---- Persistent per-worker server ----------------------------------------------------------
+# `session` starts and kills a fresh `next dev` for every capture/check, so every evidence step
+# pays the cold start and route compilation again. A worker can instead start one server for the
+# whole item (`serve-start`), run all captures against $PORT with `run`, and stop it at the end
+# (`serve-stop`). State lives in the system temp directory, never in the worktree.
+
+def _server_state_path(runtime: ProjectRuntime) -> Path:
+    import tempfile
+    d = Path(tempfile.gettempdir()) / "mtm-servers"
+    d.mkdir(parents=True, exist_ok=True)
+    return d / f"{runtime.match_id}_{runtime.worker_id}.json"
+
+
+def _pid_alive(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    if os.name == "nt":
+        try:
+            out = subprocess.run(["tasklist", "/FI", f"PID eq {pid}", "/NH"], capture_output=True, text=True, timeout=5)
+            return str(pid) in out.stdout
+        except Exception:
+            return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+
+
+def _responds(url: str, timeout: float = 1.0) -> bool:
+    try:
+        with urlopen(url, timeout=timeout) as response:
+            return 200 <= response.status < 500
+    except Exception:
+        return False
+
+
+def start_background_server(runtime: ProjectRuntime, server_argv: list[str], readiness_url: str | None = None,
+                            readiness_timeout: float = 90) -> dict:
+    import json
+    url = _validate_readiness_url(runtime, readiness_url)
+    state_path = _server_state_path(runtime)
+    port = int(runtime.env["PORT"])
+    if state_path.is_file():
+        try:
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+            if _pid_alive(int(state.get("pid", 0))) and _responds(url):
+                return {"status": "READY", "reused": True, "port": port, "pid": state["pid"], "url": url}
+        except Exception:
+            pass
+        stop_background_server(runtime)
+    _kill_port_listeners(port)
+    log_path = state_path.with_suffix(".log")
+    log = open(log_path, "a", encoding="utf-8", errors="replace")
+    try:
+        proc = subprocess.Popen(
+            _resolve_server_cmd(server_argv), cwd=runtime.app_root, env=runtime.env.copy(), shell=False,
+            stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT,
+            start_new_session=(os.name != "nt"),
+            creationflags=(getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0) if os.name == "nt" else 0),
+        )
+    except OSError as exc:
+        log.close()
+        return {"status": "FAILED", "reason": runtime._redact(str(exc))}
+    state_path.write_text(json.dumps({"pid": proc.pid, "port": port, "url": url, "startedAt": time.time()}), encoding="utf-8")
+    deadline = time.monotonic() + readiness_timeout
+    while time.monotonic() < deadline:
+        if proc.poll() is not None:
+            log.close()
+            state_path.unlink(missing_ok=True)
+            return {"status": "FAILED", "reason": f"server exited before readiness (exit {proc.returncode})", "log": str(log_path)}
+        if _responds(url, 0.5):
+            prewarm_routes(port)
+            log.close()
+            return {"status": "READY", "reused": False, "port": port, "pid": proc.pid, "url": url, "log": str(log_path)}
+        time.sleep(0.25)
+    log.close()
+    stop_background_server(runtime)
+    return {"status": "FAILED", "reason": f"server readiness timed out after {readiness_timeout:g}s", "log": str(log_path)}
+
+
+def stop_background_server(runtime: ProjectRuntime) -> dict:
+    import json
+    state_path = _server_state_path(runtime)
+    port = int(runtime.env.get("PORT", 0) or 0)
+    pid = None
+    if state_path.is_file():
+        try:
+            pid = int(json.loads(state_path.read_text(encoding="utf-8")).get("pid", 0))
+        except Exception:
+            pid = None
+    if pid:
+        if os.name == "nt":
+            try:
+                subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"], capture_output=True, timeout=10)
+            except Exception:
+                pass
+        else:
+            for sig in (signal.SIGTERM, signal.SIGKILL):
+                try:
+                    os.killpg(pid, sig)
+                except (ProcessLookupError, PermissionError, OSError):
+                    break
+                time.sleep(0.5)
+    if port:
+        _kill_port_listeners(port)
+    state_path.unlink(missing_ok=True)
+    return {"status": "STOPPED", "pid": pid, "port": port}

@@ -3,6 +3,7 @@ description = "Worker profile for Heavy backlog items: stronger reasoning, incre
 model = "gpt-6.1-sol"
 model_reasoning_effort = "high"
 developer_instructions = """
+First read the JSON file at taskEnvelope.full_envelope_path when it is present: it is your full TaskEnvelope.
 You own exactly one Heavy backlog item. Follow .agents/skills/mtm-worker/SKILL.md, including the "Heavy items" section,
 and the TaskEnvelope you received. Do not launch secondary CLI processes. Work only inside the assigned workspace.
 

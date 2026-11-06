@@ -527,6 +527,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     session_parser.add_argument("--url")
     session_parser.add_argument("--timeout", type=float, default=300)
     session_parser.add_argument("command", nargs=argparse.REMAINDER)
+    serve_parser = sub.add_parser("serve-start", help="Start (or reuse) one local server for this worker and leave it running")
+    serve_parser.add_argument("--server-script", default="dev")
+    serve_parser.add_argument("--url")
+    serve_parser.add_argument("--timeout", type=float, default=90)
+    sub.add_parser("serve-stop", help="Stop this worker's persistent server")
     args = parser.parse_args(argv)
     runtime = ProjectRuntime(args.match_root, args.match_id, args.worker_id)
     if runtime.worker_db_isolation_enabled():
@@ -541,18 +546,33 @@ def main(argv: Sequence[str] | None = None) -> int:
             if result.stderr: print(result.stderr, file=sys.stderr, end="" if result.stderr.endswith("\n") else "\n")
             if not result.ok: return result.returncode or 1
         return 0
-    command = list(args.command)
-    if command[:1] == ["--"]: command = command[1:]
-    if args.action == "session":
+    def server_command(script: str) -> list[str]:
         scripts = runtime._manifest().get("scripts", {})
-        if args.server_script not in scripts:
+        if script not in scripts:
             raise ValueError("Server script must be declared by the current project")
-        server = runtime._package_cmd("run", args.server_script)
+        server = runtime._package_cmd("run", script)
         manifest = runtime._manifest()
         if "next" in {**manifest.get("dependencies", {}), **manifest.get("devDependencies", {})}:
             if runtime._package_manager() == "npm":
                 server.append("--")
             server.extend(["--hostname", "127.0.0.1", "--port", runtime.env["PORT"]])
+        return server
+
+    if args.action in ("serve-start", "serve-stop"):
+        import json as _json
+        sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+        from runner.web_session import start_background_server, stop_background_server
+        if args.action == "serve-stop":
+            print(_json.dumps(stop_background_server(runtime)))
+            return 0
+        res = start_background_server(runtime, server_command(args.server_script), readiness_url=args.url,
+                                      readiness_timeout=args.timeout)
+        print(_json.dumps(res))
+        return 0 if res.get("status") == "READY" else 1
+    command = list(args.command)
+    if command[:1] == ["--"]: command = command[1:]
+    if args.action == "session":
+        server = server_command(args.server_script)
         sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
         from runner.web_session import run_web_session
         result = run_web_session(runtime, server, command, readiness_url=args.url, timeout=args.timeout)
