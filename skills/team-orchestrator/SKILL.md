@@ -23,6 +23,14 @@ For PREPARE/RESUME, follow `game-preparation`/`team-recovery`. For `START_GAME`,
    - **Pipelined Dispatch (Mandatory)**: BEFORE integrating or submitting the completed item, immediately call `plan_tasks()`. If slots are available, immediately call `start_work` + `claim_task` and spawn the next worker. Always keep all worker slots 100% occupied. Workers must never wait for submissions to take on new tasks.
    - For `overdueWorkers`, checkpoint/interrupt with native tools, confirm the worker stopped, then call `reconcile_worker` before retry/reassignment. Failed attempts report real diagnostics; retry only within budget. Never release a live worker's capacity or discard artifacts.
 
+## Heavy items
+
+- `claim_task` marks a Heavy item with `taskEnvelope.heavy=true`, `model="gpt-6.1-sol"`, `reasoning_effort="high"` and `agent_profile="team_heavy_worker"`; its budget is the whole remaining window minus a 300 s hand-off margin. Heavy items are dispatched before other timeless items.
+- Spawn a Heavy worker with the `team_heavy_worker` agent profile, and pass the envelope's model and reasoning effort to the native spawn when the spawn tool accepts them. If that profile cannot be spawned, spawn the usual worker profile with the same envelope instead of waiting.
+- One worker owns one Heavy item. Do not split it across workers.
+- A Heavy item does not have to reach DONE. When its worker is listed in `overdueWorkers`, stop it, record its result and integrate and submit the committed work as an honest PARTIAL in the same loop. Never let a Heavy item end the match unsubmitted.
+- Keep calling `wait_for_update`/`plan_tasks` until the match is FINISHED. Never end your turn while the match is running.
+
 ## Integration and submission
 
 **STRICT ROLE BOUNDARY & IMMEDIATE SUBMISSION (Root Orchestrator)**:

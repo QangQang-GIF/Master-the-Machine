@@ -11,7 +11,7 @@ Follow `mtm-init` boundaries, TaskEnvelope constraints, and returned submit temp
 
 1. **Mandatory ProjectRuntime Sandbox Execution (`run` & `session`)**:
    - Your worktree `src/node_modules` is already pre-linked by `claim_task`. **NEVER run `pnpm install`, `pnpm build`, `pnpm dev`, or `pnpm start` manually!**
-   - Run ALL test, typecheck, seed, and check-runner commands inside the isolated `ProjectRuntime` sandbox (which injects in-memory secrets, `DATABASE_URL`, and worker-isolated `TEST_DATABASE_URL`):
+   - Run ALL test, typecheck, seed, and check-runner commands inside the isolated `ProjectRuntime` sandbox (which injects in-memory secrets, a worker-private `DATABASE_URL` copy of the seeded database, and worker-isolated `TEST_DATABASE_URL`; seeds you load are visible only to your own server and screenshots):
      ```bash
      python3 "<metadata.project_runtime_path>" --match-root "<match_root>" --match-id "<metadata.match_id>" --worker-id "<worker_id>" run -- <command>
      ```
@@ -41,3 +41,10 @@ Follow `mtm-init` boundaries, TaskEnvelope constraints, and returned submit temp
 4. **Deadline Protection & Output Contract**:
    - If a UI scenario fails or deadline is within 2 minutes, mark only the uncaptured scenario `NOT_RUN` in `submit.json` (`status: "PARTIAL"`), NEVER fabricate fake/placeholder PNGs, and commit immediately.
    - Always `git add` and `git commit` all modified source files, `src/tests/<key.lower()>-mvs.test.ts`, `answers/<key>/submit.json`, and `answers/<key>/evidence/*` inside your worktree before writing `worker_result.json`.
+
+5. **Heavy items (`taskEnvelope.heavy == true`)**:
+   - You run with stronger reasoning and a budget that covers the whole remaining window minus a hand-off margin.
+   - Plan the acceptance criteria / test cases first, then deliver them in priority order. After each part that genuinely passes, commit it and update `answers/<key>/submit.json` (real PASS/FAIL/NOT_RUN rows, `status: "PARTIAL"` until everything passes).
+   - Do not wait for the whole item to be finished before committing: an honest PARTIAL still scores every finished test case, while an uncommitted half-done item scores nothing.
+   - When the budget ends or Root asks you to stop, stop coding, make sure the last committed `submit.json` matches what is really verified, and write `worker_result.json`.
+

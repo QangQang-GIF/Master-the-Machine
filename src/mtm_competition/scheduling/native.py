@@ -90,7 +90,7 @@ class NativeTaskCoordinator:
 
     @staticmethod
     def _key(key: str) -> str:
-        if not isinstance(key, str) or not re.fullmatch(r"(?:TASK|CR|BUG|PI)-[A-Za-z0-9_-]+", key):
+        if not isinstance(key, str) or not re.fullmatch(r"[A-Za-z][A-Za-z0-9]{0,15}-[A-Za-z0-9_-]{1,64}", key):
             raise NativeCoordinationError("Invalid announced backlog key")
         return key
 
@@ -156,6 +156,43 @@ class NativeTaskCoordinator:
         deadline = task.get("deadline_epoch")
         # Any task with a deadline, deadlineMinutes, or PI is urgent so it is never starved or blocked
         return task.get("type") == "PI" or deadline is not None or task.get("deadlineMinutes") is not None
+
+    # ---- Heavy items ----------------------------------------------------------------------
+    # The organizers announced Heavy tasks without publishing their exact metadata shape, so the
+    # check is deliberately broad: an explicit type/flag/tag, a [Heavy] title marker, or a point
+    # value above anything a normal item has carried (>= MTM_HEAVY_MIN_POINTS, default 200).
+    @staticmethod
+    def is_heavy(task: dict) -> bool:
+        def says_heavy(value) -> bool:
+            if isinstance(value, str):
+                return "heavy" in value.lower()
+            if isinstance(value, (list, tuple, set)):
+                return any(says_heavy(v) for v in value)
+            return False
+        for field in ("type", "backlogType", "task_type", "category", "kind", "size", "difficulty",
+                      "complexity", "workload", "class", "tier", "level"):
+            if says_heavy(task.get(field)):
+                return True
+        for flag in ("heavy", "isHeavy", "is_heavy", "heavyTask"):
+            if task.get(flag) is True:
+                return True
+        for field in ("tags", "labels", "flags", "badges"):
+            if says_heavy(task.get(field)):
+                return True
+        key = str(task.get("key", task.get("backlogId", ""))).upper()
+        if key.startswith(("HEAVY", "HVY", "HT-")):
+            return True
+        title = str(task.get("title", task.get("backlogTitle", ""))).lower()
+        if "[heavy]" in title or title.startswith("heavy") or "heavy task" in title:
+            return True
+        head = str(task.get("descriptionMd", task.get("description", "")))[:600].lower()
+        if "heavy task" in head:
+            return True
+        try:
+            min_points = float(os.environ.get("MTM_HEAVY_MIN_POINTS", "200"))
+            return min_points > 0 and float(task.get("points", 0) or 0) >= min_points
+        except (TypeError, ValueError):
+            return False
 
     def _calculate_task_difficulty(self, task: dict) -> float:
         """Calculate estimated task difficulty based on task type, UI keywords, and MVS scenarios."""
@@ -351,6 +388,10 @@ class NativeTaskCoordinator:
             elif has_deadline:
                 prio_tier = 2
                 prio_sub = slack if slack is not None else 9999
+            elif self.is_heavy(task):
+                # Longest work first: a Heavy item starts before the other timeless items.
+                prio_tier = 3
+                prio_sub = float("-inf")
             else:
                 prio_tier = 3
                 diff = self._calculate_task_difficulty(task)
@@ -449,12 +490,26 @@ class NativeTaskCoordinator:
             budget = min(max(10, int(estimated_seconds)), max(10, int(slack - self.reserve)))
             worker_model = os.environ.get("MTM_WORKER_MODEL", "gpt-6.1-sol" if os.environ.get("MTM_ENV") == "production" else "gpt-6-luna")
             worker_effort = os.environ.get("MTM_WORKER_EFFORT", "medium" if os.environ.get("MTM_ENV") == "production" else "low")
+            heavy = self.is_heavy(eligible)
+            if heavy:
+                # Heavy: stronger reasoning, and the whole remaining window minus a hand-off margin
+                # (stop, commit, integrate, submit an honest PARTIAL) instead of a fixed estimate.
+                worker_model = os.environ.get("MTM_HEAVY_MODEL", "gpt-6.1-sol")
+                worker_effort = os.environ.get("MTM_HEAVY_EFFORT", "high")
+                handoff = max(self.reserve, int(os.environ.get("MTM_HEAVY_HANDOFF_SECONDS", "300")))
+                budget = max(10, int(slack - handoff))
+            skill_type = task_type.lower() if task_type in ("BUG", "CR", "PI", "TASK") else "cr"
             envelope = {"task_id": key, "task_type": task_type, "title": eligible.get("title", key),
                         "description": specification or eligible.get("description") or eligible.get("descriptionMd", ""), "repository_path": str(target),
                         "match_root": str(worker_match), "base_revision": base, "points": int(eligible.get("points", 0)),
                         "deadline_epoch": eligible.get("deadline_epoch"),
-                        "selected_skills": ["mtm-init", f"mtm-{task_type.lower()}-worker", "mtm-verification", "mtm-evidence"],
+                        "selected_skills": ["mtm-init", f"mtm-{skill_type}-worker", "mtm-verification", "mtm-evidence"],
                         "time_budget_seconds": budget, "model": worker_model, "reasoning_effort": worker_effort, "backend": "codex",
+                        "heavy": heavy, "agent_profile": "team_heavy_worker" if heavy else "team_feature_worker",
+                        "heavy_policy": ("Heavy item: work in priority order of the acceptance criteria / test cases, "
+                                         "commit after each part that passes, keep answers/<key>/submit.json current "
+                                         "with real PASS/FAIL/NOT_RUN rows. When the budget ends, stop and hand off an "
+                                         "honest PARTIAL: every finished test case still scores.") if heavy else None,
                         "evidence_required": details.get("evidence_required", eligible.get("evidence_required", [])),
                         "mvs": self._mvs_list(details.get("minimumVerificationScenarios", details.get("mvs"))),
                         "submit_template": details.get("submitTemplate"), "allowed_paths": [str(worker_match)],
