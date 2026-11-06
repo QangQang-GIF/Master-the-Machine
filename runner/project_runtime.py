@@ -426,6 +426,42 @@ class ProjectRuntime:
             self.env["DATABASE_URL"] = shared_url
             return f"shared:error:{type(exc).__name__}"
 
+    # ---- prisma generate in workers ------------------------------------------------------
+    # Worker worktrees link src/node_modules to the root checkout, so the generated Prisma client
+    # is shared and the root already generated it during preparation. Regenerating from a worker
+    # rewrites the shared engine DLL while other workers' servers hold it open (EPERM on Windows)
+    # and costs time. Workers therefore skip it unless they changed the Prisma schema.
+
+    @staticmethod
+    def is_prisma_generate(argv: Sequence[str]) -> bool:
+        words = [str(a).lower() for a in argv]
+        return "prisma" in words and words.index("prisma") + 1 < len(words) and words[words.index("prisma") + 1] == "generate"
+
+    def worker_schema_changed(self) -> bool:
+        try:
+            res = subprocess.run(["git", "-C", str(self.app_root), "status", "--porcelain", "--", "prisma"],
+                                 capture_output=True, text=True, timeout=10, check=False)
+            if res.returncode != 0:
+                return True  # cannot tell: be safe and generate
+            if res.stdout.strip():
+                return True
+            # Committed schema changes: compare with the commit this worktree started from
+            # (the oldest entry of the worktree's HEAD reflog).
+            log = subprocess.run(["git", "-C", str(self.app_root), "reflog", "--format=%H", "HEAD"],
+                                 capture_output=True, text=True, timeout=10, check=False)
+            entries = log.stdout.split() if log.returncode == 0 else []
+            if not entries:
+                return False
+            diff = subprocess.run(["git", "-C", str(self.app_root), "diff", "--name-only", entries[-1], "HEAD", "--", "prisma"],
+                                  capture_output=True, text=True, timeout=10, check=False)
+            return diff.returncode != 0 or bool(diff.stdout.strip())
+        except (OSError, subprocess.TimeoutExpired):
+            return True
+
+    def skip_worker_prisma_generate(self) -> bool:
+        return (self.worker_id != "main" and os.environ.get("MTM_WORKER_PRISMA_GENERATE", "0") != "1"
+                and not self.worker_schema_changed())
+
     def prepare(self) -> list[CommandResult]:
         """Install dependencies; only the root worker provisions/migrates/seeds and builds."""
         results: list[CommandResult] = []
@@ -440,7 +476,10 @@ class ProjectRuntime:
             if not results[-1].ok: return results
             if any((self.app_root / p).exists() for p in ("prisma/schema.prisma", "prisma/schema")):
                 if self.worker_id != "main":
-                    results.append(self.run(self._package_cmd("exec", "prisma", "generate"), timeout=180))
+                    if self.skip_worker_prisma_generate():
+                        print("[mtm] prisma generate skipped: the root already generated the shared client and the schema is unchanged", file=sys.stderr)
+                    else:
+                        results.append(self.run(self._package_cmd("exec", "prisma", "generate"), timeout=180))
                     return results
                 results.extend(self._ensure_scoped_databases())
                 for script in ("db:generate",):
@@ -517,6 +556,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
         from runner.web_session import run_web_session
         result = run_web_session(runtime, server, command, readiness_url=args.url, timeout=args.timeout)
+    elif runtime.is_prisma_generate(command) and runtime.skip_worker_prisma_generate():
+        print("[mtm] prisma generate skipped: the root already generated the shared client and the schema is unchanged; "
+              "run it only after changing prisma/ (set MTM_WORKER_PRISMA_GENERATE=1 to force)")
+        return 0
     else:
         result = runtime.run(command, args.cwd, args.timeout)
     print(result.stdout, end="")

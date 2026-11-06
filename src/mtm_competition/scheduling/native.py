@@ -41,6 +41,12 @@ class NativeTaskCoordinator:
         self.repository_folder = folder.as_posix()
         self.match_id = match_id
         self.max_workers, self.normal_workers = max_workers, normal_workers
+        # Strong lane (MTM_STRONG_SLOT=1): the slots above normal_workers are no longer reserved for
+        # urgent items; they run a stronger model. Heavy items take a free strong slot first; a normal
+        # item only uses it when every normal slot is busy. PI and deadline items keep priority in the
+        # queue but no longer have a slot kept empty for them.
+        self.strong_slot = os.environ.get("MTM_STRONG_SLOT", "0") == "1"
+        self.strong_slots = max(0, max_workers - normal_workers) if self.strong_slot else 0
         self.reserve = max(10, int(integration_reserve_seconds))
         self.clock_max_age = max(10, int(clock_max_age_seconds))
         self.workers_root = self.checkout_root.parent / ".workers" / match_id
@@ -402,7 +408,7 @@ class NativeTaskCoordinator:
         for _, task, urgent, slack in candidates:
             if len(response["selected"]) >= response["availableSlots"]:
                 break
-            if not urgent and normals >= self.normal_workers:
+            if not urgent and normals >= (self.max_workers if self.strong_slot else self.normal_workers):
                 continue
             if self._overlap(busy_paths, task.get("claimed_paths", [])):
                 continue
@@ -447,7 +453,7 @@ class NativeTaskCoordinator:
                     and plan["availableSlots"] > 0
                     and row["phase"] == "QUEUED"
                     and row["started"]
-                    and (urgent or normals < self.normal_workers)
+                    and (urgent or normals < (self.max_workers if self.strong_slot else self.normal_workers))
                 ):
                     eligible = task_data
                 else:
@@ -491,6 +497,16 @@ class NativeTaskCoordinator:
             worker_model = os.environ.get("MTM_WORKER_MODEL", "gpt-6.1-sol" if os.environ.get("MTM_ENV") == "production" else "gpt-6-luna")
             worker_effort = os.environ.get("MTM_WORKER_EFFORT", "medium" if os.environ.get("MTM_ENV") == "production" else "low")
             heavy = self.is_heavy(eligible)
+            lane = "normal"
+            if self.strong_slot:
+                running = [json.loads(r["data"]) for r in db.execute("SELECT data FROM tasks WHERE phase='RUNNING'").fetchall()]
+                strong_busy = sum(1 for t in running if t.get("lane") == "strong")
+                normal_busy = len(running) - strong_busy
+                if strong_busy < self.strong_slots and (heavy or normal_busy >= self.normal_workers):
+                    lane = "strong"
+            if lane == "strong":
+                worker_model = os.environ.get("MTM_STRONG_MODEL", "gpt-6.1-sol")
+                worker_effort = os.environ.get("MTM_STRONG_EFFORT", "high")
             if heavy:
                 # Heavy: stronger reasoning, and the whole remaining window minus a hand-off margin
                 # (stop, commit, integrate, submit an honest PARTIAL) instead of a fixed estimate.
@@ -505,7 +521,8 @@ class NativeTaskCoordinator:
                         "deadline_epoch": eligible.get("deadline_epoch"),
                         "selected_skills": ["mtm-init", f"mtm-{skill_type}-worker", "mtm-verification", "mtm-evidence"],
                         "time_budget_seconds": budget, "model": worker_model, "reasoning_effort": worker_effort, "backend": "codex",
-                        "heavy": heavy, "agent_profile": "team_heavy_worker" if heavy else "team_feature_worker",
+                        "heavy": heavy, "lane": lane,
+                        "agent_profile": "team_heavy_worker" if heavy else ("team_strong_worker" if lane == "strong" else "team_feature_worker"),
                         "heavy_policy": ("Heavy item: work in priority order of the acceptance criteria / test cases, "
                                          "commit after each part that passes, keep answers/<key>/submit.json current "
                                          "with real PASS/FAIL/NOT_RUN rows. When the budget ends, stop and hand off an "
@@ -521,6 +538,7 @@ class NativeTaskCoordinator:
                                      "worker_result_path": str(worker_match / "worker_result.json")}}
             stored = json.loads(row["data"])
             _, server_now, server_remaining = self._clock(db)
+            stored["lane"] = lane
             stored["lease"] = {"start_server_epoch": server_now, "start_remaining_seconds": server_remaining,
                                "budget_seconds": budget}
             db.execute("UPDATE tasks SET phase='RUNNING',worker_id=?,worktree=?,data=? WHERE key=?",

@@ -61,3 +61,39 @@ def test_normal_envelope_is_unchanged(coordinator, monkeypatch):
     assert env["heavy"] is False and env["agent_profile"] == "team_feature_worker"
     assert env["reasoning_effort"] == "medium" and env["time_budget_seconds"] == 420
     assert "mtm-bug-worker" in env["selected_skills"]
+
+
+def _five(c):
+    return N(c.db_path.parent, c.checkout_root, c.match_root, "source", "MATCH", max_workers=5, normal_workers=4)
+
+
+def test_strong_lane_takes_heavy_first(coordinator, monkeypatch):
+    monkeypatch.setenv("MTM_STRONG_SLOT", "1")
+    c = _five(coordinator)
+    projection(c, item("BUG-01"), item("HEAVY-01", type="HEAVY"))
+    start(c, "HEAVY-01")
+    env = c.claim_task("HEAVY-01", "w-h", 420)["taskEnvelope"]
+    assert env["lane"] == "strong" and env["reasoning_effort"] == "high" and env["agent_profile"] == "team_heavy_worker"
+
+
+def test_strong_lane_runs_a_normal_item_only_when_normal_lanes_are_full(coordinator, monkeypatch):
+    monkeypatch.setenv("MTM_STRONG_SLOT", "1")
+    monkeypatch.setenv("MTM_WORKER_EFFORT", "medium")
+    c = _five(coordinator)
+    keys = ["BUG-01", "BUG-02", "BUG-03", "BUG-04", "BUG-05"]
+    projection(c, *[item(k) for k in keys])
+    lanes = []
+    for i, k in enumerate(keys):
+        start(c, k)
+        env = c.claim_task(k, f"w{i}", 420)["taskEnvelope"]
+        lanes.append((env["lane"], env["reasoning_effort"], env["agent_profile"]))
+    assert lanes[:4] == [("normal", "medium", "team_feature_worker")] * 4
+    assert lanes[4] == ("strong", "high", "team_strong_worker")       # 5th normal item uses the strong worker
+    assert c.plan_tasks()["availableSlots"] == 0
+
+
+def test_without_strong_flag_the_fifth_slot_stays_urgent_only(coordinator, monkeypatch):
+    monkeypatch.delenv("MTM_STRONG_SLOT", raising=False)
+    c = _five(coordinator)
+    projection(c, *[item(f"BUG-0{i}") for i in range(1, 6)])
+    assert len(c.plan_tasks()["selected"]) == 4

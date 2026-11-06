@@ -111,3 +111,45 @@ def test_root_snapshots_template_after_seed(tmp_path):
     assert res is not None and res.ok and "appdb_m1_tpl" in pg.dbs
     created = [argv for argv, _ in pg.calls if argv[0] == "createdb"]
     assert created and created[-1][-3:] == ["-T", "appdb_m1", "appdb_m1_tpl"]
+
+
+# ---- prisma generate in workers -------------------------------------------------------------
+import subprocess as _sp
+
+
+def _git_app(tmp_path):
+    root = project(tmp_path)
+    app = root / "src"
+    (app / "prisma").mkdir()
+    (app / "prisma" / "schema.prisma").write_text("model A { id Int @id }\n")
+    for cmd in (["init", "-q"], ["config", "user.email", "t@example.invalid"], ["config", "user.name", "T"],
+                ["add", "."], ["commit", "-qm", "base"]):
+        _sp.run(["git", "-C", str(app), *cmd], check=True, capture_output=True)
+    return root, app
+
+
+def test_detects_prisma_generate_commands():
+    assert ProjectRuntime.is_prisma_generate(["pnpm", "exec", "prisma", "generate"])
+    assert ProjectRuntime.is_prisma_generate(["npx", "prisma", "generate", "--no-hints"])
+    assert not ProjectRuntime.is_prisma_generate(["pnpm", "exec", "prisma", "migrate", "deploy"])
+    assert not ProjectRuntime.is_prisma_generate(["pnpm", "test"])
+
+
+def test_worker_skips_generate_when_schema_unchanged(tmp_path):
+    root, app = _git_app(tmp_path)
+    assert ProjectRuntime(root, "m1", "w1").skip_worker_prisma_generate()
+    assert not ProjectRuntime(root, "m1").skip_worker_prisma_generate()        # root always generates
+
+
+def test_worker_generates_after_changing_schema(tmp_path):
+    root, app = _git_app(tmp_path)
+    (app / "prisma" / "schema.prisma").write_text("model A { id Int @id\n  name String }\n")
+    assert not ProjectRuntime(root, "m1", "w1").skip_worker_prisma_generate()  # uncommitted change
+    _sp.run(["git", "-C", str(app), "commit", "-qam", "schema"], check=True, capture_output=True)
+    assert not ProjectRuntime(root, "m1", "w1").skip_worker_prisma_generate()  # committed change
+
+
+def test_force_flag_restores_generation(tmp_path, monkeypatch):
+    root, app = _git_app(tmp_path)
+    monkeypatch.setenv("MTM_WORKER_PRISMA_GENERATE", "1")
+    assert not ProjectRuntime(root, "m1", "w1").skip_worker_prisma_generate()
