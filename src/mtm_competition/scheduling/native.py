@@ -519,7 +519,10 @@ class NativeTaskCoordinator:
                 running = [json.loads(r["data"]) for r in db.execute("SELECT data FROM tasks WHERE phase='RUNNING'").fetchall()]
                 strong_busy = sum(1 for t in running if t.get("lane") == "strong")
                 normal_busy = len(running) - strong_busy
-                if strong_busy < self.strong_slots and (heavy or normal_busy >= self.normal_workers):
+                # Heavy and PI items take a free strong slot first (PI: fastest, most careful fix for
+                # the incident); other items only overflow into it when every normal slot is busy.
+                is_pi = str(task_type).upper() == "PI"
+                if strong_busy < self.strong_slots and (heavy or is_pi or normal_busy >= self.normal_workers):
                     lane = "strong"
             if lane == "strong":
                 worker_model = os.environ.get("MTM_STRONG_MODEL", "gpt-6.1-sol")

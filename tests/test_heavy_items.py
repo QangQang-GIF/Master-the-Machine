@@ -77,6 +77,19 @@ def test_strong_lane_takes_heavy_first(coordinator, monkeypatch):
     assert env["lane"] == "strong" and env["reasoning_effort"] == "high" and env["agent_profile"] == "team_heavy_worker"
 
 
+def test_strong_lane_takes_a_pi_item_first(coordinator, monkeypatch):
+    monkeypatch.setenv("MTM_STRONG_SLOT", "1")
+    monkeypatch.setenv("MTM_WORKER_EFFORT", "medium")
+    c = _five(coordinator)
+    projection(c, item("BUG-01"), item("PI-01", type="PI"))
+    start(c, "PI-01")
+    env = c.claim_task("PI-01", "w-pi", 420)["taskEnvelope"]
+    assert env["lane"] == "strong" and env["reasoning_effort"] == "high" and env["agent_profile"] == "team_strong_worker"
+    assert env["heavy"] is False
+    start(c, "BUG-01")                       # the strong slot is taken, so a normal item stays in a normal lane
+    assert c.claim_task("BUG-01", "w-b", 420)["taskEnvelope"]["lane"] == "normal"
+
+
 def test_strong_lane_runs_a_normal_item_only_when_normal_lanes_are_full(coordinator, monkeypatch):
     monkeypatch.setenv("MTM_STRONG_SLOT", "1")
     monkeypatch.setenv("MTM_WORKER_EFFORT", "medium")
