@@ -642,6 +642,7 @@ class MCPHelperServer:
                 repository_folder=folder, match_id=str(self.match_code),
                 max_workers=int(os.environ.get("MTM_NATIVE_MAX_WORKERS", "4")),
                 normal_workers=int(os.environ.get("MTM_NATIVE_NORMAL_WORKERS", "3")),
+                pi_burst_slots=int(os.environ.get("MTM_PI_BURST_SLOTS", "2")),
             )
             self._reconcile_native_receipts()
             # Preflight: make the effective worker configuration visible. The env defaults here differ from
@@ -649,6 +650,7 @@ class MCPHelperServer:
             self.effective_worker_config = {
                 "max_workers": self.native.max_workers,
                 "normal_workers": self.native.normal_workers,
+                "pi_burst_slots": self.native.pi_burst_slots,
                 "source": "env" if os.environ.get("MTM_NATIVE_MAX_WORKERS") else "mcp_server default",
             }
             sys.stderr.write(f"Effective native worker config: {self.effective_worker_config}\n")

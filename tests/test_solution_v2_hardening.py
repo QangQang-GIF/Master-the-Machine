@@ -153,3 +153,54 @@ def test_pi_dispatched_before_emergency_deadline_task(tmp_path):
     ])
     plan = c.plan_tasks()
     assert plan["selected"][0]["key"] == "PI-02"
+
+
+# ---- PI burst slots -------------------------------------------------------------------------------
+def _burst_coordinator(tmp_path, items, burst):
+    c = _coordinator(tmp_path, items)
+    c.max_workers, c.normal_workers, c.pi_burst_slots = 5, 4, burst   # production shape: 4 normal + 1 urgent
+    return c
+
+
+def _fill(c, keys):
+    for i, k in enumerate(keys):
+        c.register_started(k, {})
+        c.claim_task(k, f"w{i}")
+
+
+def _base_items():
+    items = [{"key": f"CR-0{i}", "type": "CR", "status": "OPEN", "points": 100} for i in range(1, 5)]
+    items.append({"key": "BUG-01", "type": "BUG", "status": "OPEN", "points": 80, "deadline_epoch": 100000})
+    return items
+
+
+BASE_BUSY = ["CR-01", "CR-02", "CR-03", "CR-04", "BUG-01"]
+
+
+def test_pi_gets_a_burst_slot_when_all_base_slots_are_busy(tmp_path):
+    items = _base_items() + [{"key": "PI-01", "type": "PI", "status": "OPEN", "points": 90}]
+    c = _burst_coordinator(tmp_path, items, burst=2)
+    c.pi_burst_slots = 0
+    _fill(c, BASE_BUSY)
+    assert c.plan_tasks()["selected"] == []                  # without burst the PI would have to wait
+    c.pi_burst_slots = 2
+    assert [t["key"] for t in c.plan_tasks()["selected"]] == ["PI-01"]
+
+
+def test_burst_slots_are_pi_only_and_stack_up_to_the_limit(tmp_path):
+    items = _base_items() + [{"key": "CR-05", "type": "CR", "status": "OPEN", "points": 100}]
+    items += [{"key": f"PI-0{i}", "type": "PI", "status": "OPEN", "points": 90} for i in range(1, 4)]
+    c = _burst_coordinator(tmp_path, items, burst=2)
+    _fill(c, BASE_BUSY)
+    sel = [t["key"] for t in c.plan_tasks()["selected"]]
+    assert "CR-05" not in sel                                # an ordinary item never takes a burst slot
+    assert sel == ["PI-01", "PI-02"]                         # two PIs start at once, the third waits
+
+
+def test_running_pi_does_not_take_base_slots_from_ordinary_work(tmp_path):
+    items = _base_items() + [{"key": "PI-01", "type": "PI", "status": "OPEN", "points": 90},
+                             {"key": "CR-05", "type": "CR", "status": "OPEN", "points": 100}]
+    c = _burst_coordinator(tmp_path, items, burst=1)
+    _fill(c, ["PI-01", "CR-01", "CR-02", "CR-03", "BUG-01"])  # PI sits in its burst slot
+    sel = [t["key"] for t in c.plan_tasks()["selected"]]
+    assert sel == ["CR-04"]                                  # a base slot is still free for ordinary work
