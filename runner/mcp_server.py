@@ -21,6 +21,7 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
 import time
 import urllib.parse
 import uuid
@@ -45,6 +46,7 @@ from mtm_competition.adapters.official_game_master import (
 )
 from mtm_competition.integration.git_guard import PreSubmissionGitGuard
 from mtm_competition.tasks.journal import SubmissionJournal
+from mtm_competition.verification.encoding_check import assert_no_mojibake
 from mtm_competition.scheduling.native import NativeTaskCoordinator
 from mtm_knowledge.bootstrap import KnowledgeBootstrap, detect_tech_stack
 from runner.telemetry import (
@@ -134,6 +136,32 @@ def save_stored_session_credentials(workspace_root: Path, match_code: str, data:
     """Compatibility name for memory-only retention; nothing is persisted."""
     if match_code:
         _SESSION_MEMORY[(str(workspace_root.resolve()), str(match_code))] = dict(data)
+
+
+
+SUBMIT_ALREADY_SUBMITTED = "ALREADY_SUBMITTED"
+SUBMIT_TERMINAL = "TERMINAL"      # Game Master says the item can no longer be submitted (closed/expired/gone)
+SUBMIT_FIXABLE = "FIXABLE"        # Rejected before acceptance for a payload/validation reason; item stays open
+SUBMIT_UNKNOWN = "UNKNOWN"        # Timeout/5xx/429/other: the server may or may not have received the request
+
+
+def classify_submit_error(status_code: Optional[int], err_code_str: str, exc_str: str) -> str:
+    """Classify a Submit failure. Only a server-confirmed closed item is terminal.
+
+    A validation error (HTTP 400/422) means the request was rejected, not that the item is closed, so the
+    item must stay open for a corrected payload. Anything whose outcome is not known must not be treated as
+    a rejection.
+    """
+    if status_code == 409 and ("already_submitted" in err_code_str or "already submitted" in exc_str):
+        return SUBMIT_ALREADY_SUBMITTED
+    closed_markers = ("closed", "not allowed", "deadline", "expired")
+    if status_code == 409 and any(k in exc_str or k in err_code_str for k in closed_markers):
+        return SUBMIT_TERMINAL
+    if status_code in (404, 410):
+        return SUBMIT_TERMINAL
+    if status_code in (400, 422):
+        return SUBMIT_FIXABLE
+    return SUBMIT_UNKNOWN
 
 
 class MCPHelperServer:
@@ -616,6 +644,14 @@ class MCPHelperServer:
                 normal_workers=int(os.environ.get("MTM_NATIVE_NORMAL_WORKERS", "3")),
             )
             self._reconcile_native_receipts()
+            # Preflight: make the effective worker configuration visible. The env defaults here differ from
+            # config/production.yaml and releases/prod_manifest.json, so state which one is in force.
+            self.effective_worker_config = {
+                "max_workers": self.native.max_workers,
+                "normal_workers": self.native.normal_workers,
+                "source": "env" if os.environ.get("MTM_NATIVE_MAX_WORKERS") else "mcp_server default",
+            }
+            sys.stderr.write(f"Effective native worker config: {self.effective_worker_config}\n")
 
         # Record initial items from descriptor
         for item in descriptor.get("backlogItems", []):
@@ -1282,7 +1318,76 @@ class MCPHelperServer:
                 )
             raise
 
+    def _start_integration_heartbeat(self, backlog_item_key: str) -> None:
+        """Renew the integration lease while this process is alive; a dead process stops renewing it."""
+        self._stop_integration_heartbeat()
+        if not self.native:
+            return
+        stop = threading.Event()
+        interval = max(0.5, float(getattr(self.native, "integration_lease_seconds", 8.0)) / 3.0)
+        native = self.native
+
+        def beat() -> None:
+            while not stop.wait(interval):
+                try:
+                    if not native.touch_integration(backlog_item_key):
+                        return  # fenced out: another task owns the lock now
+                except Exception:
+                    return
+
+        thread = threading.Thread(target=beat, name=f"integration-heartbeat-{backlog_item_key}", daemon=True)
+        self._hb_stop, self._hb_thread = stop, thread
+        thread.start()
+
+    def _stop_integration_heartbeat(self) -> None:
+        stop = getattr(self, "_hb_stop", None)
+        if stop is not None:
+            stop.set()
+        self._hb_stop = None
+        self._hb_thread = None
+
+    def _scoped_stage_paths(self, backlog_item_key: str) -> List[str]:
+        """Paths this item is allowed to stage, relative to the checkout root. Never the whole checkout."""
+        root = Path(self.checkout_root).resolve()
+        match_root = Path(self.match_root).resolve() if self.match_root else root
+        try:
+            rel = match_root.relative_to(root).as_posix()
+        except ValueError:
+            rel = ""
+        base = "" if rel in ("", ".") else rel.rstrip("/") + "/"
+        candidates = [f"{base}answers/{backlog_item_key}"]
+        if self.native:
+            try:
+                details = self.native.task_details(backlog_item_key)
+                changed = (details.get("workerResult") or {}).get("changed_files") or []
+            except Exception:
+                changed = []
+            for rel_path in changed:
+                if not isinstance(rel_path, str) or not rel_path or rel_path.startswith("/") or ".." in rel_path.split("/"):
+                    continue
+                if "\\" in rel_path or re.match(r"^[A-Za-z]:", rel_path):
+                    continue
+                candidates.append(f"{base}{rel_path}")
+        return [c for c in dict.fromkeys(candidates) if (root / c).exists()]
+
+    def _git_checked(self, *args: str, timeout: int = 30) -> subprocess.CompletedProcess:
+        return subprocess.run(["git", "-C", str(self.checkout_root), *args],
+                              capture_output=True, text=True, timeout=timeout)
+
     def submit_work(
+        self,
+        client_submission_id: str,
+        backlog_item_key: str,
+        git_revision: str,
+        answer: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """Submit with a heartbeat on the integration lease for the whole duration of the call."""
+        try:
+            return self._submit_work_impl(client_submission_id, backlog_item_key, git_revision, answer)
+        finally:
+            self._stop_integration_heartbeat()
+
+    def _submit_work_impl(
         self,
         client_submission_id: str,
         backlog_item_key: str,
@@ -1310,6 +1415,7 @@ class MCPHelperServer:
             self.native.assert_can_submit(backlog_item_key)
             # Rechecking an existing lock is idempotent; another item cannot push in between.
             self.native.begin_integration(backlog_item_key)
+            self._start_integration_heartbeat(backlog_item_key)
             details = self.native.task_details(backlog_item_key)["data"].get("start_details", {})
             required_test_ids = announced_test_ids(details)
 
@@ -1317,11 +1423,16 @@ class MCPHelperServer:
         if self.checkout_root:
             try:
                 # Auto-commit any pending evidence or answer files on disk before push
-                status_res = subprocess.run(["git", "-C", str(self.checkout_root), "status", "--porcelain"], capture_output=True, text=True, timeout=10)
-                if status_res.stdout.strip():
-                    subprocess.run(["git", "-C", str(self.checkout_root), "add", "-A"], capture_output=True, timeout=15)
-                    subprocess.run(["git", "-C", str(self.checkout_root), "commit", "-m", f"Auto-capture evidence for {backlog_item_key}"], capture_output=True, timeout=15)
-                    rev_res = subprocess.run(["git", "-C", str(self.checkout_root), "rev-parse", "HEAD"], capture_output=True, text=True, timeout=10)
+                paths = self._scoped_stage_paths(backlog_item_key)
+                status_res = self._git_checked("status", "--porcelain", "--", *paths, timeout=10) if paths else None
+                if status_res is not None and status_res.returncode == 0 and status_res.stdout.strip():
+                    add_res = self._git_checked("add", "--", *paths, timeout=15)
+                    if add_res.returncode != 0:
+                        raise RuntimeError(f"git add failed: {add_res.stderr.strip()}")
+                    commit_res = self._git_checked("commit", "-m", f"Auto-capture evidence for {backlog_item_key}", timeout=15)
+                    if commit_res.returncode != 0:
+                        raise RuntimeError(f"git commit failed: {commit_res.stderr.strip() or commit_res.stdout.strip()}")
+                    rev_res = self._git_checked("rev-parse", "HEAD", timeout=10)
                     if rev_res.returncode == 0 and rev_res.stdout.strip():
                         git_revision = rev_res.stdout.strip()
 
@@ -1337,8 +1448,9 @@ class MCPHelperServer:
             except Exception as e:
                 sys.stderr.write(f"Notice: Auto-commit/push before submit: {e}\n")
 
-        # 1. Pre-submission Git Invariant Verification (GIT-01..05) with Self-Healing Retry
+        # 1. Pre-submission Git Invariant Verification (GIT-01..05). Fail closed: no silent downgrade or re-stage.
         try:
+            assert_no_mojibake(answer, label=f"answer for {backlog_item_key}")
             self.git_guard.validate_pre_submission(
                 target_commit_sha=git_revision,
                 assigned_branch_ref=assigned_branch,
@@ -1351,28 +1463,13 @@ class MCPHelperServer:
                 required_test_ids=required_test_ids,
             )
         except Exception as gate_err:
-            sys.stderr.write(f"Submission Gate auto-healing retry for {backlog_item_key}: {gate_err}\n")
-            if isinstance(answer, dict):
-                answer["status"] = "PARTIAL"
-            if self.checkout_root:
-                subprocess.run(["git", "-C", str(self.checkout_root), "add", "-A"], capture_output=True, timeout=15)
-                subprocess.run(["git", "-C", str(self.checkout_root), "commit", "-m", f"Auto-heal evidence for {backlog_item_key}"], capture_output=True, timeout=15)
-                rev_res = subprocess.run(["git", "-C", str(self.checkout_root), "rev-parse", "HEAD"], capture_output=True, text=True, timeout=10)
-                if rev_res.returncode == 0 and rev_res.stdout.strip():
-                    git_revision = rev_res.stdout.strip()
-                if not self.descriptor.get("offline"):
-                    subprocess.run(["git", "-C", str(self.checkout_root), "push", "origin", assigned_branch], capture_output=True, text=True, timeout=30)
-            self.git_guard.validate_pre_submission(
-                target_commit_sha=git_revision,
-                assigned_branch_ref=assigned_branch,
-                backlog_item_key=backlog_item_key,
-                answer_payload=answer,
-                match_root=self.match_root,
-                checkout_root=self.checkout_root,
-                require_remote=False if self.descriptor.get("offline") else True,
-                raise_on_error=False,
-                required_test_ids=required_test_ids,
-            )
+            sys.stderr.write(f"Submission gate rejected {backlog_item_key}: {gate_err}\n")
+            if self.native:
+                try:
+                    self.native.end_integration(backlog_item_key, success=False)
+                except Exception:
+                    pass
+            raise
 
         # 2. Record In-Flight Submission Journal with canonical serialized bytes (API-06, API-07)
         payload = {
@@ -1391,6 +1488,8 @@ class MCPHelperServer:
             git_revision=git_revision,
             remote_ref=assigned_branch,
         )
+        if self.native:
+            self.native.mark_submit_in_flight(backlog_item_key)
 
         origin = self.adapter.api_base_url
         path = f"/api/v1/matches/{self.match_uuid}/submissions"
@@ -1474,33 +1573,30 @@ class MCPHelperServer:
             exc_str = str(exc).lower()
             err_code_str = str(err_code or "").lower()
 
-            is_already_submitted = (status_code == 409 and ("already_submitted" in err_code_str or "already submitted" in exc_str))
-
-            # Terminal rejection: 409 [CLOSED / NOT ALLOWED / EXPIRED], 400, 404, 410, 422
-            is_terminal_rejection = (
-                (status_code == 409 and not is_already_submitted and any(k in exc_str for k in ("closed", "not allowed", "deadline", "expired")))
-                or (status_code in (400, 404, 410, 422))
-            )
+            outcome = classify_submit_error(status_code, err_code_str, exc_str)
+            is_already_submitted = outcome == SUBMIT_ALREADY_SUBMITTED
+            is_terminal_rejection = outcome == SUBMIT_TERMINAL
 
             if is_terminal_rejection and self.native:
                 try:
-                    # 1. Reconcile and free worker immediately, transitioning directly to CLOSED
-                    self.native.reconcile_worker(
-                        backlog_item_key,
-                        confirmed_stopped=True,
-                        reason=f"GM_TERMINAL_REJECTED_{status_code}: {exc}",
-                        requeue=False,
-                    )
+                    # Close only when the worker is known to have stopped; never fabricate that confirmation.
+                    if self.native.worker_quiesced(backlog_item_key):
+                        self.native.reconcile_worker(
+                            backlog_item_key,
+                            confirmed_stopped=True,
+                            reason=f"GM_TERMINAL_REJECTED_{status_code}: {exc}",
+                            requeue=False,
+                        )
+                    else:
+                        sys.stderr.write(f"Warning: {backlog_item_key} rejected as terminal but worker still RUNNING; not closing\n")
                 except Exception as rec_err:
                     sys.stderr.write(f"Warning: reconcile_worker failed: {rec_err}\n")
 
                 try:
-                    # 2. Release integration owner lock immediately
                     self.native.end_integration(backlog_item_key, success=False)
                 except Exception:
                     pass
 
-                # 3. Emit dashboard telemetry status as CLOSED
                 if self.telemetry:
                     self.telemetry.emit_backlog_status(
                         backlog_id=backlog_item_key,
@@ -1508,11 +1604,14 @@ class MCPHelperServer:
                         status="CLOSED",
                         summary=f"Item closed/rejected by Game Master ({status_code}): {exc}",
                     )
-            elif self.native and not is_already_submitted:
+            elif outcome == SUBMIT_FIXABLE and self.native:
+                # Rejected, item still open: release the lock so a corrected payload can be resubmitted.
                 try:
                     self.native.end_integration(backlog_item_key, success=False)
                 except Exception:
                     pass
+            # SUBMIT_UNKNOWN: the server may have accepted it. Keep the lock and in-flight marker; the long
+            # unknown-outcome TTL (not the 8s lease) lets the item be reconciled against server records.
 
             # Distinguish deterministic 4xx rejection (excluding 429) from unknown outcome (timeouts, 5xx)
             if status_code is not None and 400 <= status_code < 500 and status_code != 429:

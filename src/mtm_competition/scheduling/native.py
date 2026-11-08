@@ -8,6 +8,7 @@ import os
 
 from contextlib import contextmanager
 import json
+import uuid
 import math
 import re
 import sqlite3
@@ -26,7 +27,8 @@ class NativeTaskCoordinator:
     def __init__(self, state_dir: Path | str, checkout_root: Path | str,
                  match_root: Path | str, repository_folder: str, match_id: str,
                  max_workers: int = 2, normal_workers: int = 1,
-                 integration_reserve_seconds: int = 90, clock_max_age_seconds: int = 120):
+                 integration_reserve_seconds: int = 90, clock_max_age_seconds: int = 120,
+                 integration_lease_seconds: float = 8.0, submit_unknown_ttl_seconds: float = 120.0):
         if not 1 <= normal_workers < max_workers <= 16:
             raise NativeCoordinationError("Require 1 <= normal_workers < max_workers <= 16")
         if not re.fullmatch(r"[A-Za-z0-9_-]{1,80}", match_id):
@@ -43,6 +45,10 @@ class NativeTaskCoordinator:
         self.max_workers, self.normal_workers = max_workers, normal_workers
         self.reserve = max(10, int(integration_reserve_seconds))
         self.clock_max_age = max(10, int(clock_max_age_seconds))
+        # Lease: the integration owner must heartbeat (begin/touch_integration) within this window.
+        self.integration_lease_seconds = max(1.0, float(integration_lease_seconds))
+        # A submit whose outcome is unknown keeps the lock longer, but never forever.
+        self.submit_unknown_ttl_seconds = max(self.integration_lease_seconds, float(submit_unknown_ttl_seconds))
         self.workers_root = self.checkout_root.parent / ".workers" / match_id
         if not self.workers_root.resolve().is_relative_to(self.checkout_root.parent):
             raise NativeCoordinationError("Worker root escapes challenge workspace")
@@ -203,12 +209,22 @@ class NativeTaskCoordinator:
         clock_ready = not stale and now is not None and remaining is not None
         owner = self._meta(db, "integration_owner")
         acquired_at = self._meta(db, "integration_acquired_at", 0)
-        if owner and acquired_at and (planning_time - float(acquired_at)) > 8:
-            # Auto-clear stalled integration owner so ready tasks can progress (universal 8s ceiling)
-            db.execute("UPDATE tasks SET phase='READY_TO_INTEGRATE' WHERE key=? AND phase='INTEGRATING'", (owner,))
-            self._set_meta(db, "integration_owner", None)
-            self._set_meta(db, "integration_acquired_at", None)
-            owner = None
+        inflight = self._meta(db, "integration_submit_inflight")
+        if owner and acquired_at:
+            held_for = planning_time - float(acquired_at)
+            if inflight and inflight.get("key") == owner:
+                # Submit request may already be at Game Master: do not reclaim until the bounded TTL passes.
+                expired = (planning_time - float(inflight.get("since", acquired_at))) > self.submit_unknown_ttl_seconds
+            else:
+                expired = held_for > self.integration_lease_seconds
+            if expired:
+                # Lease expired: the owner stopped heartbeating (begin/touch_integration) so it is presumed dead.
+                db.execute("UPDATE tasks SET phase='READY_TO_INTEGRATE' WHERE key=? AND phase='INTEGRATING'", (owner,))
+                self._set_meta(db, "integration_owner", None)
+                self._set_meta(db, "integration_acquired_at", None)
+                self._set_meta(db, "integration_lease_id", None)
+                self._set_meta(db, "integration_submit_inflight", None)
+                owner = None
         response = {"matchStatus": status, "availableSlots": max(0, self.max_workers - len(active)),
                     "selected": [], "active": [public_row(r) for r in active], "readyToIntegrate": [],
                     "readyDiagnostics": [], "skippedReady": [], "integrationOwner": owner, "integrationBlocked": [],
@@ -241,8 +257,10 @@ class NativeTaskCoordinator:
                     emergency_result = {
                         "task_id": key, "worker_id": row["worker_id"], "status": "PARTIAL",
                         "skill_ids": ["mtm-emergency-flush"], "changed_files": [f"answers/{key}/submit.json"],
-                        "test_results": [{"command": "emergency-deadline-cutoff", "passed": True, "exit_code": 0}],
+                        # Honest record: a cutoff is an event, not a passing test. No test command is fabricated.
+                        "test_results": [],
                         "evidence_paths": [], "elapsed_seconds": 0,
+                        "cutoff_triggered": True, "verification_status": "UNVERIFIED",
                         "note": f"Hard cutoff triggered at {int(slack)}s remaining before deadline"
                     }
                     db.execute("UPDATE tasks SET phase='READY_TO_INTEGRATE',result=? WHERE key=?",
@@ -342,12 +360,14 @@ class NativeTaskCoordinator:
             is_pi = (task.get("type") == "PI")
             has_deadline = (deadline is not None or task.get("deadlineMinutes") is not None)
 
-            if deadline is not None and slack <= 180:
+            # PI is a speed race measured from reveal, so it is dispatched before everything else;
+            # a deadline item inside its last 180s is next. (Previously the emergency tier preceded PI.)
+            if is_pi:
                 prio_tier = 0
-                prio_sub = slack
-            elif is_pi:
-                prio_tier = 1
                 prio_sub = slack if slack is not None else 0
+            elif deadline is not None and slack <= 180:
+                prio_tier = 1
+                prio_sub = slack
             elif has_deadline:
                 prio_tier = 2
                 prio_sub = slack if slack is not None else 9999
@@ -603,6 +623,8 @@ class NativeTaskCoordinator:
             if self._meta(db, "integration_owner") == key:
                 self._set_meta(db, "integration_owner", None)
                 self._set_meta(db, "integration_acquired_at", None)
+                self._set_meta(db, "integration_lease_id", None)
+                self._set_meta(db, "integration_submit_inflight", None)
             return {"key": key, "phase": phase}
 
     def record_worker_result(self, key: str, worker_result: dict[str, Any]) -> dict[str, Any]:
@@ -628,8 +650,12 @@ class NativeTaskCoordinator:
 
             worker_match = Path(row["worktree"]) / self.repository_folder
             has_changes_or_answers = bool(result.get("changed_files")) or (worker_match / "answers" / key / "submit.json").is_file()
-            if result["status"] in ("BLOCKED", "TIMED_OUT", "FAILED") and has_changes_or_answers:
-                result["status"] = "PARTIAL"
+            # A failed/blocked/timed-out worker is never silently promoted to an integratable result.
+            # Its artifacts are kept for review; salvage requires the worker/root to report PARTIAL explicitly
+            # with real passing tests or evidence.
+            if result["status"] in ("BLOCKED", "TIMED_OUT", "FAILED"):
+                result["has_unverified_artifacts"] = bool(has_changes_or_answers)
+                result["verification_status"] = "UNVERIFIED"
             is_integratable = result["status"] in ('READY_FOR_REVIEW', 'PARTIAL', 'DONE')
 
             if not is_integratable:
@@ -641,6 +667,9 @@ class NativeTaskCoordinator:
                                 or not t["command"].strip() or t.get("passed") is not True
                                 or type(t.get("exit_code")) is not int or t["exit_code"] != 0 for t in tests):
                 raise NativeCoordinationError("Actual passing test commands and exit_code=0 required")
+            if not tests and not result["evidence_paths"]:
+                raise NativeCoordinationError("An integratable result needs passing test commands or evidence paths")
+            result["verification_status"] = "VERIFIED" if tests else "EVIDENCE_ONLY"
             def safe(relative: str) -> Path:
                 if not isinstance(relative, str):
                     raise NativeCoordinationError("Result path must be a string")
@@ -703,9 +732,56 @@ class NativeTaskCoordinator:
                 raise NativeCoordinationError("Another task owns the integration/submission lock")
             if row["phase"] not in ("READY_TO_INTEGRATE", "INTEGRATING", "INTEGRATED"):
                 raise NativeCoordinationError("Worker result is not ready for integration")
+            if owner != key or not self._meta(db, "integration_lease_id"):
+                self._set_meta(db, "integration_lease_id", uuid.uuid4().hex)
             self._set_meta(db, "integration_owner", key)
+            # Acquire/renew the lease. Without this timestamp the lease can never be evaluated.
+            self._set_meta(db, "integration_acquired_at", time.monotonic())
             db.execute("UPDATE tasks SET phase='INTEGRATING' WHERE key=?", (key,))
-            return {"key": key, "phase": "INTEGRATING", "worktreeRoot": row["worktree"], "workerResult": json.loads(row["result"])}
+            return {"key": key, "phase": "INTEGRATING", "worktreeRoot": row["worktree"],
+                    "workerResult": json.loads(row["result"]), "leaseId": self._meta(db, "integration_lease_id")}
+
+    def touch_integration(self, key: str, lease_id: str | None = None) -> bool:
+        """Heartbeat for the integration lock. Returns False if this task no longer owns it (fenced out)."""
+        key = self._key(key)
+        with self._db() as db:
+            if self._meta(db, "integration_owner") != key:
+                return False
+            if lease_id is not None and self._meta(db, "integration_lease_id") != lease_id:
+                return False
+            self._set_meta(db, "integration_acquired_at", time.monotonic())
+            return True
+
+    def owns_integration(self, key: str, lease_id: str | None = None) -> bool:
+        key = self._key(key)
+        with self._db() as db:
+            if self._meta(db, "integration_owner") != key:
+                return False
+            return lease_id is None or self._meta(db, "integration_lease_id") == lease_id
+
+    def mark_submit_in_flight(self, key: str) -> None:
+        """Record that a Submit request is being sent. Until the outcome is known the lock is not reclaimed early."""
+        key = self._key(key)
+        with self._db() as db:
+            if self._meta(db, "integration_owner") != key:
+                raise NativeCoordinationError("Submission requires current integration ownership")
+            self._set_meta(db, "integration_submit_inflight", {"key": key, "since": time.monotonic()})
+
+    def clear_submit_in_flight(self, key: str) -> None:
+        key = self._key(key)
+        with self._db() as db:
+            inflight = self._meta(db, "integration_submit_inflight")
+            if inflight and inflight.get("key") == key:
+                self._set_meta(db, "integration_submit_inflight", None)
+
+    def worker_quiesced(self, key: str) -> bool:
+        """True only when the task's worker has reported completion (phase is no longer RUNNING).
+
+        The coordinator cannot observe a native worker process; a RUNNING phase means it may still write.
+        """
+        with self._db() as db:
+            row = self._task(db, self._key(key))
+            return row["phase"] != "RUNNING"
 
     def end_integration(self, key: str, success: bool = True) -> dict[str, Any]:
         with self._db() as db:
@@ -717,6 +793,8 @@ class NativeTaskCoordinator:
             if not success:
                 self._set_meta(db, "integration_owner", None)
                 self._set_meta(db, "integration_acquired_at", None)
+                self._set_meta(db, "integration_lease_id", None)
+                self._set_meta(db, "integration_submit_inflight", None)
             return {"key": key, "phase": phase}
 
     def mark_submitted(self, key: str, receipt_id: str) -> None:
@@ -731,3 +809,5 @@ class NativeTaskCoordinator:
             db.execute("UPDATE tasks SET phase='SUBMITTED',receipt=? WHERE key=?", (receipt_id, key))
             self._set_meta(db, "integration_owner", None)
             self._set_meta(db, "integration_acquired_at", None)
+            self._set_meta(db, "integration_lease_id", None)
+            self._set_meta(db, "integration_submit_inflight", None)

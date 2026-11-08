@@ -119,7 +119,7 @@ def test_hybrid_parallel_pi_fast_track(tmp_path):
                 task_id=tid,
                 status=WorkerStatus.READY_FOR_REVIEW,
                 changed_files=[file_name, test_file_name],
-                test_results=[{"command": f"{py_exec} -m pytest -q", "passed": True}],
+                test_results=[{"command": f"{py_exec} -m pytest -q", "passed": True, "mvs_id": "MVS-PI" if envelope.task_type == "PI" else "MVS-CR"}],
                 elapsed_seconds=sleep_dur,
             ),
             trace,

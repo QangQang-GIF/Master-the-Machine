@@ -17,7 +17,7 @@
     },
     "status": {
       "type": "string",
-      "enum": ["READY_FOR_REVIEW", "BLOCKED", "TIMED_OUT", "FAILED", "ESCALATE"]
+      "enum": ["READY_FOR_REVIEW", "PARTIAL", "DONE", "BLOCKED", "TIMED_OUT", "FAILED", "ESCALATE"]
     },
     "skill_ids": {
       "type": "array",
@@ -85,6 +85,13 @@
     },
     "effort": {
       "type": ["string", "null"]
+    },
+    "verification_status": {
+      "type": "string",
+      "enum": ["VERIFIED", "EVIDENCE_ONLY", "UNVERIFIED"]
+    },
+    "cutoff_triggered": {
+      "type": "boolean"
     },
     "notes": {
       "type": "string"

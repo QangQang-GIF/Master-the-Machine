@@ -192,7 +192,7 @@ def test_end_to_end_orchestration_cycle(tmp_path):
             task_id=envelope.task_id,
             status=WorkerStatus.READY_FOR_REVIEW,
             changed_files=["calculator.py"],
-            test_results=[{"command": "pytest", "passed": True}],
+            test_results=[{"command": "pytest -k test_add", "passed": True}],
             evidence_paths=["trace.jsonl"],
             elapsed_seconds=12.4,
         )

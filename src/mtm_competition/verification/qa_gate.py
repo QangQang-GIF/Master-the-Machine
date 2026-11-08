@@ -109,7 +109,7 @@ def map_mvs_to_test_command(mvs_item: Dict[str, Any] | str) -> str:
         return desc
     if desc.startswith("test_") or "::test_" in desc:
         return f"pytest -k {desc}"
-    return f"pytest -k {desc}" if desc else "pytest"
+    return f"pytest -k {desc}" if desc else ""
 
 
 def validate_qa_gate(
@@ -215,9 +215,6 @@ def validate_qa_gate(
                         matched = True
                         break
                     if mvs_cmd and (mvs_cmd == tr_cmd or mvs_cmd in tr_cmd):
-                        matched = True
-                        break
-                    if tr_cmd.strip() in ("pytest", "python -m pytest", "pytest -v", "pytest -q"):
                         matched = True
                         break
 
