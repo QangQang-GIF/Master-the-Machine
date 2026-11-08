@@ -204,3 +204,38 @@ def test_running_pi_does_not_take_base_slots_from_ordinary_work(tmp_path):
     _fill(c, ["PI-01", "CR-01", "CR-02", "CR-03", "BUG-01"])  # PI sits in its burst slot
     sel = [t["key"] for t in c.plan_tasks()["selected"]]
     assert sel == ["CR-04"]                                  # a base slot is still free for ordinary work
+
+
+# ---- PI-first integration gate ---------------------------------------------------------------------
+def _pi_gate_setup(tmp_path):
+    c = _coordinator(tmp_path, [{"key": "CR-01", "type": "CR", "status": "OPEN", "points": 100},
+                                {"key": "PI-01", "type": "PI", "status": "OPEN", "points": 90}])
+    _ready(c, "CR-01", "w1")
+    _ready(c, "PI-01", "w2")
+    return c
+
+
+def test_pi_ready_blocks_ordinary_item_from_starting_integration(tmp_path):
+    c = _pi_gate_setup(tmp_path)
+    with pytest.raises(NativeCoordinationError, match="PI-first"):
+        c.begin_integration("CR-01")
+    assert c.begin_integration("PI-01")["phase"] == "INTEGRATING"     # the PI itself is never gated
+
+
+def test_pi_gate_expires_so_a_stuck_pi_cannot_starve_other_items(tmp_path):
+    import json as _json
+    c = _pi_gate_setup(tmp_path)
+    with c._db() as db:
+        row = db.execute("SELECT result FROM tasks WHERE key='PI-01'").fetchone()
+        res = _json.loads(row["result"]); res["ready_at"] = time.monotonic() - 46.0
+        db.execute("UPDATE tasks SET result=? WHERE key='PI-01'", (_json.dumps(res),))
+    assert c.begin_integration("CR-01")["phase"] == "INTEGRATING"
+
+
+def test_no_gate_while_the_pi_is_still_running(tmp_path):
+    c = _coordinator(tmp_path, [{"key": "CR-01", "type": "CR", "status": "OPEN", "points": 100},
+                                {"key": "PI-01", "type": "PI", "status": "OPEN", "points": 90}])
+    _ready(c, "CR-01", "w1")
+    c.register_started("PI-01", {})
+    c.claim_task("PI-01", "w2")                                       # still RUNNING, nothing to integrate yet
+    assert c.begin_integration("CR-01")["phase"] == "INTEGRATING"

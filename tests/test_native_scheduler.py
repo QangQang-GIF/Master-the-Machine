@@ -173,11 +173,13 @@ def test_symlink_evidence_escape(coordinator, tmp_path):
 
 def test_lock_survives_restart_until_receipt(coordinator):
     c = coordinator
+    c.pi_integration_gate_seconds = 0   # this test is about lock ownership, not PI-first ordering
     projection(c, item(), item('PI-01'))
     for key in ['BUG-01', 'PI-01']:
         start(c, key); c.claim_task(key, key); c.record_worker_result(key, result(key))
     c.begin_integration('BUG-01'); c.end_integration('BUG-01')
-    other = NativeTaskCoordinator(c.db_path.parent, c.checkout_root, c.match_root, 'source', 'MATCH')
+    other = NativeTaskCoordinator(c.db_path.parent, c.checkout_root, c.match_root, 'source', 'MATCH',
+                                  pi_integration_gate_seconds=0)
     with pytest.raises(NativeCoordinationError, match='lock'):
         other.begin_integration('PI-01')
     with pytest.raises(NativeCoordinationError, match='receipt'):
@@ -365,6 +367,7 @@ def test_paused_ready_omitted_from_dispatch_preserving_diagnostics(coordinator):
 
 def test_closed_live_integration_keeps_lock_until_explicit_recovery(coordinator):
     c = coordinator
+    c.pi_integration_gate_seconds = 0   # this test is about lock ownership, not PI-first ordering
     projection(c, item(), item('PI-01'))
     complete(c, 'BUG-01', 'one'); complete(c, 'PI-01', 'two')
     c.begin_integration('BUG-01')

@@ -29,7 +29,7 @@ class NativeTaskCoordinator:
                  max_workers: int = 2, normal_workers: int = 1,
                  integration_reserve_seconds: int = 90, clock_max_age_seconds: int = 120,
                  integration_lease_seconds: float = 8.0, submit_unknown_ttl_seconds: float = 120.0,
-                 pi_burst_slots: int = 0):
+                 pi_burst_slots: int = 0, pi_integration_gate_seconds: float = 45.0):
         if not 1 <= normal_workers < max_workers <= 16:
             raise NativeCoordinationError("Require 1 <= normal_workers < max_workers <= 16")
         if not re.fullmatch(r"[A-Za-z0-9_-]{1,80}", match_id):
@@ -47,6 +47,9 @@ class NativeTaskCoordinator:
         # Extra worker slots that ONLY Product Incidents may use, on top of max_workers. PIs arrive at
         # unknown times and are a speed race, so a PI must never wait behind busy ordinary workers.
         self.pi_burst_slots = max(0, min(8, int(pi_burst_slots)))
+        # While a finished PI waits to integrate, ordinary items may not START integrating for this long
+        # (a lock holder is never interrupted). Time-limited so a stuck PI cannot starve everything else.
+        self.pi_integration_gate_seconds = max(0.0, float(pi_integration_gate_seconds))
         self.reserve = max(10, int(integration_reserve_seconds))
         self.clock_max_age = max(10, int(clock_max_age_seconds))
         # Lease: the integration owner must heartbeat (begin/touch_integration) within this window.
@@ -714,6 +717,7 @@ class NativeTaskCoordinator:
             required_evidence = task.get("start_details", {}).get("evidence_required", task.get("evidence_required", []))
             if not set(required_evidence).issubset(evidence):
                 raise NativeCoordinationError("Required evidence missing from worker result")
+            result["ready_at"] = time.monotonic()   # used by the PI-first integration gate
             db.execute("UPDATE tasks SET phase='READY_TO_INTEGRATE',result=? WHERE key=?", (json.dumps(result), key))
             return {"key": key, "phase": "READY_TO_INTEGRATE", "worktreeRoot": row["worktree"], "workerResult": result}
 
@@ -749,6 +753,16 @@ class NativeTaskCoordinator:
                 raise NativeCoordinationError("Another task owns the integration/submission lock")
             if row["phase"] not in ("READY_TO_INTEGRATE", "INTEGRATING", "INTEGRATED"):
                 raise NativeCoordinationError("Worker result is not ready for integration")
+            if (owner != key and self.pi_integration_gate_seconds > 0
+                    and json.loads(row["data"]).get("type") != "PI"):
+                now_mono = time.monotonic()
+                for other in db.execute("SELECT key,data,result FROM tasks WHERE phase='READY_TO_INTEGRATE'").fetchall():
+                    if other["key"] == key or json.loads(other["data"]).get("type") != "PI":
+                        continue
+                    ready_at = (json.loads(other["result"] or "{}") or {}).get("ready_at")
+                    if isinstance(ready_at, (int, float)) and 0 <= now_mono - ready_at <= self.pi_integration_gate_seconds:
+                        raise NativeCoordinationError(
+                            f"PI {other['key']} is ready to integrate; integrate it first (PI-first gate)")
             if owner != key or not self._meta(db, "integration_lease_id"):
                 self._set_meta(db, "integration_lease_id", uuid.uuid4().hex)
             self._set_meta(db, "integration_owner", key)
