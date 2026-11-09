@@ -27,6 +27,10 @@ For PREPARE/RESUME, follow `game-preparation`/`team-recovery`. For `START_GAME`,
    - A worker's budget ends at its real hand-off point: 150 s before the item's deadline, or 240 s before the match ends. A hand-off leaves no time for a new attempt; the policy accounts for that (`REWORK` needs `submitBudgetSeconds` + `MTM_MIN_REWORK_SECONDS` left).
    - **Submit results that pass.** A `SUBMIT` decision is acted on immediately; never send a passing result back to polish or re-capture evidence (594OYFBS lost CR-01, 140 points, this way).
 
+## Submit revision and company tools (I5NLYST2 lessons)
+- The `gitRevision` you submit is the root checkout HEAD pushed to the assigned branch after integrating the worker commit. Cherry-pick/merge always creates a new SHA, so it never equals the worker's SHA; say so in one line when you call `submit_work` (it verifies answer parity and that the remote branch is at that SHA).
+- Company tools (`kb_search`, `search_logs`, `get_test_data`, `collect_logs`, `fetch_fixture`) go only through the MCP server. If they fail, report the exact error text in a blocker and continue other items; never write your own HTTP/bearer bridge or retry loops (automatic review rejects them).
+
 ## Until the end
 
 - Keep calling `wait_for_update`/`plan_tasks` until the match is FINISHED. Never end your turn while the match is running.

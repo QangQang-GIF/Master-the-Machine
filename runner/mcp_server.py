@@ -119,6 +119,22 @@ def check_effective_worker_config(config: Dict[str, Any]) -> None:
                            "MTM_EXPECTED_WORKER_CONFIG")
 
 
+def company_tools_origin(*candidates: Optional[str]) -> str:
+    """Origin (scheme://host) of the Game Master for the Match MCP endpoint <origin>/api/v1/mcp/<match>.
+
+    Player 0.9.45 sends matchPageUrl="https://masterthemachine.tech/match"; using that page URL as the base
+    produced https://masterthemachine.tech/match/api/v1/mcp/<match> and HTTP 404 in I5NLYST2, which blocked
+    every KB/log/test-data call. Only the origin of the first valid URL is used.
+    """
+    from urllib.parse import urlsplit
+    for value in candidates:
+        if isinstance(value, str) and value.strip():
+            parts = urlsplit(value.strip())
+            if parts.scheme in ("https", "http") and parts.netloc:
+                return f"{parts.scheme}://{parts.netloc}"
+    return "https://masterthemachine.tech"
+
+
 # Single source of truth for scenario IDs lives with the submission policy (Solution v3, S2).
 announced_test_ids = _policy_announced_test_ids
 
@@ -207,11 +223,11 @@ class MCPHelperServer:
         if not match_id or not token:
             return
 
-        base_url = (
-            self.match_page_url
-            or self.descriptor.get("gameMasterApiUrl")
-            or self.descriptor.get("baseUrl")
-            or "https://masterthemachine.tech"
+        base_url = company_tools_origin(
+            self.descriptor.get("gameMasterApiUrl"),
+            self.descriptor.get("gameMasterUrl"),
+            self.descriptor.get("baseUrl"),
+            self.match_page_url,
         )
         state_dir = self.workspace_root / "team-sdlc-pack" / "state" / str(match_id)
 
@@ -2031,7 +2047,7 @@ def get_tool_definitions() -> List[Dict[str, Any]]:
                 "properties": {
                     "clientSubmissionId": {"type": "string", "description": "Client-generated UUID v4"},
                     "backlogItemKey": {"type": "string", "description": "Backlog item key"},
-                    "gitRevision": {"type": "string", "description": "Full remote-pushed 40-character Git SHA"},
+                    "gitRevision": {"type": "string", "description": "Full 40-character SHA of the root checkout HEAD that is pushed to the assigned branch after integrating the worker commit. Integration (cherry-pick/merge) always creates a new SHA, so it never equals the worker's own commit SHA; submit_work verifies the answer file parity and that the remote branch is at this SHA."},
                     "answer": {"type": "object", "description": "Answer payload matching submitTemplate"},
                 },
                 "required": ["clientSubmissionId", "backlogItemKey", "gitRevision", "answer"],

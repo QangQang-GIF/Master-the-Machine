@@ -79,9 +79,16 @@ def submit_budget(samples: Iterable[float] | None = None) -> float:
 
 
 def announced_test_ids(details: dict[str, Any] | None) -> list[str]:
-    """Inventory explicit public scenario IDs, independent of a worker's answer."""
+    """Scenario IDs the answer must report, independent of a worker's answer.
+
+    The submit template rows (and structured MVS rows) are authoritative: when they exist, only their IDs are
+    required. Prose is scanned only when no structured rows exist, and a bare ID such as ``TC-01`` is dropped
+    when a qualified ID ending in it (``BUG-09-TC-01``) exists. (I5NLYST2: "schedules from TC-01 may stay" in
+    the MVS text made the gate demand a TC-01 row that the official schema does not allow.)
+    """
     details = details or {}
-    ids: set[str] = set()
+    structured: set[str] = set()
+    prose: set[str] = set()
 
     def walk(value: Any, rows: bool = False) -> None:
         if isinstance(value, list):
@@ -91,16 +98,18 @@ def announced_test_ids(details: dict[str, Any] | None) -> list[str]:
             if rows:
                 identifier = value.get("id") or value.get("testCaseId") or value.get("scenarioId")
                 if isinstance(identifier, str) and identifier.strip():
-                    ids.add(identifier.strip())
+                    structured.add(identifier.strip())
             for name in ("testResults", "scenarios", "testCases", "cases", "tests", "minimumVerificationScenarios", "mvs"):
                 if name in value:
                     walk(value[name], True)
         elif isinstance(value, str):
-            ids.update(re.findall(r"\b(?:[A-Z0-9]+-)*(?:TC|MVS|SCENARIO|TEST)-\d+(?:-[A-Za-z0-9]+)*\b", value))
+            prose.update(re.findall(r"\b(?:[A-Z0-9]+-)*(?:TC|MVS|SCENARIO|TEST)-\d+(?:-[A-Za-z0-9]+)*\b", value))
 
     walk(details.get("submitTemplate", {}))
     walk(details.get("minimumVerificationScenarios", details.get("mvs")), True)
-    return sorted(ids)
+    if structured:
+        return sorted(structured)
+    return sorted(i for i in prose if not any(o != i and o.endswith("-" + i) for o in prose))
 
 
 def mvs_status(required_ids: Iterable[str], answer: dict[str, Any] | None,
