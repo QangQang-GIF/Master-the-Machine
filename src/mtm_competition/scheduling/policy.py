@@ -9,6 +9,7 @@ are marked as hypotheses in the solution document:
 
 - ``MTM_PARTIAL_SUBMIT_TYPES`` (default ``TASK``): item types whose honest PARTIAL may be submitted. The
   public rules only say a graded submission is PASSED or FAILED, so BUG/CR/PI PARTIAL stay off by default.
+  A Heavy item (announced to score per finished test case) may always submit an honest PARTIAL.
 - ``MTM_MAX_REWORK`` (default 1): extra attempts after a final result that is not good enough.
 - ``MTM_MIN_REWORK_SECONDS`` (default 300): a rework is pointless with less time than this left.
 - ``MTM_SUBMIT_P95_DEFAULT_SECONDS`` (default 60) / ``MTM_SUBMIT_SAFETY_MARGIN_SECONDS`` (default 30):
@@ -151,7 +152,7 @@ class Decision:
 
 def decide(*, item_type: str, phase: str, item_open: bool, time_left: Optional[float],
            result: dict[str, Any] | None, answer_status: Optional[str], rework_count: int,
-           budget: float, ready_age: Optional[float] = None) -> Decision:
+           budget: float, ready_age: Optional[float] = None, heavy: bool = False) -> Decision:
     """The single decision for one item. ``time_left`` is min(match remaining, item deadline slack)."""
     item_type = str(item_type or "").upper()
     must_finalize = time_left is not None and time_left <= budget
@@ -193,7 +194,8 @@ def decide(*, item_type: str, phase: str, item_open: bool, time_left: Optional[f
             out(CLOSE, "DONE claimed but MVS not passed; answer must be corrected to an honest status")
 
     if status == "PARTIAL":
-        if item_type not in partial_submit_types():
+        # A Heavy item scores every finished test case, so its honest PARTIAL is always submittable.
+        if item_type not in partial_submit_types() and not heavy:
             return out(REWORK, f"{item_type} PARTIAL is not submitted by policy") if can_rework else \
                 out(CLOSE, f"{item_type} PARTIAL is not submitted by policy")
         if must_finalize or not can_rework:

@@ -489,3 +489,12 @@ def test_policy_hold_for_review_is_time_bounded():
     assert policy.decide(**kwargs, ready_age=5).action == policy.HOLD_FOR_REVIEW
     assert policy.decide(**kwargs, ready_age=600).action == policy.SUBMIT
     assert policy.decide(**{**kwargs, "item_type": "PI"}, ready_age=5).action == policy.SUBMIT
+
+
+def test_policy_heavy_partial_is_submittable_without_rework_time():
+    d = policy.decide(item_type="CR", phase="READY_TO_INTEGRATE", item_open=True, time_left=280,
+                      result={"status": "PARTIAL"}, answer_status="PARTIAL", rework_count=0, budget=90, heavy=True)
+    assert d.action == policy.SUBMIT
+    d = policy.decide(item_type="CR", phase="READY_TO_INTEGRATE", item_open=True, time_left=280,
+                      result={"status": "PARTIAL"}, answer_status="PARTIAL", rework_count=0, budget=90)
+    assert d.action == policy.CLOSE

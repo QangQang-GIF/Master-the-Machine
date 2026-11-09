@@ -14,6 +14,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Sequence
@@ -324,6 +325,143 @@ class ProjectRuntime:
                 results.append(create)
         return results
 
+    # ---- Per-worker application database -------------------------------------------------
+    # Workers used to share one DATABASE_URL (<base>_<match>): every worker's QA seed, dev server
+    # and screenshots read and wrote the same rows, so one item's fixture data polluted another's
+    # evidence. A worker now gets its own copy, cloned from a pristine template the root prepares.
+    # The shared database remains the fallback whenever a private copy cannot be made.
+
+    def worker_db_isolation_enabled(self) -> bool:
+        return (self.worker_id != "main" and bool(self.env.get("DATABASE_URL"))
+                and os.environ.get("MTM_WORKER_DB_ISOLATION", "1") != "0")
+
+    def _db_target(self, url: str) -> dict:
+        parts = urlsplit(url)
+        name = (parts.path or "").lstrip("/")
+        if not _IDENT.fullmatch(name):
+            raise ValueError("invalid derived database name")
+        return {"parts": parts, "name": name, "user": parts.username or "",
+                "host": parts.hostname or "localhost", "port": str(parts.port or 5432),
+                "pw": {"PGPASSWORD": parts.password} if parts.password else None}
+
+    def _with_db_name(self, url: str, name: str) -> str:
+        parts = urlsplit(url)
+        return urlunsplit((parts.scheme, parts.netloc, "/" + name, parts.query, parts.fragment))
+
+    def template_db_name(self, shared_url: str | None = None) -> str:
+        return self._bounded_db_name(self._db_target(shared_url or self.env["DATABASE_URL"])["name"], "tpl")
+
+    def worker_app_db_name(self, shared_url: str | None = None) -> str:
+        return self._bounded_db_name(self._db_target(shared_url or self.env["DATABASE_URL"])["name"], f"{self.worker_id}_app")
+
+    def _pg(self, tool: str, t: dict, *args: str, timeout: float = 15) -> CommandResult:
+        return self.run([tool, "-w", "-h", t["host"], "-p", t["port"], "-U", t["user"], *args],
+                        timeout=timeout, _env_overrides=t["pw"])
+
+    def _db_exists(self, t: dict, name: str) -> bool:
+        res = self._pg("psql", t, "-d", "postgres", "-Atqc", f"SELECT 1 FROM pg_database WHERE datname = '{name}'", timeout=5)
+        return res.ok and res.stdout.strip() == "1"
+
+    def refresh_template_database(self) -> CommandResult | None:
+        """Root only, right after migrate+seed: snapshot the pristine shared DB as the worker template."""
+        if self.worker_id != "main" or not self.env.get("DATABASE_URL") or os.environ.get("MTM_WORKER_DB_ISOLATION", "1") == "0":
+            return None
+        try:
+            t = self._db_target(self.env["DATABASE_URL"])
+            if not t["user"]:
+                return None
+            tpl = self.template_db_name()
+            self._pg("dropdb", t, "--if-exists", tpl, timeout=20)
+            return self._pg("createdb", t, "-T", t["name"], tpl, timeout=60)
+        except Exception as exc:  # never fail preparation because of the optional template
+            sys.stderr.write(f"[mtm] worker template database not created: {exc}\n")
+            return None
+
+    def ensure_worker_app_database(self) -> str:
+        """Point DATABASE_URL at this worker's private copy, creating it on first use.
+
+        Order: existing copy -> clone of the pristine template -> clone of the shared DB -> empty DB
+        with migrate + seed. If all of these fail the shared database is kept (previous behaviour),
+        so a worker is never left without a database. Returns what happened, for diagnostics.
+        """
+        if not self.worker_db_isolation_enabled():
+            return "disabled"
+        shared_url = self.env["DATABASE_URL"]
+        try:
+            t = self._db_target(shared_url)
+            if not t["user"]:
+                return "shared:no-role"
+            name = self.worker_app_db_name(shared_url)
+            worker_url = self._with_db_name(shared_url, name)
+            if self._db_exists(t, name):
+                self.env["DATABASE_URL"] = worker_url
+                return "existing"
+            for source in (self.template_db_name(shared_url), t["name"]):
+                if not self._db_exists(t, source):
+                    continue
+                for attempt in range(3):
+                    if self._pg("createdb", t, "-T", source, name, timeout=60).ok or self._db_exists(t, name):
+                        self.env["DATABASE_URL"] = worker_url
+                        return f"cloned:{'template' if source != t['name'] else 'shared'}"
+                    time.sleep(0.5 * (attempt + 1))  # template briefly in use by a parallel clone
+            created = self._pg("createdb", t, name, timeout=30)
+            if not (created.ok or self._db_exists(t, name)):
+                return "shared:create-failed"
+            self.env["DATABASE_URL"] = worker_url
+            scripts = self._manifest().get("scripts", {})
+            steps = []
+            if "db:deploy" in scripts:
+                steps.append(self._package_cmd("run", "db:deploy"))
+            elif (self.app_root / "prisma" / "migrations").is_dir():
+                steps.append(self._package_cmd("exec", "prisma", "migrate", "deploy"))
+            if "db:seed" in scripts:
+                steps.append(self._package_cmd("run", "db:seed"))
+            for step in steps:
+                if not self.run(step, timeout=300).ok:
+                    self.env["DATABASE_URL"] = shared_url
+                    self._pg("dropdb", t, "--if-exists", name, timeout=20)
+                    return "shared:migrate-failed"
+            return "created:migrated"
+        except Exception as exc:
+            self.env["DATABASE_URL"] = shared_url
+            return f"shared:error:{type(exc).__name__}"
+
+    # ---- prisma generate in workers ------------------------------------------------------
+    # Worker worktrees link src/node_modules to the root checkout, so the generated Prisma client
+    # is shared and the root already generated it during preparation. Regenerating from a worker
+    # rewrites the shared engine DLL while other workers' servers hold it open (EPERM on Windows)
+    # and costs time. Workers therefore skip it unless they changed the Prisma schema.
+
+    @staticmethod
+    def is_prisma_generate(argv: Sequence[str]) -> bool:
+        words = [str(a).lower() for a in argv]
+        return "prisma" in words and words.index("prisma") + 1 < len(words) and words[words.index("prisma") + 1] == "generate"
+
+    def worker_schema_changed(self) -> bool:
+        try:
+            res = subprocess.run(["git", "-C", str(self.app_root), "status", "--porcelain", "--", "prisma"],
+                                 capture_output=True, text=True, timeout=10, check=False)
+            if res.returncode != 0:
+                return True  # cannot tell: be safe and generate
+            if res.stdout.strip():
+                return True
+            # Committed schema changes: compare with the commit this worktree started from
+            # (the oldest entry of the worktree's HEAD reflog).
+            log = subprocess.run(["git", "-C", str(self.app_root), "reflog", "--format=%H", "HEAD"],
+                                 capture_output=True, text=True, timeout=10, check=False)
+            entries = log.stdout.split() if log.returncode == 0 else []
+            if not entries:
+                return False
+            diff = subprocess.run(["git", "-C", str(self.app_root), "diff", "--name-only", entries[-1], "HEAD", "--", "prisma"],
+                                  capture_output=True, text=True, timeout=10, check=False)
+            return diff.returncode != 0 or bool(diff.stdout.strip())
+        except (OSError, subprocess.TimeoutExpired):
+            return True
+
+    def skip_worker_prisma_generate(self) -> bool:
+        return (self.worker_id != "main" and os.environ.get("MTM_WORKER_PRISMA_GENERATE", "0") != "1"
+                and not self.worker_schema_changed())
+
     def prepare(self) -> list[CommandResult]:
         """Install dependencies; only the root worker provisions/migrates/seeds and builds."""
         results: list[CommandResult] = []
@@ -338,7 +476,10 @@ class ProjectRuntime:
             if not results[-1].ok: return results
             if any((self.app_root / p).exists() for p in ("prisma/schema.prisma", "prisma/schema")):
                 if self.worker_id != "main":
-                    results.append(self.run(self._package_cmd("exec", "prisma", "generate"), timeout=180))
+                    if self.skip_worker_prisma_generate():
+                        print("[mtm] prisma generate skipped: the root already generated the shared client and the schema is unchanged", file=sys.stderr)
+                    else:
+                        results.append(self.run(self._package_cmd("exec", "prisma", "generate"), timeout=180))
                     return results
                 results.extend(self._ensure_scoped_databases())
                 for script in ("db:generate",):
@@ -355,6 +496,9 @@ class ProjectRuntime:
                 if "db:seed" in manifest.get("scripts", {}):
                     results.append(self.run(self._package_cmd("run", "db:seed"), timeout=300))
                     if not results[-1].ok: return results
+                tpl = self.refresh_template_database()
+                if tpl is not None and not tpl.ok:
+                    sys.stderr.write(f"[mtm] worker template database not created: {tpl.stderr[:200]}\n")
         if self.worker_id != "main":
             return results
         doctor = self.doctor_command()
@@ -383,8 +527,17 @@ def main(argv: Sequence[str] | None = None) -> int:
     session_parser.add_argument("--url")
     session_parser.add_argument("--timeout", type=float, default=300)
     session_parser.add_argument("command", nargs=argparse.REMAINDER)
+    serve_parser = sub.add_parser("serve-start", help="Start (or reuse) one local server for this worker and leave it running")
+    serve_parser.add_argument("--server-script", default="dev")
+    serve_parser.add_argument("--url")
+    serve_parser.add_argument("--timeout", type=float, default=90)
+    sub.add_parser("serve-stop", help="Stop this worker's persistent server")
     args = parser.parse_args(argv)
     runtime = ProjectRuntime(args.match_root, args.match_id, args.worker_id)
+    if runtime.worker_db_isolation_enabled():
+        outcome = runtime.ensure_worker_app_database()
+        if outcome != "existing":
+            print(f"[mtm] worker app database: {outcome}", file=sys.stderr)
     if args.action == "prepare":
         results = runtime.prepare()
         for result in results:
@@ -393,21 +546,40 @@ def main(argv: Sequence[str] | None = None) -> int:
             if result.stderr: print(result.stderr, file=sys.stderr, end="" if result.stderr.endswith("\n") else "\n")
             if not result.ok: return result.returncode or 1
         return 0
-    command = list(args.command)
-    if command[:1] == ["--"]: command = command[1:]
-    if args.action == "session":
+    def server_command(script: str) -> list[str]:
         scripts = runtime._manifest().get("scripts", {})
-        if args.server_script not in scripts:
+        if script not in scripts:
             raise ValueError("Server script must be declared by the current project")
-        server = runtime._package_cmd("run", args.server_script)
+        server = runtime._package_cmd("run", script)
         manifest = runtime._manifest()
         if "next" in {**manifest.get("dependencies", {}), **manifest.get("devDependencies", {})}:
             if runtime._package_manager() == "npm":
                 server.append("--")
             server.extend(["--hostname", "127.0.0.1", "--port", runtime.env["PORT"]])
+        return server
+
+    if args.action in ("serve-start", "serve-stop"):
+        import json as _json
+        sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+        from runner.web_session import start_background_server, stop_background_server
+        if args.action == "serve-stop":
+            print(_json.dumps(stop_background_server(runtime)))
+            return 0
+        res = start_background_server(runtime, server_command(args.server_script), readiness_url=args.url,
+                                      readiness_timeout=args.timeout)
+        print(_json.dumps(res))
+        return 0 if res.get("status") == "READY" else 1
+    command = list(args.command)
+    if command[:1] == ["--"]: command = command[1:]
+    if args.action == "session":
+        server = server_command(args.server_script)
         sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
         from runner.web_session import run_web_session
         result = run_web_session(runtime, server, command, readiness_url=args.url, timeout=args.timeout)
+    elif runtime.is_prisma_generate(command) and runtime.skip_worker_prisma_generate():
+        print("[mtm] prisma generate skipped: the root already generated the shared client and the schema is unchanged; "
+              "run it only after changing prisma/ (set MTM_WORKER_PRISMA_GENERATE=1 to force)")
+        return 0
     else:
         result = runtime.run(command, args.cwd, args.timeout)
     print(result.stdout, end="")

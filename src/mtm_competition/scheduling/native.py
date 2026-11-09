@@ -47,6 +47,12 @@ class NativeTaskCoordinator:
         self.repository_folder = folder.as_posix()
         self.match_id = match_id
         self.max_workers, self.normal_workers = max_workers, normal_workers
+        # Strong lane (MTM_STRONG_SLOT=1): the slots above normal_workers are no longer reserved for
+        # urgent items; they run a stronger model. Heavy items take a free strong slot first; a normal
+        # item only uses it when every normal slot is busy. PI and deadline items keep priority in the
+        # queue but no longer have a slot kept empty for them.
+        self.strong_slot = os.environ.get("MTM_STRONG_SLOT", "0") == "1"
+        self.strong_slots = max(0, max_workers - normal_workers) if self.strong_slot else 0
         # Extra worker slots that ONLY Product Incidents may use, on top of max_workers. PIs arrive at
         # unknown times and are a speed race, so a PI must never wait behind busy ordinary workers.
         self.pi_burst_slots = max(0, min(8, int(pi_burst_slots)))
@@ -115,7 +121,7 @@ class NativeTaskCoordinator:
 
     @staticmethod
     def _key(key: str) -> str:
-        if not isinstance(key, str) or not re.fullmatch(r"(?:TASK|CR|BUG|PI)-[A-Za-z0-9_-]+", key):
+        if not isinstance(key, str) or not re.fullmatch(r"[A-Za-z][A-Za-z0-9]{0,15}-[A-Za-z0-9_-]{1,64}", key):
             raise NativeCoordinationError("Invalid announced backlog key")
         return key
 
@@ -181,6 +187,43 @@ class NativeTaskCoordinator:
         deadline = task.get("deadline_epoch")
         # Any task with a deadline, deadlineMinutes, or PI is urgent so it is never starved or blocked
         return task.get("type") == "PI" or deadline is not None or task.get("deadlineMinutes") is not None
+
+    # ---- Heavy items ----------------------------------------------------------------------
+    # The organizers announced Heavy tasks without publishing their exact metadata shape, so the
+    # check is deliberately broad: an explicit type/flag/tag, a [Heavy] title marker, or a point
+    # value above anything a normal item has carried (>= MTM_HEAVY_MIN_POINTS, default 200).
+    @staticmethod
+    def is_heavy(task: dict) -> bool:
+        def says_heavy(value) -> bool:
+            if isinstance(value, str):
+                return "heavy" in value.lower()
+            if isinstance(value, (list, tuple, set)):
+                return any(says_heavy(v) for v in value)
+            return False
+        for field in ("type", "backlogType", "task_type", "category", "kind", "size", "difficulty",
+                      "complexity", "workload", "class", "tier", "level"):
+            if says_heavy(task.get(field)):
+                return True
+        for flag in ("heavy", "isHeavy", "is_heavy", "heavyTask"):
+            if task.get(flag) is True:
+                return True
+        for field in ("tags", "labels", "flags", "badges"):
+            if says_heavy(task.get(field)):
+                return True
+        key = str(task.get("key", task.get("backlogId", ""))).upper()
+        if key.startswith(("HEAVY", "HVY", "HT-")):
+            return True
+        title = str(task.get("title", task.get("backlogTitle", ""))).lower()
+        if "[heavy]" in title or title.startswith("heavy") or "heavy task" in title:
+            return True
+        head = str(task.get("descriptionMd", task.get("description", "")))[:600].lower()
+        if "heavy task" in head:
+            return True
+        try:
+            min_points = float(os.environ.get("MTM_HEAVY_MIN_POINTS", "200"))
+            return min_points > 0 and float(task.get("points", 0) or 0) >= min_points
+        except (TypeError, ValueError):
+            return False
 
     def _calculate_task_difficulty(self, task: dict) -> float:
         """Calculate estimated task difficulty based on task type, UI keywords, and MVS scenarios."""
@@ -257,7 +300,8 @@ class NativeTaskCoordinator:
         return policy.decide(item_type=task.get("type", ""), phase=row["phase"], item_open=item_open,
                              time_left=self._time_left(task, now, remaining, clock_ready), result=result,
                              answer_status=answer_status, rework_count=int(task.get("rework_count", 0)),
-                             budget=self._submit_budget(db) if budget is None else budget, ready_age=ready_age)
+                             budget=self._submit_budget(db) if budget is None else budget, ready_age=ready_age,
+                             heavy=self.is_heavy(task))
 
     def decide(self, key: str, answer_status: str | None = None) -> dict[str, Any]:
         """The policy decision for one item; the Root follows it instead of re-deriving rules.
@@ -462,6 +506,8 @@ class NativeTaskCoordinator:
             points = float(task.get("points", 0))
             diff = self._calculate_task_difficulty(task)
             roi = points / diff if diff > 0 else points
+            if self.is_heavy(task):
+                roi = float("inf")            # Heavy: longest work starts first among items without deadline
             # S9': the same priority function as the ready queue and the PI gate. A queued item is not
             # submit-ready, so the critical-deadline tier never applies here: PI first, then deadlines, then ROI.
             has_deadline = deadline is not None or task.get("deadlineMinutes") is not None
@@ -475,7 +521,7 @@ class NativeTaskCoordinator:
             is_pi_task = task.get("type") == "PI"
             if not is_pi_task and base_free <= 0:
                 continue                      # burst slots are PI-only
-            if not urgent and normals >= self.normal_workers:
+            if not urgent and normals >= (self.max_workers if self.strong_slot else self.normal_workers):
                 continue
             if self._overlap(busy_paths, task.get("claimed_paths", [])):
                 continue
@@ -530,7 +576,7 @@ class NativeTaskCoordinator:
                     and (task_data.get("type") == "PI" or plan.get("baseSlotsFree", 1) > 0)
                     and row["phase"] == "QUEUED"
                     and row["started"]
-                    and (urgent or normals < self.normal_workers)
+                    and (urgent or normals < (self.max_workers if self.strong_slot else self.normal_workers))
                 ):
                     eligible = task_data
                 else:
@@ -570,15 +616,60 @@ class NativeTaskCoordinator:
             slack = eligible.get("slackSeconds")
             if slack is None:
                 slack = min(remaining, float(deadline) - now if deadline is not None else remaining) if (now is not None and remaining is not None) else (remaining or 2400)
-            budget = min(max(10, int(estimated_seconds)), max(10, int(slack - self.reserve)))
+            # Worker budget = the real hand-off point, not the Root's guess (594OYFBS: estimates of 300 s cut
+            # BUG-01 and CR-01 mid-way and forced restarts). Deadline items stop MTM_DEADLINE_HANDOFF_SECONDS
+            # before their deadline; every item stops MTM_MATCH_HANDOFF_SECONDS before the match ends, leaving
+            # time to commit, integrate and submit (PARTIAL if unfinished). MTM_WORKER_BUDGET_MODE=estimate
+            # restores min(estimate, slack - reserve).
+            if os.environ.get("MTM_WORKER_BUDGET_MODE", "handoff") == "estimate":
+                budget = min(max(10, int(estimated_seconds)), max(10, int(slack - self.reserve)))
+            else:
+                match_handoff = max(self.reserve, int(os.environ.get("MTM_MATCH_HANDOFF_SECONDS", "240")))
+                deadline_handoff = max(self.reserve, int(os.environ.get("MTM_DEADLINE_HANDOFF_SECONDS", "150")))
+                limits = []
+                if remaining is not None:
+                    limits.append(float(remaining) - match_handoff)
+                if deadline is not None and now is not None:
+                    limits.append(float(deadline) - float(now) - deadline_handoff)
+                if not limits:
+                    limits.append(float(slack) - match_handoff)
+                budget = max(10, int(min(limits)))
             worker_model = os.environ.get("MTM_WORKER_MODEL", "gpt-6.1-sol" if os.environ.get("MTM_ENV") == "production" else "gpt-6-luna")
             worker_effort = os.environ.get("MTM_WORKER_EFFORT", "medium" if os.environ.get("MTM_ENV") == "production" else "low")
+            heavy = self.is_heavy(eligible)
+            lane = "normal"
+            if self.strong_slot:
+                running = [json.loads(r["data"]) for r in db.execute("SELECT data FROM tasks WHERE phase='RUNNING'").fetchall()]
+                strong_busy = sum(1 for t in running if t.get("lane") == "strong")
+                normal_busy = len(running) - strong_busy
+                # Heavy and PI items take a free strong slot first (PI: fastest, most careful fix for
+                # the incident); other items only overflow into it when every normal slot is busy.
+                is_pi = str(task_type).upper() == "PI"
+                if strong_busy < self.strong_slots and (heavy or is_pi or normal_busy >= self.normal_workers):
+                    lane = "strong"
+            if lane == "strong":
+                worker_model = os.environ.get("MTM_STRONG_MODEL", "gpt-6.1-sol")
+                worker_effort = os.environ.get("MTM_STRONG_EFFORT", "high")
+            if heavy:
+                # Heavy: stronger reasoning, and the whole remaining window minus a hand-off margin
+                # (stop, commit, integrate, submit an honest PARTIAL) instead of a fixed estimate.
+                worker_model = os.environ.get("MTM_HEAVY_MODEL", "gpt-6.1-sol")
+                worker_effort = os.environ.get("MTM_HEAVY_EFFORT", "high")
+                handoff = max(self.reserve, int(os.environ.get("MTM_HEAVY_HANDOFF_SECONDS", "300")))
+                budget = max(10, int(slack - handoff))
+            skill_type = task_type.lower() if task_type in ("BUG", "CR", "PI", "TASK") else "cr"
             envelope = {"task_id": key, "task_type": task_type, "title": eligible.get("title", key),
                         "description": specification or eligible.get("description") or eligible.get("descriptionMd", ""), "repository_path": str(target),
                         "match_root": str(worker_match), "base_revision": base, "points": int(eligible.get("points", 0)),
                         "deadline_epoch": eligible.get("deadline_epoch"),
-                        "selected_skills": ["mtm-init", f"mtm-{task_type.lower()}-worker", "mtm-verification", "mtm-evidence"],
+                        "selected_skills": ["mtm-init", f"mtm-{skill_type}-worker", "mtm-verification", "mtm-evidence"],
                         "time_budget_seconds": budget, "model": worker_model, "reasoning_effort": worker_effort, "backend": "codex",
+                        "heavy": heavy, "lane": lane,
+                        "agent_profile": "team_heavy_worker" if heavy else ("team_strong_worker" if lane == "strong" else "team_feature_worker"),
+                        "heavy_policy": ("Heavy item: work in priority order of the acceptance criteria / test cases, "
+                                         "commit after each part that passes, keep answers/<key>/submit.json current "
+                                         "with real PASS/FAIL/NOT_RUN rows. When the budget ends, stop and hand off an "
+                                         "honest PARTIAL: every finished test case still scores.") if heavy else None,
                         "evidence_required": details.get("evidence_required", eligible.get("evidence_required", [])),
                         "mvs": self._mvs_list(details.get("minimumVerificationScenarios", details.get("mvs"))),
                         "submit_template": details.get("submitTemplate"), "allowed_paths": [str(worker_match)],
@@ -590,6 +681,7 @@ class NativeTaskCoordinator:
                                      "worker_result_path": str(worker_match / "worker_result.json")}}
             stored = json.loads(row["data"])
             _, server_now, server_remaining = self._clock(db)
+            stored["lane"] = lane
             stored["lease"] = {"start_server_epoch": server_now, "start_remaining_seconds": server_remaining,
                                "budget_seconds": budget}
             # S8': every attempt has its own identity; artifacts and results of another attempt are rejected.

@@ -2054,6 +2054,85 @@ def get_tool_definitions() -> List[Dict[str, Any]]:
     ]
 
 
+
+# ---- Compact tool output for the Root ------------------------------------------------------
+# start_work / claim_task / plan_tasks used to hand the Root every delivered file, the submit
+# template, MVS, company context and the item description - twice per item, plus once per poll.
+# Over a 40-minute match that filled the Root's context (594OYFBS: Codex FAILED mid-match).
+# The full payload is now written to state/<match>/handoff/ and the Root receives a short summary
+# with the file path; the worker reads the file. MTM_COMPACT_ROOT_OUTPUT=0 restores full output.
+
+_BULKY_FIELDS = ("descriptionMd", "description", "start_details", "startInstruction", "files", "companyContext",
+                 "company_context", "submitTemplate", "minimumVerificationScenarios", "mvs", "onStartFiles",
+                 "releaseFiles", "prior_attempts")
+_ENVELOPE_SUMMARY_FIELDS = ("task_id", "task_type", "title", "worker_id", "repository_path", "match_root", "base_revision",
+                            "points", "deadline_epoch", "time_budget_seconds", "model", "reasoning_effort", "backend",
+                            "heavy", "lane", "agent_profile", "heavy_policy", "selected_skills", "allowed_paths",
+                            "evidence_required", "attempt_id", "result_contract")
+
+
+def _safe_name(value: str) -> str:
+    return re.sub(r"[^A-Za-z0-9_.-]+", "_", str(value))[:120] or "item"
+
+
+def compact_root_output(server: "MCPHelperServer", tool_name: str, args: Dict[str, Any], val: Any) -> Any:
+    if os.environ.get("MTM_COMPACT_ROOT_OUTPUT", "1") == "0" or not isinstance(val, dict):
+        return val
+    try:
+        if tool_name == "plan_tasks":
+            out = dict(val)
+            for key in ("selected", "active", "readyToIntegrate", "readyDiagnostics", "skippedReady", "integrationBlocked", "overdueWorkers"):
+                if isinstance(out.get(key), list):
+                    out[key] = [{k: v for k, v in r.items() if k not in _BULKY_FIELDS} if isinstance(r, dict) else r
+                                for r in out[key]]
+            return out
+        if tool_name not in ("start_work", "claim_task"):
+            return val
+        handoff = Path(server.workspace_root) / "team-sdlc-pack" / "state" / _safe_name(server.match_code or "match") / "handoff"
+        handoff.mkdir(parents=True, exist_ok=True)
+        if tool_name == "start_work":
+            key = str(args.get("backlogItemKey", "item"))
+            path = handoff / f"{_safe_name(key)}-start.json"
+            path.write_text(json.dumps(val, indent=1), encoding="utf-8")
+            template = val.get("submitTemplate") if isinstance(val.get("submitTemplate"), dict) else {}
+            rows = [r.get("id") for r in template.get("testResults", []) if isinstance(r, dict)]
+            ctx = val.get("companyContext") or {}
+            return {k: v for k, v in {
+                "backlogItemKey": key, "status": "STARTED", "requestId": val.get("requestId") or val.get("request_id"),
+                "replay": val.get("replay"), "startDetailsPath": str(path),
+                "files": sorted((val.get("files") or {}).keys()) if isinstance(val.get("files"), dict) else None,
+                "unavailableAnnouncedFiles": val.get("unavailableAnnouncedFiles"),
+                "submitTemplateTestIds": rows or None,
+                "submitTemplate": template if template and len(json.dumps(template)) <= 8000 else None,
+                "companyContext": {"kb": len(ctx.get("kb") or []), "logs": len(ctx.get("logs") or [])} if ctx else None,
+                "note": "Full start details are saved at startDetailsPath and reach the worker through claim_task. Do not read them into the Root unless a decision needs them.",
+            }.items() if v is not None}
+        # claim_task
+        env = val.get("taskEnvelope") if isinstance(val.get("taskEnvelope"), dict) else None
+        if env is None:
+            return val
+        path = handoff / f"{_safe_name(val.get('workerId') or args.get('workerId') or 'worker')}-envelope.json"
+        path.write_text(json.dumps(env, indent=1), encoding="utf-8")
+        meta = env.get("metadata") or {}
+        summary = {k: env.get(k) for k in _ENVELOPE_SUMMARY_FIELDS if env.get(k) is not None}
+        summary["full_envelope_path"] = str(path)
+        desc = str(env.get("descriptionMd") or env.get("description") or "")
+        if desc:  # a short excerpt so a worker that skips the file still knows the gist
+            summary["description_excerpt"] = desc[:1200] + ("... [truncated: read full_envelope_path]" if len(desc) > 1200 else "")
+        summary["metadata"] = {k: meta.get(k) for k in ("match_root", "project_runtime_path", "match_id", "worker_id",
+                                                         "worker_result_path", "attempt_id", "worker_checkpoint_path")
+                               if meta.get(k) is not None}
+        if meta.get("company_tools"):
+            summary["metadata"]["company_tools"] = [t.get("name") for t in meta["company_tools"] if isinstance(t, dict)]
+        return {"workerId": val.get("workerId"), "worktreeRoot": val.get("worktreeRoot"), "matchRoot": val.get("matchRoot"),
+                "taskEnvelope": summary, "taskEnvelopePath": str(path),
+                "spawnInstruction": ("Spawn the worker with this compact taskEnvelope as-is. Its first step is to read "
+                                     "taskEnvelope.full_envelope_path (description, delivered files, submit template, MVS, "
+                                     "company context). The Root does not need to read that file.")}
+    except Exception as exc:  # never lose a tool result because compaction failed
+        sys.stderr.write(f"Warning: compact output for {tool_name} failed: {exc}\n")
+        return val
+
 def run_mcp_stdio_server():
     server = MCPHelperServer()
     tools = get_tool_definitions()
@@ -2140,6 +2219,7 @@ def run_mcp_stdio_server():
                 else:
                     raise ValueError(f"Unknown tool: {tool_name}")
 
+                val = compact_root_output(server, tool_name, tool_args, val)
                 res = {
                     "jsonrpc": "2.0",
                     "id": req_id,

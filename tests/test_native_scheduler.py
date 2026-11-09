@@ -393,7 +393,8 @@ def test_stale_clock_does_not_terminalize_ready_result(coordinator):
     assert c.task_details('BUG-01')['phase'] == 'READY_TO_INTEGRATE'
 
 
-def test_overdue_worker_retains_slot_until_confirmed_native_stop(coordinator):
+def test_overdue_worker_retains_slot_until_confirmed_native_stop(coordinator, monkeypatch):
+    monkeypatch.setenv('MTM_WORKER_BUDGET_MODE', 'estimate')  # exercises the estimate-based budget
     c = coordinator
     projection(c, item(), item('TASK-01'))
     start(c, 'BUG-01'); c.claim_task('BUG-01', 'worker', estimated_seconds=10)
@@ -409,7 +410,8 @@ def test_overdue_worker_retains_slot_until_confirmed_native_stop(coordinator):
         c.reconcile_worker('BUG-01', confirmed_stopped=False, reason='budget exceeded', requeue=True)
 
 
-def test_overdue_budget_excludes_official_pause_duration(coordinator):
+def test_overdue_budget_excludes_official_pause_duration(coordinator, monkeypatch):
+    monkeypatch.setenv('MTM_WORKER_BUDGET_MODE', 'estimate')  # exercises the estimate-based budget
     c = coordinator
     projection(c, item()); start(c, 'BUG-01'); c.claim_task('BUG-01', 'worker', estimated_seconds=10)
     c.register_projection({'status': 'PAUSED', 'server_epoch': 1_000_005,
