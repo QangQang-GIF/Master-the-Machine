@@ -1,35 +1,61 @@
 ---
 name: mtm-bug-worker
-description: Reproduce, minimally fix, and verify an announced MTM BUG item inside the ProjectRuntime sandbox.
+description: BUG worker - read the brief and grading first, reproduce with the official MVS file, fix the cause at the named module (keeping its API), add tests for the hidden boundary cases, capture every required evidence item.
 ---
 
-# BUG (Defect Fix — Sandbox Fast Path)
+# BUG — reproduce, fix the cause, prove every scenario
 
-Follow `mtm-init` and `mtm-worker`. Root owns Start Work, integration, push, and Submit.
+Follow `mtm-init`, `mtm-worker`, `mtm-verification`, `mtm-evidence`. Root owns Start Work, push and Submit.
+Lessons from graded matches: a scenario reported `NOT_RUN` scores 0 even when the fix works; about half of a BUG's
+points come from organizer hidden tests on boundaries; the grader restores the original test/config files and runs
+the whole suite and the type check itself.
 
-1. **Mandatory Sandbox Commands**:
-   - Run all CLI/test/seed commands via:
-     `python3 "<metadata.project_runtime_path>" --match-root "<match_root>" --match-id "<metadata.match_id>" --worker-id "<worker_id>" run -- <cmd>`
-   - Run all browser/UI checks via:
-     `python3 "<metadata.project_runtime_path>" --match-root "<match_root>" --match-id "<metadata.match_id>" --worker-id "<worker_id>" session -- <cmd>`
-   - NEVER manually spawn `pnpm dev`, `pnpm build`, or `pnpm start`.
+## 1. Read before touching code (first 2–3 minutes)
+Read in this order and write down what you find:
+1. `challenge/<key>.md`: **Requirements** (the module/function to fix and the names that must not change),
+   **Acceptance criteria**, **Grading** (MVS replay? hidden tests? browser replay? reported figures?),
+   **Out of scope**, the deadline and the maximum score.
+2. `challenge/<key>-minimum-verification-scenarios.md`: every TC id, its data, expected result, the exact
+   evidence file names, and the exact command that writes each log.
+3. `challenge/<key>-submit.json` + schema: rows to keep, extra fields to fill (figures, records).
+4. Every other provided file (`*-mvs.test.ts`, `*-seed.ts`, `*-report.ts`, `*-run-checks.mjs`, check scripts)
+   and, for an app that must be built/served, the commands in `env-require/README.md` ("Commands during the match").
+5. If the brief cites company standards, a ticket or "the knowledge base": `kb_search` them and save the articles.
+   The standard, not your intuition, defines correct behaviour; the hidden tests follow it to the letter.
 
-2. **Fast Paths by BUG Archetype**:
-   - **`BUG-01` (Responsive Shell / Layout)**:
-     - Fix layout CSS in `src/components/layout/`.
-     - Inside a single `project_runtime.py ... session` wrapper script, run `node ../challenge/BUG-01-layout-check.mjs http://127.0.0.1:$PORT development ../answers/BUG-01/evidence/layout-report-dev.json`, `node ../challenge/BUG-01-layout-check.mjs http://127.0.0.1:$PORT production ../answers/BUG-01/evidence/layout-report-prod.json`, and capture `desktop-1440x900.png` & `mobile-390x844.png`! (Do NOT run `pnpm build` — `BUG-01-layout-check.mjs` only tags the mode argument in JSON).
-   - **`BUG-02` (Client Currency Propagation)**:
-     - Verify `answers/BUG-02/evidence/bug-02-test-data.json` exists (pre-fetched by Root; NEVER overwrite with synthetic data).
-     - Copy `challenge/BUG-02-seed.ts` -> `src/prisma/seed-bug02.ts` and `challenge/BUG-02-report.ts` -> `src/prisma/report-bug02.ts`.
-     - Fix currency propagation in `src/` and add unit tests.
-     - Run `node ../challenge/BUG-02-run-checks.mjs` via `project_runtime.py ... run` to write `answers/BUG-02/evidence/test.log`.
-     - Run `pnpm tsx prisma/seed-bug02.ts ../answers/BUG-02/evidence/bug-02-test-data.json` via `project_runtime.py ... run`, then execute a small `pnpm tsx` script using `~/server/db` and `postInvoiceIssued` / `postPaymentReceived` / `refreshInvoiceStatus` to create & issue the VND invoice (lines `25000000`, `18500000`, `6500000` = `50000000`), record the VND payment (`20000000` -> `PARTIAL`), and create & issue the USD invoice (`150000`, `85000` = `235000` -> `SENT`).
-     - Run `pnpm tsx prisma/report-bug02.ts ../answers/BUG-02/evidence/bug-02-test-data.json ../answers/BUG-02/evidence/currency-report.txt` via `project_runtime.py ... run`.
-     - Capture `tc-01-vnd-invoice.png`, `tc-02-vnd-partial-paid.png`, `tc-03-usd-invoice.png` in ONE `project_runtime.py ... session` pass. Remove temporary `src/prisma/*-bug02.ts` helper files before committing.
-   - **`BUG-03` (Invoice Status Precedence — Pure Logic)**:
-     - **NO browser, NO web server!**
-     - Ensure `challenge/BUG-03-mvs.test.ts` is copied to `src/tests/bug-03-mvs.test.ts` and committed.
-     - Fix `src/src/lib/invoice-status.ts`, run `pnpm test` and `pnpm typecheck` via `project_runtime.py ... run`, save required logs, fill `submit.json` (`status: "DONE"`), commit, and finish in < 90s.
-   - **`BUG-04` (Kanban Card Reorder Position)**:
-     - Ensure `challenge/BUG-04-mvs.test.ts` is copied to `src/tests/bug-04-mvs.test.ts` and committed!
-     - Fix `src/src/lib/position.ts`, write `mvs-tests.log` (`command: pnpm vitest run tests/bug-04-mvs.test.ts` ... `exit_code: 0`) and `typecheck.log` (`command: pnpm typecheck` ... `exit_code: 0`) via `project_runtime.py ... run`, and capture `tc-02-top-order.png` via `project_runtime.py ... session`.
+## 2. Reproduce
+- Copy the official `*-mvs.test.ts` to the location the MVS file names, unchanged. Run it on the unfixed code:
+  it must fail for the reported reason. That failure is your reproduction.
+- Official data: get it with `fetch_fixture` / the QA test data store and save it **unchanged** under the exact
+  evidence name. A fixture that is not the store's file zeroes every scenario that uses it. Never write your own.
+- Bugs with several causes (tickets, imports, transfers): list each symptom and find each cause separately.
+
+## 3. Fix the cause, not the example
+- Change the module the Requirements name. Keep module paths, exported names, signatures, handler names,
+  database schema and migrations exactly; hidden tests call them directly.
+- Implement the rule for every case the brief/KB describes (boundaries such as "on the due date", "exactly 7 days",
+  "at the end of any window", currencies, empty/zero/negative, repeated operations). Hard-coding examples fails.
+- Keep behaviour the brief says must not change (other statuses, other currencies, other drop positions...).
+
+## 4. Tests that the grader will count
+- Add NEW test files only (where the brief says, e.g. `src/tests/` or next to the module); never edit, skip or
+  weaken existing tests. Cover each acceptance criterion and each boundary, including "unchanged" behaviour.
+- Run the targeted tests, the whole existing suite and the type check through ProjectRuntime
+  (`python3 "<metadata.project_runtime_path>" ... run -- <command from the MVS/README>`). Use the project's own
+  commands (`yarn`/`node .../vitest.mjs` or `pnpm`, as the files say); do not assume a package manager.
+
+## 5. Evidence for every TC row (cheap points)
+- Write each log with the exact command and path from the MVS file.
+- Screenshots: from the app you built and served yourself (README commands), at the viewport the MVS states
+  (desktop ≥ 1280×720 unless told otherwise), named exactly as required. A required PNG missing turns the row into
+  `NOT_RUN` = 0 points, so capture screenshots before polishing anything else.
+- Reported figures (balances, counts, lists): compute them by running the fixed application/scripts on the official
+  data, never by hand.
+
+## 6. Hand off
+- `submit.json`: keep the template rows/fields; `PASS` only when the check really passed and its evidence exists;
+  honest `FAIL`/`NOT_RUN` otherwise; `status` DONE only when every row is PASS. Fill the engineering record
+  (observed vs expected, root cause, change, verification).
+- Commit source, new tests, MVS test copy, evidence and `submit.json`; remove temporary helper copies the brief says
+  not to commit. Write `worker_result.json` with the real test commands and exit codes.
+- Short deadline (≤ 20 min): reproduce → fix → MVS log → submit.json first; extra tests and polish only after.

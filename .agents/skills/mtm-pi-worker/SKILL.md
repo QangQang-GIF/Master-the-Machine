@@ -15,6 +15,12 @@ The answer fields usually carry more points than the fix: settle them first, the
   (`context.seq`) over the whole log", "distinct transactions while a faulty release was live",
   "sum of absolute amountMinor"). Each word changes the number.
 - The brief may warn that not every alarm is related. Treat every alarm as a hypothesis to test, never as the answer.
+- Check **Out of scope**: some PIs forbid changing the application source (report only); others require a fix.
+  Check for a deadline: a PI can close 15 minutes after release.
+- Note each field's JSON type and form: release names, component names, flag names, ids "exactly as found";
+  set fields (e.g. affected invoices/schedules) must be complete and contain nothing else.
+- `kb_search` the company's **incident report / incident analysis rules**: they define names, scope and what counts
+  (e.g. retries once, only while a faulty release was live). Apply them literally in the script.
 
 ## 1. Collect complete evidence with tools (no manual paging)
 - `kb_search` the incident topic and every rule/article id the brief or logs mention; save the articles.
@@ -40,13 +46,21 @@ Save the script output to `answers/<key>/evidence/analysis.json`. Fill `submit.j
 If coverage is incomplete (`complete: false`), say so in the answer and keep collecting; never write a
 placeholder number as if it were measured.
 
-## 3. Fix the code (minimal, verified)
+## 3. Fix the code (minimal, verified) — only when the brief asks for a fix
 - Locate the faulty logic named by the release notes and the analysis (search `src/` for the function that
   implements the documented rule). Make the minimal change that makes the code follow the KB rule.
 - Add or update a focused unit test that reproduces a logged wrong decision and passes after the fix.
 - Run only the targeted test and the type check through the project runtime:
   `python3 "<metadata.project_runtime_path>" --match-root "<match_root>" --match-id "<metadata.match_id>" --worker-id "<worker_id>" run -- <test command>`
   Do not start a web server or browser unless the submit template requires a screenshot.
+
+## Priorities for speed and accuracy
+- Speed comes from tools and scripts, not from skipping checks: one `collect_logs` per service instead of paging,
+  one analysis script instead of reasoning over pages.
+- Order: brief → KB rules/release notes → complete logs → script → fields → (fix) → hand off. Never start the fix
+  before the fields are computed: fields usually carry most of the points.
+- Time-box: if coverage is still incomplete after ~10 minutes, narrow the collection (service, message, release
+  words) instead of reading entries by hand.
 
 ## 4. Hand off fast
 - `submit.json`: exact strings and integers (no prefixes, quotes, spaces or explanations), `incidentRecord`
