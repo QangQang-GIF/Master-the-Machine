@@ -272,7 +272,8 @@ class NativeTaskCoordinator:
                     **self._decision(db, row, now, remaining, clock_ready, answer_status=answer_status).to_dict()}
 
     def seconds_to_next_deadline_action(self) -> float | None:
-        """Seconds until the next deadline item reaches its flush request (running) or must_finalize (ready)."""
+        """Seconds until the next item reaches its flush request (running) or must_finalize (ready); the time
+        left of an item is min(its deadline, match end)."""
         with self._db() as db:
             status, now, remaining = self._clock(db)
             if now is None or remaining is None:
@@ -281,8 +282,6 @@ class NativeTaskCoordinator:
             waits = []
             for row in db.execute("SELECT * FROM tasks WHERE phase IN ('RUNNING','READY_TO_INTEGRATE')").fetchall():
                 task = json.loads(row["data"])
-                if task.get("deadline_epoch") is None:
-                    continue
                 left = self._time_left(task, now, remaining, True)
                 lead = budget + (self.flush_lead_seconds if row["phase"] == "RUNNING" else 0.0)
                 if left - lead > 0:
@@ -346,7 +345,9 @@ class NativeTaskCoordinator:
         for row in active:
             task = json.loads(row["data"])
             key, attempt_id = row["key"], task.get("attempt_id")
-            slack = self._time_left(task, now, remaining, clock_ready) if task.get("deadline_epoch") is not None else None
+            # Time left = min(item deadline, match end): an item without deadline still has to hand off
+            # before the match ends (7DIJ089J: BUG-09/TASK-08/PI-02 finished too close to the end).
+            slack = self._time_left(task, now, remaining, clock_ready) if running else None
             result_file = Path(row["worktree"]) / self.repository_folder / "worker_result.json" if row["worktree"] else None
             if result_file is not None and result_file.is_file():
                 try:

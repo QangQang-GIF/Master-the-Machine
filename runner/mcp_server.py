@@ -247,6 +247,47 @@ class MCPHelperServer:
             raise RuntimeError("Company tools bridge not initialized (missing match credentials or match ID).")
         return self.company_tools_client.call_tool(name, arguments)
 
+    def collect_logs(self, query: str = "", service: str = "", out_path: Optional[str] = None,
+                     tool: str = "search_logs", max_calls: int = 600) -> Dict[str, Any]:
+        """Collect EVERY matching production-log entry (search_logs caps each call at ~20 newest entries).
+
+        Narrows by timestamp prefix until every partition is complete, deduplicates by context.seq and writes
+        all entries, ordered by context.seq, to a JSON file. Returns only a summary plus the file path, so the
+        worker computes counts/first entries/sums with a script instead of reading pages into its context.
+        """
+        from mtm_competition.adapters.log_collector import collect_all
+
+        def search(q: str, svc: str) -> Dict[str, Any]:
+            args: Dict[str, Any] = {"query": q}
+            if svc:
+                args["service"] = svc
+            return self.call_company_tool(tool, args)
+
+        result = collect_all(search, query or "", service or "", max_calls=max(10, min(int(max_calls), 2000)))
+        base = Path(self.workspace_root) / "team-sdlc-pack" / "state" / str(self.match_code or self.match_uuid or "match") / "logs"
+        if out_path:
+            target = Path(out_path)
+            allowed = [base.resolve()]
+            if self.checkout_root:
+                allowed.append(Path(self.checkout_root).resolve().parent)
+            if not target.is_absolute() or not any(target.resolve().is_relative_to(a) for a in allowed):
+                raise ValueError("outPath must be an absolute path inside a worker worktree or the match state folder")
+        else:
+            digest = hashlib.sha256(f"{tool}|{service}|{query}".encode("utf-8")).hexdigest()[:12]
+            target = base / f"{(service or 'all')}-{digest}.json"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        payload = json.dumps({k: v for k, v in result.items()}, ensure_ascii=False, indent=1)
+        target.write_text(payload, encoding="utf-8")
+        entries = result["entries"]
+        first, last = (entries[0], entries[-1]) if entries else ({}, {})
+        return {"path": str(target), "sha256": hashlib.sha256(payload.encode("utf-8")).hexdigest(),
+                "total": result["total"], "unique": result["unique"], "complete": result["complete"],
+                "calls": result["calls"], "elapsedSeconds": result["elapsedSeconds"],
+                "incompletePartitions": result["incompletePartitions"][:10],
+                "firstEntry": {k: first.get(k) for k in ("ts", "service", "message", "context")} if first else None,
+                "lastEntry": {k: last.get(k) for k in ("ts", "service", "message", "context")} if last else None,
+                "note": "Entries are ordered by context.seq. Analyse the file with a script; do not paste it into context."}
+
     def fetch_fixture(
         self,
         backlog_item_key: str,
@@ -2039,6 +2080,19 @@ def get_tool_definitions() -> List[Dict[str, Any]]:
             },
         },
         {
+            "name": "collect_logs",
+            "description": "Collect ALL production-log entries matching query/service (search_logs returns only ~20 newest per call). Narrows by timestamp automatically, writes every entry ordered by context.seq to a JSON file and returns a summary with the path and complete=true/false. Use it for any count, first/last entry or sum over logs, then compute with a script.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "Words that must all appear in an entry (may be empty)"},
+                    "service": {"type": "string", "description": "Optional service filter, e.g. rule-engine, deploy"},
+                    "outPath": {"type": "string", "description": "Absolute output path inside your worktree, e.g. <match_root>/answers/<key>/evidence/logs-rule-engine.json"},
+                    "maxCalls": {"type": "integer", "minimum": 10, "maximum": 2000, "default": 600},
+                },
+            },
+        },
+        {
             "name": "fetch_fixture",
             "description": "Fetch official QA test data fixture from Match MCP and save into answers/<key>/evidence/<id>-test-data.json with .source.json sidecar.",
             "inputSchema": {
@@ -2210,6 +2264,9 @@ def run_mcp_stdio_server():
                     val = server.list_company_tools()
                 elif tool_name == "call_company_tool":
                     val = server.call_company_tool(tool_args.get("name", ""), tool_args.get("arguments", {}))
+                elif tool_name == "collect_logs":
+                    val = server.collect_logs(tool_args.get("query", ""), tool_args.get("service", ""),
+                                              tool_args.get("outPath"), max_calls=tool_args.get("maxCalls", 600))
                 elif tool_name == "fetch_fixture":
                     val = server.fetch_fixture(
                         tool_args.get("backlogItemKey", ""),

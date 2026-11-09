@@ -493,3 +493,12 @@ def test_policy_hold_for_review_is_time_bounded():
     assert policy.decide(**kwargs, ready_age=5).action == policy.HOLD_FOR_REVIEW
     assert policy.decide(**kwargs, ready_age=600).action == policy.SUBMIT
     assert policy.decide(**{**kwargs, "item_type": "PI"}, ready_age=5).action == policy.SUBMIT
+
+
+def test_flush_request_also_near_match_end_for_items_without_deadline(tmp_path):
+    c = coordinator(tmp_path, [{"key": "BUG-09", "type": "BUG", "status": "OPEN", "points": 80}], remaining=2400)
+    started_claim(c, "BUG-09", "w1")
+    c.register_projection({"status": "RUNNING", "server_epoch": 3300, "remaining_seconds": 140})
+    plan = c.plan_tasks()
+    assert [r["key"] for r in plan["deadlineFlushRequests"]] == ["BUG-09"]
+    assert c.task_details("BUG-09")["phase"] == "RUNNING"

@@ -58,3 +58,4 @@ Follow `mtm-init` boundaries, TaskEnvelope constraints, and returned submit temp
    - Plan the acceptance criteria / test cases first, then deliver them in priority order. After each part that genuinely passes, commit it and update `answers/<key>/submit.json` (real PASS/FAIL/NOT_RUN rows, `status: "PARTIAL"` until everything passes).
    - Do not wait for the whole item to be finished before committing: an uncommitted half-done item scores nothing.
    - When the budget ends or Root asks you to stop, stop coding, make sure the last committed `submit.json` matches what is really verified, and write `worker_result.json`.
+   - **Production logs**: for any count, first/last entry or sum over logs, use the MCP tool `collect_logs(query, service, outPath)` (it returns every entry, not just the newest 20) and compute with a script over the saved file.
