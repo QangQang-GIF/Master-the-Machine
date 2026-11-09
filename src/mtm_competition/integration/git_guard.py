@@ -60,6 +60,37 @@ def is_forbidden_path(rel_path: Path | str) -> tuple[bool, str]:
     return False, ""
 
 
+def answer_field_differences(committed: Any, payload: Any, path: str = "$", limit: int = 10) -> list[str]:
+    """Field-level parity diff (no Unicode normalization): shows exactly which field and code points differ."""
+    out: list[str] = []
+
+    def walk(a: Any, b: Any, where: str) -> None:
+        if len(out) >= limit:
+            return
+        if isinstance(a, dict) and isinstance(b, dict):
+            for k in sorted(set(a) | set(b), key=str):
+                if k not in a or k not in b:
+                    out.append(f"{where}.{k}: present only in {'commit' if k in a else 'payload'}")
+                else:
+                    walk(a[k], b[k], f"{where}.{k}")
+        elif isinstance(a, list) and isinstance(b, list):
+            if len(a) != len(b):
+                out.append(f"{where}: list length {len(a)} (commit) != {len(b)} (payload)")
+            for i, (x, y) in enumerate(zip(a, b)):
+                walk(x, y, f"{where}[{i}]")
+        elif type(a) is not type(b) or a != b:
+            if isinstance(a, str) and isinstance(b, str):
+                idx = next((i for i, (x, y) in enumerate(zip(a, b)) if x != y), min(len(a), len(b)))
+                ca = f"U+{ord(a[idx]):04X}" if idx < len(a) else "end"
+                cb = f"U+{ord(b[idx]):04X}" if idx < len(b) else "end"
+                out.append(f"{where}: first difference at char {idx} (commit {ca}, payload {cb})")
+            else:
+                out.append(f"{where}: {type(a).__name__} {a!r:.60} (commit) != {type(b).__name__} {b!r:.60} (payload)")
+
+    walk(committed, payload, path)
+    return out
+
+
 def extract_required_evidence(text: str) -> set[str]:
     """Dynamically parse scenario markdown or task text to extract expected evidence filenames."""
     import re
@@ -349,9 +380,11 @@ class PreSubmissionGitGuard:
 
             if answer_payload is not None:
                 if committed_answer != answer_payload:
+                    diffs = answer_field_differences(committed_answer, answer_payload)
                     msg = (
                         f"Commit answer parity mismatch for task {backlog_item_key}: "
-                        f"'{tree_path}' in commit {full_sha} does not match answer payload"
+                        f"'{tree_path}' in commit {full_sha} does not match answer payload; "
+                        f"differing fields: {diffs}"
                     )
                     if raise_on_error:
                         raise SubmissionGateError(msg)
@@ -403,17 +436,18 @@ class PreSubmissionGitGuard:
                             if "id" in tr:
                                 seen_ids.add(tr_id)
                             tr_res = tr.get("result")
-                            if not allow_partial and tr_res != "PASS":
+                            # Fail closed: a DONE answer needs every test case PASS. The status is never
+                            # downgraded here (Solution v3, principle 3); only an honest PARTIAL answer
+                            # submitted with allow_partial may carry FAIL/NOT_RUN rows.
+                            if tr_res != "PASS" and (not allow_partial or overall_status != "PARTIAL"):
                                 msg = (
-                                    f"Submission Gate Hard Rule: Test case '{tr_id}' has result '{tr_res}'. "
-                                    f"Every test case must evaluate to 'PASS' before submission! "
-                                    f"(Never submit NOT_RUN or FAIL to Game Master)."
+                                    f"Submission Gate Hard Rule: Test case '{tr_id}' has result '{tr_res}' "
+                                    f"in a '{overall_status}' answer. A DONE answer needs every test case PASS; "
+                                    f"report an unfinished item honestly as PARTIAL."
                                 )
                                 if raise_on_error:
                                     raise SubmissionGateError(msg)
                                 return ValidationResult(valid=False, error_message=msg)
-                            elif allow_partial and overall_status == "DONE" and tr_res != "PASS":
-                                committed_answer["status"] = "PARTIAL"
                 missing_ids = required_ids - seen_ids
                 if missing_ids:
                     msg = f"Submission Gate: Missing required test results for task {backlog_item_key}: {sorted(missing_ids)}"

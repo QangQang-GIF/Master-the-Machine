@@ -85,7 +85,8 @@ def _ready(c, key, worker):
     c.record_worker_result(key, _result(key, worker))
 
 
-def test_in_flight_submit_not_stolen_at_lease_but_reclaimed_after_ttl(tmp_path):
+def test_in_flight_submit_not_stolen_at_lease_nor_after_ttl(tmp_path):
+    """Solution v3 S4: an unknown Submit outcome never releases the lock on a timer; it needs reconciliation."""
     c = _coordinator(tmp_path, [{"key": "CR-01", "type": "CR", "status": "OPEN", "points": 100},
                                 {"key": "CR-02", "type": "CR", "status": "OPEN", "points": 100}])
     _ready(c, "CR-01", "w1")
@@ -101,8 +102,10 @@ def test_in_flight_submit_not_stolen_at_lease_but_reclaimed_after_ttl(tmp_path):
         meta = dict(c._meta(db, "integration_submit_inflight"))
         meta["since"] = time.monotonic() - 121.0
         c._set_meta(db, "integration_submit_inflight", meta)
-    c.plan_tasks()
-    assert c.begin_integration("CR-02")["phase"] == "INTEGRATING"
+    plan = c.plan_tasks()
+    assert plan["integrationOwner"] == "CR-01" and plan["reconciliationRequired"][0]["key"] == "CR-01"
+    with pytest.raises(NativeCoordinationError):
+        c.begin_integration("CR-02")
 
 
 def test_touch_integration_renews_lease(tmp_path):
@@ -135,15 +138,17 @@ def test_result_without_tests_or_evidence_rejected(tmp_path):
         c.record_worker_result("CR-01", _result("CR-01", "w1", test_results=[]))
 
 
-def test_emergency_flush_marks_result_unverified(tmp_path):
+def test_deadline_flush_never_fabricates_a_result(tmp_path):
+    """Solution v3 S0: near the deadline the coordinator only requests a final result from the worker."""
     c = _coordinator(tmp_path, [{"key": "BUG-02", "type": "BUG", "status": "OPEN", "points": 100,
                                  "deadline_epoch": 1090}])
     c.register_started("BUG-02", {})
     claim = c.claim_task("BUG-02", "w1")
     (Path(claim["worktreeRoot"]) / "source" / "main.py").write_text("print(2)\n")
-    c.plan_tasks()
-    res = c.task_details("BUG-02")["workerResult"]
-    assert res["test_results"] == [] and res["verification_status"] == "UNVERIFIED"
+    plan = c.plan_tasks()
+    assert c.task_details("BUG-02")["workerResult"] is None
+    assert c.task_details("BUG-02")["phase"] == "RUNNING"
+    assert [r["key"] for r in plan["deadlineFlushRequests"]] == ["BUG-02"]
 
 
 def test_pi_dispatched_before_emergency_deadline_task(tmp_path):

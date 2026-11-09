@@ -78,6 +78,11 @@ def test_mcp_server_submit_work_terminal_rejection_cleanup(tmp_path):
     subprocess.run(["git", "-C", str(repo), "add", "."], check=True, capture_output=True)
     subprocess.run(["git", "-C", str(repo), "commit", "-m", "init"], check=True, capture_output=True)
     subprocess.run(["git", "-C", str(repo), "branch", "-M", "main"], check=True, capture_output=True)
+    # Git preparation is fail-fast (Solution v3, S3): the checkout needs a real remote to push to.
+    origin = tmp_path / "origin.git"
+    subprocess.run(["git", "init", "--bare", str(origin)], check=True, capture_output=True)
+    subprocess.run(["git", "-C", str(repo), "remote", "add", "origin", str(origin)], check=True, capture_output=True)
+    subprocess.run(["git", "-C", str(repo), "push", "-u", "origin", "main"], check=True, capture_output=True)
 
     server = MCPHelperServer()
     server.workspace_root = tmp_path
@@ -131,7 +136,7 @@ def test_mcp_server_submit_work_terminal_rejection_cleanup(tmp_path):
 
     server.adapter.submit_work.side_effect = GMTerminalError("409: [BACKLOG_ITEM_CLOSED] Item deadline elapsed")
 
-    answer = {"status": "PARTIAL"}
+    answer = {"status": "DONE"}   # a BUG PARTIAL is not submitted by the default policy
     commit_sha = subprocess.run(["git", "-C", str(repo), "rev-parse", "HEAD"], check=True, capture_output=True, text=True).stdout.strip()
 
     with pytest.raises(GMTerminalError):

@@ -14,13 +14,12 @@ STRICT ROLE BOUNDARY:
 - Orchestrator is ONLY a coordinator, integrator, and submitter.
 - NEVER launch playwright, browser scripts, dev servers, or execute test commands in the main checkout.
 - NEVER attempt to complete or fix verification/evidence on behalf of a worker.
-- If a worker result reports missing evidence or partial tests, accept it AS-IS and submit as PARTIAL immediately.
-- Your sole job upon worker completion: Git cherry-pick/merge -> Verify submit.json schema -> Git push -> submit_work RPC -> receive receipt.
+- Never change a worker's status: failing or missing tests stay recorded; DONE is never downgraded and PARTIAL is never upgraded.
+- Submission, rework, hold and close are decided only by decide(backlogItemKey) / the decision attached to plan_tasks() and record_worker_result(); follow it.
+- Your job upon a SUBMIT decision: Git cherry-pick/merge -> verify submit.json schema -> submit_work (it commits, rebases and pushes fail-fast) -> receive receipt.
 
-PIPELINED DISPATCH WORKFLOW (Zero-Wait Workers):
-- Whenever a worker returns a WorkerResult:
-  1. Call record_worker_result(backlogItemKey, workerResult) immediately.
-  2. BEFORE integrating/submitting the completed task, IMMEDIATELY call plan_tasks(). If slots are available and selected tasks exist, call start_work -> claim_task -> spawn a new worker for the next task.
-  3. Only AFTER new workers are actively running, proceed with the 2-second integration and submission of completed tasks.
-  - Workers must NEVER sit idle waiting for submissions!
+ORDER AFTER EVERY WORKER RESULT (single order, see .agents/skills/team-orchestrator/SKILL.md):
+  1. record_worker_result(backlogItemKey, workerResult) immediately.
+  2. If a readyToIntegrate item has decision.mustFinalize, integrate and submit it first.
+  3. Otherwise dispatch plan_tasks().selected (start_work -> claim_task -> spawn), then integrate readyToIntegrate[0].
 """

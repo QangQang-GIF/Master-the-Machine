@@ -45,14 +45,13 @@ def test_emergency_cutoff_at_120s(tmp_path):
 
     # Run plan_tasks
     plan = c.plan_tasks()
-    
-    # BUG-01 has 150s slack -> stays RUNNING
+
+    # Solution v3 S0: no worker is converted into a result by the scheduler; it only requests a flush.
     assert c.task_details("BUG-01")["phase"] == "RUNNING"
-    # BUG-02 has 90s slack <= 120s -> auto-promoted to READY_TO_INTEGRATE with emergency cutoff
-    assert c.task_details("BUG-02")["phase"] == "READY_TO_INTEGRATE"
-    res = c.task_details("BUG-02")["workerResult"]
-    assert res["status"] == "PARTIAL"
-    assert "Hard cutoff triggered at " in res["note"]
+    assert c.task_details("BUG-02")["phase"] == "RUNNING"
+    assert c.task_details("BUG-02")["workerResult"] is None
+    assert not (wt_2 / "answers" / "BUG-02" / "submit.json").exists()
+    assert "BUG-02" in [r["key"] for r in plan["deadlineFlushRequests"]]
 
 
 def test_endgame_lock_release_after_8s(tmp_path):
@@ -164,9 +163,9 @@ def test_global_8s_lock_and_ready_sorting(tmp_path):
     plan = c.plan_tasks()
     assert plan["integrationOwner"] is None
 
-    # 2. readyToIntegrate sorts BUG before CR (fast-track logic)
+    # 2. Solution v3 S9': items without deadline are ordered by expected value (CR-01 140 > BUG-01 80)
     ready_keys = [r["key"] for r in plan["readyToIntegrate"]]
-    assert ready_keys == ["BUG-01", "CR-01"]
+    assert ready_keys == ["CR-01", "BUG-01"]
 
     # 3. BUG-01 acquires lock immediately
     integ = c.begin_integration("BUG-01")

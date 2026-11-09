@@ -48,6 +48,7 @@ from mtm_competition.integration.git_guard import PreSubmissionGitGuard
 from mtm_competition.tasks.journal import SubmissionJournal
 from mtm_competition.verification.encoding_check import assert_no_mojibake
 from mtm_competition.scheduling.native import NativeTaskCoordinator
+from mtm_competition.scheduling.policy import announced_test_ids as _policy_announced_test_ids
 from mtm_knowledge.bootstrap import KnowledgeBootstrap, detect_tech_stack
 from runner.telemetry import (
     TelemetryLogger,
@@ -101,26 +102,25 @@ def normalize_native_projection(projection: Dict[str, Any], adapter: Any) -> Dic
     return {"status": status, "server_epoch": server, "remaining_seconds": remaining, "items": items}
 
 
-def announced_test_ids(details: Dict[str, Any]) -> List[str]:
-    """Inventory explicit public scenario IDs, independent of a worker's answer."""
-    ids: set[str] = set()
-    def walk(value: Any, rows: bool = False) -> None:
-        if isinstance(value, list):
-            for row in value:
-                walk(row, True)
-        elif isinstance(value, dict):
-            if rows:
-                identifier = value.get("id") or value.get("testCaseId") or value.get("scenarioId")
-                if isinstance(identifier, str) and identifier.strip():
-                    ids.add(identifier.strip())
-            for name in ("testResults", "scenarios", "testCases", "cases", "tests", "minimumVerificationScenarios", "mvs"):
-                if name in value:
-                    walk(value[name], True)
-        elif isinstance(value, str):
-            ids.update(re.findall(r"\b(?:[A-Z0-9]+-)*(?:TC|MVS|SCENARIO|TEST)-\d+(?:-[A-Za-z0-9]+)*\b", value))
-    walk(details.get("submitTemplate", {}))
-    walk(details.get("minimumVerificationScenarios", details.get("mvs")), True)
-    return sorted(ids)
+def check_effective_worker_config(config: Dict[str, Any]) -> None:
+    """S10': stop before the match when the effective worker config is not the expected one.
+
+    MTM_EXPECTED_WORKER_CONFIG="max/normal/burst" (e.g. "16/15/8") states the expectation. In production a
+    config that does not come entirely from the environment is refused, because the defaults are 4/3/2.
+    """
+    actual = f"{config['max_workers']}/{config['normal_workers']}/{config['pi_burst_slots']}"
+    expected = os.environ.get("MTM_EXPECTED_WORKER_CONFIG", "").strip()
+    if expected and expected != actual:
+        raise RuntimeError(f"Effective worker config {actual} ({config['source']}) differs from "
+                           f"MTM_EXPECTED_WORKER_CONFIG={expected}; fix the environment before the match")
+    if not expected and os.environ.get("MTM_ENV") == "production" and config.get("source") != "env":
+        raise RuntimeError(f"Production worker config {actual} comes from '{config['source']}', not the "
+                           "environment; set MTM_NATIVE_MAX_WORKERS/NORMAL_WORKERS/PI_BURST_SLOTS or "
+                           "MTM_EXPECTED_WORKER_CONFIG")
+
+
+# Single source of truth for scenario IDs lives with the submission policy (Solution v3, S2).
+announced_test_ids = _policy_announced_test_ids
 
 
 def resolve_stored_session_credentials(workspace_root: Path, match_code: Optional[str]) -> Dict[str, Any]:
@@ -647,13 +647,16 @@ class MCPHelperServer:
             self._reconcile_native_receipts()
             # Preflight: make the effective worker configuration visible. The env defaults here differ from
             # config/production.yaml and releases/prod_manifest.json, so state which one is in force.
+            env_names = ("MTM_NATIVE_MAX_WORKERS", "MTM_NATIVE_NORMAL_WORKERS", "MTM_PI_BURST_SLOTS")
+            present = [n for n in env_names if os.environ.get(n)]
             self.effective_worker_config = {
                 "max_workers": self.native.max_workers,
                 "normal_workers": self.native.normal_workers,
                 "pi_burst_slots": self.native.pi_burst_slots,
-                "source": "env" if os.environ.get("MTM_NATIVE_MAX_WORKERS") else "mcp_server default",
+                "source": "env" if len(present) == len(env_names) else ("partial env" if present else "mcp_server default"),
             }
             sys.stderr.write(f"Effective native worker config: {self.effective_worker_config}\n")
+            check_effective_worker_config(self.effective_worker_config)
 
         # Record initial items from descriptor
         for item in descriptor.get("backlogItems", []):
@@ -1420,35 +1423,51 @@ class MCPHelperServer:
             self._start_integration_heartbeat(backlog_item_key)
             details = self.native.task_details(backlog_item_key)["data"].get("start_details", {})
             required_test_ids = announced_test_ids(details)
+            # S4: a Submit whose outcome is unknown is reconciled by replaying the journaled body with the
+            # same idempotency key; nothing else may be sent for this item.
+            reconciliation = self.native.reconciliation_state()
+            if reconciliation and reconciliation.get("key") == backlog_item_key:
+                entry = self.journal.get_in_flight(self.match_uuid, backlog_item_key)
+                note = self.native.note_reconciliation_attempt(backlog_item_key)
+                if note.get("gaveUp"):
+                    raise RuntimeError(f"Submit outcome for {backlog_item_key} still unknown after "
+                                       f"{note.get('attempts')} reconciliation attempts; item parked for review")
+                if entry and entry.get("state") == "IN_FLIGHT":
+                    return self._send_journaled_submission(backlog_item_key, entry)
 
-        # Ensure local commits are pushed to remote origin before pre-submission verification
+        # S1: an honest PARTIAL may pass the gate; BLOCKED is never a submission path; DONE stays fail-closed.
+        answer_status = str(answer.get("status", "")).upper() if isinstance(answer, dict) else ""
+        if answer_status == "BLOCKED":
+            if self.native:
+                try:
+                    self.native.end_integration(backlog_item_key, success=False)
+                except Exception:
+                    pass
+            raise ValueError(f"{backlog_item_key}: BLOCKED is not a submission path; rework or close the item")
+        allow_partial = answer_status == "PARTIAL"
+        if self.native:
+            # S2: the policy decides on the answer that is actually being submitted.
+            decision = self.native.decide(backlog_item_key, answer_status=answer_status or None)
+            if decision["action"] != "SUBMIT":
+                try:
+                    self.native.end_integration(backlog_item_key, success=False)
+                except Exception:
+                    pass
+                raise ValueError(f"{backlog_item_key}: policy decision {decision['action']} ({decision['reason']}); not submitted")
+
+        # S3: commit, rebase and push must each succeed; any Git failure stops here with its real cause
+        # (the journal is not touched and nothing is sent).
         if self.checkout_root:
             try:
-                # Auto-commit any pending evidence or answer files on disk before push
-                paths = self._scoped_stage_paths(backlog_item_key)
-                status_res = self._git_checked("status", "--porcelain", "--", *paths, timeout=10) if paths else None
-                if status_res is not None and status_res.returncode == 0 and status_res.stdout.strip():
-                    add_res = self._git_checked("add", "--", *paths, timeout=15)
-                    if add_res.returncode != 0:
-                        raise RuntimeError(f"git add failed: {add_res.stderr.strip()}")
-                    commit_res = self._git_checked("commit", "-m", f"Auto-capture evidence for {backlog_item_key}", timeout=15)
-                    if commit_res.returncode != 0:
-                        raise RuntimeError(f"git commit failed: {commit_res.stderr.strip() or commit_res.stdout.strip()}")
-                    rev_res = self._git_checked("rev-parse", "HEAD", timeout=10)
-                    if rev_res.returncode == 0 and rev_res.stdout.strip():
-                        git_revision = rev_res.stdout.strip()
-
-                if not self.descriptor.get("offline"):
-                    subprocess.run(
-                        ["git", "-C", str(self.checkout_root), "pull", "--rebase", "origin", assigned_branch],
-                        capture_output=True, text=True, timeout=30
-                    )
-                    subprocess.run(
-                        ["git", "-C", str(self.checkout_root), "push", "origin", assigned_branch],
-                        capture_output=True, text=True, timeout=30
-                    )
-            except Exception as e:
-                sys.stderr.write(f"Notice: Auto-commit/push before submit: {e}\n")
+                git_revision = self._prepare_git_snapshot(backlog_item_key, assigned_branch, git_revision)
+            except Exception as git_err:
+                sys.stderr.write(f"Git preparation failed for {backlog_item_key}: {git_err}\n")
+                if self.native:
+                    try:
+                        self.native.end_integration(backlog_item_key, success=False)
+                    except Exception:
+                        pass
+                raise RuntimeError(f"Git preparation failed before submit for {backlog_item_key}: {git_err}") from git_err
 
         # 1. Pre-submission Git Invariant Verification (GIT-01..05). Fail closed: no silent downgrade or re-stage.
         try:
@@ -1463,6 +1482,7 @@ class MCPHelperServer:
                 require_remote=False if self.descriptor.get("offline") else True,
                 raise_on_error=True,
                 required_test_ids=required_test_ids,
+                allow_partial=allow_partial,
             )
         except Exception as gate_err:
             sys.stderr.write(f"Submission gate rejected {backlog_item_key}: {gate_err}\n")
@@ -1490,6 +1510,65 @@ class MCPHelperServer:
             git_revision=git_revision,
             remote_ref=assigned_branch,
         )
+        return self._send_journaled_submission(backlog_item_key, {"request_body_bytes": serialized_bytes})
+
+    def _git_rev(self, ref: str = "HEAD") -> str:
+        res = self._git_checked("rev-parse", ref, timeout=10)
+        if res.returncode != 0 or not res.stdout.strip():
+            raise RuntimeError(f"git rev-parse {ref} failed: {res.stderr.strip()}")
+        return res.stdout.strip()
+
+    def _prepare_git_snapshot(self, backlog_item_key: str, assigned_branch: str, git_revision: str) -> str:
+        """Commit scoped answer/evidence files, rebase onto origin, push, and return the SHA that is on the remote.
+
+        Every step checks its return code. A rebase that rewrites our commit is only accepted when the
+        answer file is byte-identical before and after; the new SHA is then the snapshot.
+        """
+        paths = self._scoped_stage_paths(backlog_item_key)
+        status_res = self._git_checked("status", "--porcelain", "--", *paths, timeout=10) if paths else None
+        if status_res is not None and status_res.returncode != 0:
+            raise RuntimeError(f"git status failed: {status_res.stderr.strip()}")
+        if status_res is not None and status_res.stdout.strip():
+            add_res = self._git_checked("add", "--", *paths, timeout=15)
+            if add_res.returncode != 0:
+                raise RuntimeError(f"git add failed: {add_res.stderr.strip()}")
+            commit_res = self._git_checked("commit", "-m", f"Auto-capture evidence for {backlog_item_key}", timeout=15)
+            if commit_res.returncode != 0:
+                raise RuntimeError(f"git commit failed: {commit_res.stderr.strip() or commit_res.stdout.strip()}")
+            git_revision = self._git_rev()
+        if self.descriptor.get("offline"):
+            return git_revision
+        head_before = self._git_rev()
+        pull_res = self._git_checked("pull", "--rebase", "origin", assigned_branch, timeout=60)
+        if pull_res.returncode != 0:
+            self._git_checked("rebase", "--abort", timeout=30)
+            raise RuntimeError(f"git pull --rebase failed: {(pull_res.stderr or pull_res.stdout).strip()[:400]}")
+        head_after = self._git_rev()
+        if head_after != head_before and git_revision in (head_before, head_before[:len(git_revision)]):
+            folder = self.match_root.relative_to(self.checkout_root).as_posix()
+            answer_path = f"{folder}/answers/{backlog_item_key}/submit.json" if folder not in ("", ".") else f"answers/{backlog_item_key}/submit.json"
+            before = self._git_checked("show", f"{head_before}:{answer_path}", timeout=10)
+            after = self._git_checked("show", f"{head_after}:{answer_path}", timeout=10)
+            if before.returncode != 0 or after.returncode != 0 or before.stdout != after.stdout:
+                raise RuntimeError(f"rebase changed or removed {answer_path}; refusing to submit a different snapshot")
+            sys.stderr.write(f"Rebase moved {backlog_item_key} snapshot {head_before[:12]} -> {head_after[:12]}\n")
+            git_revision = head_after
+        push_res = self._git_checked("push", "origin", assigned_branch, timeout=60)
+        if push_res.returncode != 0:
+            raise RuntimeError(f"git push failed: {(push_res.stderr or push_res.stdout).strip()[:400]}")
+        remote = self._git_checked("ls-remote", "origin", f"refs/heads/{assigned_branch}", timeout=30)
+        remote_sha = remote.stdout.split()[0] if remote.returncode == 0 and remote.stdout.strip() else ""
+        if not remote_sha or not (remote_sha.startswith(git_revision) or git_revision.startswith(remote_sha)):
+            raise RuntimeError(f"remote {assigned_branch} is at {remote_sha or 'unknown'}, not the snapshot {git_revision}")
+        return git_revision
+
+    def _send_journaled_submission(self, backlog_item_key: str, entry: Dict[str, Any]) -> Dict[str, Any]:
+        """POST exactly the journaled body with its idempotency key (first send and reconciliation replay)."""
+        serialized_bytes = bytes(entry["request_body_bytes"])
+        payload = json.loads(serialized_bytes.decode("utf-8"))
+        client_submission_id = payload["clientSubmissionId"]
+        git_revision = payload["gitRevision"]
+        answer = payload["answer"]
         if self.native:
             self.native.mark_submit_in_flight(backlog_item_key)
 
@@ -1762,16 +1841,48 @@ class MCPHelperServer:
             return native.end_integration(backlog_item_key, success=False)
         raise ValueError("integration_gate action must be begin or failed")
 
+    def decide(self, backlog_item_key: str) -> Dict[str, Any]:
+        self.refresh_match()
+        return self._native_coordinator().decide(backlog_item_key)
+
+    def flush_snapshot(self, backlog_item_key: str, confirmed_stopped: bool, reason: str) -> Dict[str, Any]:
+        return self._native_coordinator().flush_snapshot(
+            backlog_item_key, confirmed_stopped=confirmed_stopped, reason=reason)
+
     def reconcile_worker(self, backlog_item_key: str, confirmed_stopped: bool, reason: str, requeue: bool = True) -> Dict[str, Any]:
         return self._native_coordinator().reconcile_worker(
             backlog_item_key, confirmed_stopped=confirmed_stopped, reason=reason, requeue=requeue)
 
-    def wait_for_update(self, timeout_ms: int = 5000) -> Dict[str, Any]:
-        """Bounded serial polling detecting wave releases and match status transitions."""
-        bounded_ms = min(max(100, timeout_ms), 55000)
+    def wait_for_update(self, timeout_ms: int = 5000, since_event_id: Optional[int] = None) -> Dict[str, Any]:
+        """Bounded wait that returns early on server changes and on native events (S7').
+
+        Events carry an identity and attempt ID and are ingested idempotently, so a worker completion or a
+        deadline flush request is reported once. The bound is min(55 s, time until the next deadline action).
+        """
+        bounded_ms = min(max(100, int(timeout_ms)), 55000)
         start_time = time.time()
         elapsed_ms = 0
         poll_interval = 2.0
+        cursor = int(since_event_id) if since_event_id is not None else int(getattr(self, "_event_cursor", 0))
+
+        def native_events() -> Optional[Dict[str, Any]]:
+            nonlocal bounded_ms
+            if not self.native:
+                return None
+            plan = self.native.plan_tasks()          # local only: emits flush/result/reconciliation events
+            next_action = self.native.seconds_to_next_deadline_action()
+            if next_action is not None:
+                bounded_ms = min(bounded_ms, max(100, int(next_action * 1000)))
+            batch = self.native.events_since(cursor)
+            if batch["events"]:
+                self._event_cursor = batch["cursor"]
+                return {"status": "EVENT", "events": batch["events"], "eventCursor": batch["cursor"],
+                        "matchState": self.match_state,
+                        "deadlineFlushRequests": plan.get("deadlineFlushRequests", []),
+                        "workerResultsAvailable": plan.get("workerResultsAvailable", []),
+                        "reconciliationRequired": plan.get("reconciliationRequired", []),
+                        "elapsedMs": int((time.time() - start_time) * 1000)}
+            return None
 
         while elapsed_ms < bounded_ms:
             # Poll match state and waves
@@ -1785,20 +1896,26 @@ class MCPHelperServer:
                         "matchState": self.match_state,
                         "wave": self.current_wave,
                         "newItems": new_items,
+                        "eventCursor": cursor,
                         "elapsedMs": int((time.time() - start_time) * 1000),
                     }
                 if self.match_state == "FINISHED":
                     return {
                         "status": "FINISHED",
                         "matchState": "FINISHED",
+                        "eventCursor": cursor,
                         "elapsedMs": int((time.time() - start_time) * 1000),
                     }
                 if self.match_state == "PAUSED":
                     return {
                         "status": "PAUSED",
                         "matchState": "PAUSED",
+                        "eventCursor": cursor,
                         "elapsedMs": int((time.time() - start_time) * 1000),
                     }
+            event = native_events()
+            if event:
+                return event
 
             remaining_sec = (bounded_ms - elapsed_ms) / 1000.0
             sleep_sec = min(poll_interval, remaining_sec)
@@ -1806,7 +1923,7 @@ class MCPHelperServer:
                 time.sleep(sleep_sec)
             elapsed_ms = int((time.time() - start_time) * 1000)
 
-        return {"status": "TIMEOUT", "elapsedMs": elapsed_ms, "matchState": self.match_state}
+        return {"status": "TIMEOUT", "elapsedMs": elapsed_ms, "matchState": self.match_state, "eventCursor": cursor}
 
 
 def get_tool_definitions() -> List[Dict[str, Any]]:
@@ -1820,6 +1937,10 @@ def get_tool_definitions() -> List[Dict[str, Any]]:
          {"backlogItemKey": {"type": "string"}, "action": {"type": "string", "enum": ["begin", "failed"], "default": "begin"}}, ["backlogItemKey"]),
         ("reconcile_worker", "Reconcile a stopped/completed failed native worker. Never confirm stopped while it is still writing.",
          {"backlogItemKey": {"type": "string"}, "confirmedStopped": {"type": "boolean"}, "reason": {"type": "string"}, "requeue": {"type": "boolean", "default": True}}, ["backlogItemKey", "confirmedStopped", "reason"]),
+        ("decide", "The single policy decision for an item: SUBMIT, CONTINUE_WORK, REWORK, HOLD_FOR_REVIEW or CLOSE (with mustFinalize). Follow it; do not re-derive rules.",
+         {"backlogItemKey": {"type": "string"}}, ["backlogItemKey"]),
+        ("flush_snapshot", "Explicit cutoff of a STOPPED worker: fence its attempt, snapshot HEAD, record its own PARTIAL submit.json as UNVERIFIED. The policy still decides whether it is submitted.",
+         {"backlogItemKey": {"type": "string"}, "confirmedStopped": {"type": "boolean"}, "reason": {"type": "string"}}, ["backlogItemKey", "confirmedStopped", "reason"]),
     ]
     return [{"name": name, "description": description, "inputSchema": {"type": "object", "properties": props, "required": required, "additionalProperties": False}}
             for name, description, props, required in native_tools] + [
@@ -1888,11 +2009,12 @@ def get_tool_definitions() -> List[Dict[str, Any]]:
         },
         {
             "name": "wait_for_update",
-            "description": "Bounded serial sleep/poll waiting for state updates.",
+            "description": "Bounded wait that returns early on new items/waves, PAUSED/FINISHED, and native events (worker result available or recorded, deadline flush requested, flush timeout, reconciliation required). The bound also shrinks to the next deadline action.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "timeoutMs": {"type": "integer", "description": "Timeout in milliseconds (max 55000)", "default": 5000}
+                    "timeoutMs": {"type": "integer", "description": "Timeout in milliseconds (max 55000)", "default": 5000},
+                    "sinceEventId": {"type": "integer", "description": "Event cursor from the previous response (defaults to this server's cursor)"}
                 },
             },
         },
@@ -1990,7 +2112,7 @@ def run_mcp_stdio_server():
                 elif tool_name == "report_progress":
                     val = server.report_progress(tool_args.get("event", {}))
                 elif tool_name == "wait_for_update":
-                    val = server.wait_for_update(tool_args.get("timeoutMs", 5000))
+                    val = server.wait_for_update(tool_args.get("timeoutMs", 5000), tool_args.get("sinceEventId"))
                 elif tool_name == "plan_tasks":
                     val = server.plan_tasks()
                 elif tool_name == "claim_task":
@@ -2001,6 +2123,10 @@ def run_mcp_stdio_server():
                     val = server.integration_gate(tool_args["backlogItemKey"], tool_args.get("action", "begin"))
                 elif tool_name == "reconcile_worker":
                     val = server.reconcile_worker(tool_args["backlogItemKey"], tool_args["confirmedStopped"], tool_args["reason"], tool_args.get("requeue", True))
+                elif tool_name == "decide":
+                    val = server.decide(tool_args["backlogItemKey"])
+                elif tool_name == "flush_snapshot":
+                    val = server.flush_snapshot(tool_args["backlogItemKey"], tool_args["confirmedStopped"], tool_args["reason"])
                 elif tool_name == "list_company_tools":
                     val = server.list_company_tools()
                 elif tool_name == "call_company_tool":

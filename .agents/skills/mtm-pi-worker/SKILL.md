@@ -18,4 +18,4 @@ Follow `mtm-init` and `mtm-worker`. Score depends on time from reveal to PASS. R
      `python3 "<metadata.project_runtime_path>" --match-root "<match_root>" --match-id "<metadata.match_id>" --worker-id "<worker_id>" run -- pnpm vitest run <test_file>`
    - Save verification logs to `answers/<key>/evidence/`.
 4. **Immediate Commit & Completion**:
-   - Populate `answers/<key>/submit.json` (`status: "DONE"`), `git add` & `git commit` all modified files and `answers/<key>/`, and write `worker_result.json` (`status: "READY_FOR_REVIEW"`) immediately so Root can submit for maximum speed bonus!
+   - Populate `answers/<key>/submit.json` (`status: "DONE"` only when every MVS passes, otherwise an honest `"PARTIAL"`; a PI PARTIAL is not submitted by default policy, so keep fixing while time remains), `git add` & `git commit` all modified files and `answers/<key>/`, and write `worker_result.json` (`status: "READY_FOR_REVIEW"`) immediately so Root can submit for maximum speed bonus!
