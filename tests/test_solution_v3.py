@@ -320,7 +320,7 @@ def test_5b_submit_work_refuses_blocked(tmp_path):
     server.adapter.submit_work.assert_not_called()
 
 
-def test_4d_submit_work_refuses_bug_partial_by_policy(tmp_path):
+def test_4d_submit_work_refuses_partial_while_rework_is_still_possible(tmp_path):
     server, repo = build_server(tmp_path, "BUG-01", "BUG", "DONE")
     with pytest.raises(ValueError, match="policy decision"):
         server.submit_work("cid-1", "BUG-01", git(repo, "rev-parse", "HEAD"), {"status": "PARTIAL"})
@@ -471,13 +471,17 @@ def test_policy_submit_budget_uses_measured_p95(monkeypatch):
     assert policy.submit_budget([10, 20, 30, 40]) == 70
 
 
-def test_policy_must_finalize_does_not_force_partial_for_bug(monkeypatch):
-    monkeypatch.delenv("MTM_PARTIAL_SUBMIT_TYPES", raising=False)
-    d = policy.decide(item_type="BUG", phase="READY_TO_INTEGRATE", item_open=True, time_left=50,
+def test_policy_every_ordinary_item_follows_the_same_partial_rule(monkeypatch):
+    monkeypatch.delenv("MTM_PI_PARTIAL_SUBMIT", raising=False)
+    for kind in ("TASK", "BUG", "CR", "HEAVY"):
+        d = policy.decide(item_type=kind, phase="READY_TO_INTEGRATE", item_open=True, time_left=50,
+                          result={"status": "PARTIAL"}, answer_status="PARTIAL", rework_count=0, budget=90)
+        assert d.must_finalize and d.action == policy.SUBMIT, kind
+    d = policy.decide(item_type="PI", phase="READY_TO_INTEGRATE", item_open=True, time_left=50,
                       result={"status": "PARTIAL"}, answer_status="PARTIAL", rework_count=0, budget=90)
-    assert d.must_finalize and d.action == policy.CLOSE
-    monkeypatch.setenv("MTM_PARTIAL_SUBMIT_TYPES", "TASK,BUG")
-    d = policy.decide(item_type="BUG", phase="READY_TO_INTEGRATE", item_open=True, time_left=50,
+    assert d.action == policy.CLOSE
+    monkeypatch.setenv("MTM_PI_PARTIAL_SUBMIT", "1")
+    d = policy.decide(item_type="PI", phase="READY_TO_INTEGRATE", item_open=True, time_left=50,
                       result={"status": "PARTIAL"}, answer_status="PARTIAL", rework_count=0, budget=90)
     assert d.action == policy.SUBMIT
 
@@ -489,12 +493,3 @@ def test_policy_hold_for_review_is_time_bounded():
     assert policy.decide(**kwargs, ready_age=5).action == policy.HOLD_FOR_REVIEW
     assert policy.decide(**kwargs, ready_age=600).action == policy.SUBMIT
     assert policy.decide(**{**kwargs, "item_type": "PI"}, ready_age=5).action == policy.SUBMIT
-
-
-def test_policy_heavy_partial_is_submittable_without_rework_time():
-    d = policy.decide(item_type="CR", phase="READY_TO_INTEGRATE", item_open=True, time_left=280,
-                      result={"status": "PARTIAL"}, answer_status="PARTIAL", rework_count=0, budget=90, heavy=True)
-    assert d.action == policy.SUBMIT
-    d = policy.decide(item_type="CR", phase="READY_TO_INTEGRATE", item_open=True, time_left=280,
-                      result={"status": "PARTIAL"}, answer_status="PARTIAL", rework_count=0, budget=90)
-    assert d.action == policy.CLOSE

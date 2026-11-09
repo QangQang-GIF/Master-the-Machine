@@ -136,7 +136,7 @@ def test_mcp_server_submit_work_terminal_rejection_cleanup(tmp_path):
 
     server.adapter.submit_work.side_effect = GMTerminalError("409: [BACKLOG_ITEM_CLOSED] Item deadline elapsed")
 
-    answer = {"status": "DONE"}   # a BUG PARTIAL is not submitted by the default policy
+    answer = {"status": "DONE"}   # a PARTIAL with time left for a rework is not submitted yet
     commit_sha = subprocess.run(["git", "-C", str(repo), "rev-parse", "HEAD"], check=True, capture_output=True, text=True).stdout.strip()
 
     with pytest.raises(GMTerminalError):

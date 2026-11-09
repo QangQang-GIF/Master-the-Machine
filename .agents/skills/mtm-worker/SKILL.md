@@ -54,9 +54,7 @@ Follow `mtm-init` boundaries, TaskEnvelope constraints, and returned submit temp
    - **Honest test rows**: every executed check stays in `test_results` with `passed=true/false` and its real `exit_code`; never move a failing row elsewhere to obtain DONE. A failure unrelated to your change may go to `diagnostic_test_results` only with `unrelated: true` and `baseline_log` pointing to a log of the same failure on the base commit.
    - **Deadline flush**: when the Root relays `DEADLINE_FLUSH_REQUESTED`, stop starting new work, commit what passes, set unfinished scenarios honestly (`FAIL`/`NOT_RUN`, status `PARTIAL`), and write the final `worker_result.json` immediately.
 
-5. **Heavy items (`taskEnvelope.heavy == true`)**:
-   - You run with stronger reasoning and a budget that covers the whole remaining window minus a hand-off margin.
+5. **Incremental delivery (every item)**:
    - Plan the acceptance criteria / test cases first, then deliver them in priority order. After each part that genuinely passes, commit it and update `answers/<key>/submit.json` (real PASS/FAIL/NOT_RUN rows, `status: "PARTIAL"` until everything passes).
-   - Do not wait for the whole item to be finished before committing: an honest PARTIAL still scores every finished test case, while an uncommitted half-done item scores nothing.
+   - Do not wait for the whole item to be finished before committing: an uncommitted half-done item scores nothing.
    - When the budget ends or Root asks you to stop, stop coding, make sure the last committed `submit.json` matches what is really verified, and write `worker_result.json`.
-

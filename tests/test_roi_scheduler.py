@@ -46,7 +46,7 @@ def test_roi_difficulty_calculation(tmp_path):
     assert (t_cr2["points"] / diff_cr2) == pytest.approx(34.2857, rel=1e-3)
 
 
-def test_roi_prioritization_order(tmp_path):
+def test_ordinary_items_are_treated_alike_not_by_roi(tmp_path):
     repo = tmp_path / "checkout"
     repo.mkdir()
     c = NativeTaskCoordinator(tmp_path / "state", repo, repo / "source", "source", "MATCH", max_workers=4, normal_workers=3)
@@ -96,7 +96,7 @@ def test_roi_prioritization_order(tmp_path):
     selected_keys = [t["key"] for t in plan["selected"]]
     # Normal workers capacity is 3 (1 slot reserved for urgent/PI).
     # Top 3 selected by ROI descending: TASK-04 (70.0) -> BUG-04 (53.3) -> CR-01 (40.0)
-    assert selected_keys == ["TASK-04", "BUG-04", "CR-01"]
+    assert selected_keys == ["BUG-04", "CR-01", "CR-02"]   # no ROI/points/type ranking: same time left -> key order
 
     # When 4 normal slots are available (max_workers=5, normal_workers=4), CR-02 is selected 4th:
     c_4 = NativeTaskCoordinator(tmp_path / "state2", repo, repo / "source", "source", "MATCH", max_workers=5, normal_workers=4)
@@ -110,4 +110,4 @@ def test_roi_prioritization_order(tmp_path):
     )
     plan_4 = c_4.plan_tasks()
     selected_keys_4 = [t["key"] for t in plan_4["selected"]]
-    assert selected_keys_4 == ["TASK-04", "BUG-04", "CR-01", "CR-02"]
+    assert selected_keys_4 == ["BUG-04", "CR-01", "CR-02", "TASK-04"]

@@ -122,8 +122,9 @@ def test_official_clock_required_and_deadline_excludes_closed(coordinator):
 
 def test_nearest_urgent_deadline_precedes_score(coordinator):
     c = coordinator
+    c.max_workers, c.normal_workers = 4, 3
     projection(c, item(deadline_epoch=1_000_500, points=1000), item('CR-01', deadline_epoch=1_000_200, points=1))
-    assert [t['key'] for t in c.plan_tasks()['selected']] == ['CR-01', 'BUG-01']
+    assert [t['key'] for t in c.plan_tasks()['selected']] == ['CR-01', 'BUG-01']   # least time left, points ignored
 
 
 def test_dependency_and_path_overlap(coordinator):

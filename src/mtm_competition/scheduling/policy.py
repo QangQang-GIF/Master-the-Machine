@@ -7,9 +7,9 @@ only reference these results; they never re-implement the rules.
 Values that depend on the official rules or on measurements are configurable through the environment and
 are marked as hypotheses in the solution document:
 
-- ``MTM_PARTIAL_SUBMIT_TYPES`` (default ``TASK``): item types whose honest PARTIAL may be submitted. The
-  public rules only say a graded submission is PASSED or FAILED, so BUG/CR/PI PARTIAL stay off by default.
-  A Heavy item (announced to score per finished test case) may always submit an honest PARTIAL.
+- Every ordinary item (anything that is not a PI) follows the same rules; nothing is classified by type,
+  points or size. An ordinary item's honest PARTIAL is submitted at the latest useful moment.
+- ``MTM_PI_PARTIAL_SUBMIT`` (default ``0``): whether a PI's honest PARTIAL may be submitted.
 - ``MTM_MAX_REWORK`` (default 1): extra attempts after a final result that is not good enough.
 - ``MTM_MIN_REWORK_SECONDS`` (default 300): a rework is pointless with less time than this left.
 - ``MTM_SUBMIT_P95_DEFAULT_SECONDS`` (default 60) / ``MTM_SUBMIT_SAFETY_MARGIN_SECONDS`` (default 30):
@@ -35,7 +35,6 @@ DECISIONS = (SUBMIT, CONTINUE_WORK, REWORK, HOLD_FOR_REVIEW, CLOSE)
 
 FINAL_PHASES = ("READY_TO_INTEGRATE", "INTEGRATING", "INTEGRATED", "NEEDS_ATTENTION")
 FAILED_STATUSES = ("BLOCKED", "FAILED", "TIMED_OUT", "ESCALATE")
-TYPE_ORDER = {"PI": 0, "BUG": 1, "TASK": 2, "CR": 3}
 
 
 def _env_float(name: str, default: float) -> float:
@@ -46,9 +45,11 @@ def _env_float(name: str, default: float) -> float:
         return default
 
 
-def partial_submit_types() -> set[str]:
-    raw = os.environ.get("MTM_PARTIAL_SUBMIT_TYPES", "TASK")
-    return {part.strip().upper() for part in raw.split(",") if part.strip()}
+def partial_submittable(item_type: str) -> bool:
+    """Ordinary items: always. PI (its own flow): only when MTM_PI_PARTIAL_SUBMIT=1."""
+    if str(item_type or "").upper() == "PI":
+        return os.environ.get("MTM_PI_PARTIAL_SUBMIT", "0") == "1"
+    return True
 
 
 def max_rework() -> int:
@@ -152,7 +153,7 @@ class Decision:
 
 def decide(*, item_type: str, phase: str, item_open: bool, time_left: Optional[float],
            result: dict[str, Any] | None, answer_status: Optional[str], rework_count: int,
-           budget: float, ready_age: Optional[float] = None, heavy: bool = False) -> Decision:
+           budget: float, ready_age: Optional[float] = None) -> Decision:
     """The single decision for one item. ``time_left`` is min(match remaining, item deadline slack)."""
     item_type = str(item_type or "").upper()
     must_finalize = time_left is not None and time_left <= budget
@@ -194,8 +195,7 @@ def decide(*, item_type: str, phase: str, item_open: bool, time_left: Optional[f
             out(CLOSE, "DONE claimed but MVS not passed; answer must be corrected to an honest status")
 
     if status == "PARTIAL":
-        # A Heavy item scores every finished test case, so its honest PARTIAL is always submittable.
-        if item_type not in partial_submit_types() and not heavy:
+        if not partial_submittable(item_type):
             return out(REWORK, f"{item_type} PARTIAL is not submitted by policy") if can_rework else \
                 out(CLOSE, f"{item_type} PARTIAL is not submitted by policy")
         if must_finalize or not can_rework:
@@ -206,20 +206,18 @@ def decide(*, item_type: str, phase: str, item_open: bool, time_left: Optional[f
 
 
 def priority_key(*, item_type: str, slack: Optional[float], has_deadline: bool, submit_ready: bool,
-                 budget: float, value: float, key: str) -> tuple:
+                 budget: float, key: str) -> tuple:
     """One ordering for the ready queue, the PI-first integration gate and dispatch.
 
-    1. a ready (submit-eligible) deadline item inside the critical window that still has submit_budget;
+    Two flows only: PI and ordinary items. Ordinary items are never ranked by type, points or size.
+    1. a ready (submit-eligible) item with a deadline inside the critical window that still has submit_budget
+       (a time rule that applies to every item alike);
     2. a PI;
-    3. other deadline items, most urgent first;
-    4. items without deadline, highest expected value (completion likelihood x points) first.
+    3. every other item, least time left first (deadline slack, else match remaining), then key.
     """
-    item_type = str(item_type or "").upper()
     if (submit_ready and has_deadline and slack is not None
             and budget <= slack <= critical_deadline_seconds()):
-        return (0, slack, TYPE_ORDER.get(item_type, 2), key)
-    if item_type == "PI":
-        return (1, slack if slack is not None else 0.0, 0, key)
-    if has_deadline:
-        return (2, slack if slack is not None else 1e9, TYPE_ORDER.get(item_type, 2), key)
-    return (3, -float(value or 0), TYPE_ORDER.get(item_type, 2), key)
+        return (0, slack, key)
+    if str(item_type or "").upper() == "PI":
+        return (1, slack if slack is not None else 0.0, key)
+    return (2, slack if slack is not None else 1e9, key)

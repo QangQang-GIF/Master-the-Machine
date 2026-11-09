@@ -230,7 +230,6 @@ PYTHONPATH = "{src_posix}{sep}{target_posix}"
 MTM_NATIVE_COORDINATION = "1"
 MTM_NATIVE_MAX_WORKERS = "5"
 MTM_NATIVE_NORMAL_WORKERS = "4"
-MTM_STRONG_SLOT = "1"
 MTM_ENV = "production"
 """
     (codex_dir / "config.toml").write_text(codex_toml, encoding="utf-8")

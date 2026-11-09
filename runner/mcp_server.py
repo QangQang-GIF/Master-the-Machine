@@ -2067,7 +2067,7 @@ _BULKY_FIELDS = ("descriptionMd", "description", "start_details", "startInstruct
                  "releaseFiles", "prior_attempts")
 _ENVELOPE_SUMMARY_FIELDS = ("task_id", "task_type", "title", "worker_id", "repository_path", "match_root", "base_revision",
                             "points", "deadline_epoch", "time_budget_seconds", "model", "reasoning_effort", "backend",
-                            "heavy", "lane", "agent_profile", "heavy_policy", "selected_skills", "allowed_paths",
+                            "lane", "agent_profile", "selected_skills", "allowed_paths",
                             "evidence_required", "attempt_id", "result_contract")
 
 

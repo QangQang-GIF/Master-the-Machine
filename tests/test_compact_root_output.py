@@ -26,7 +26,7 @@ def test_start_work_is_saved_and_summarised(tmp_path):
 def test_claim_task_keeps_spawn_fields_and_points_to_full_envelope(tmp_path):
     env = {"task_id": "CR-01", "task_type": "CR", "title": "t", "worker_id": "cr-01", "match_root": "/m",
            "repository_path": "/r", "time_budget_seconds": 900, "model": "gpt-6.1-sol", "reasoning_effort": "medium",
-           "agent_profile": "team_feature_worker", "lane": "normal", "heavy": False, "selected_skills": ["mtm-cr-worker"],
+           "agent_profile": "team_feature_worker", "lane": "normal", "selected_skills": ["mtm-cr-worker"],
            "description": BIG, "metadata": {"start_details": {"files": {"a": BIG}}, "company_context": {"kb": [BIG]},
                                             "project_runtime_path": "/p/project_runtime.py", "match_id": "M1",
                                             "worker_id": "cr-01", "worker_result_path": "/m/worker_result.json",

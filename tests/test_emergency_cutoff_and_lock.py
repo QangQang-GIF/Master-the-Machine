@@ -17,8 +17,9 @@ def test_emergency_cutoff_at_120s(tmp_path):
     subprocess.run(["git", "-C", str(repo), "add", "."], check=True, capture_output=True)
     subprocess.run(["git", "-C", str(repo), "commit", "-m", "init"], check=True, capture_output=True)
 
-    c = NativeTaskCoordinator(tmp_path / "state", repo, repo / "source", "source", "MATCH")
-    
+    c = NativeTaskCoordinator(tmp_path / "state", repo, repo / "source", "source", "MATCH",
+                              max_workers=3, normal_workers=2)   # two ordinary workers (deadline items are ordinary)
+
     # Task 1: deadline slack = 150s (> 120s) -> Should NOT emergency flush
     # Task 2: deadline slack = 90s (<= 120s) -> Should emergency flush
     server_now = 1000
@@ -163,9 +164,9 @@ def test_global_8s_lock_and_ready_sorting(tmp_path):
     plan = c.plan_tasks()
     assert plan["integrationOwner"] is None
 
-    # 2. Solution v3 S9': items without deadline are ordered by expected value (CR-01 140 > BUG-01 80)
+    # 2. Ordinary items are treated alike: same time left -> key order (points are ignored)
     ready_keys = [r["key"] for r in plan["readyToIntegrate"]]
-    assert ready_keys == ["CR-01", "BUG-01"]
+    assert ready_keys == ["BUG-01", "CR-01"]
 
     # 3. BUG-01 acquires lock immediately
     integ = c.begin_integration("BUG-01")

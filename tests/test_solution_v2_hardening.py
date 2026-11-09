@@ -176,17 +176,25 @@ def _fill(c, keys):
 def _base_items():
     items = [{"key": f"CR-0{i}", "type": "CR", "status": "OPEN", "points": 100} for i in range(1, 5)]
     items.append({"key": "BUG-01", "type": "BUG", "status": "OPEN", "points": 80, "deadline_epoch": 100000})
+    items.append({"key": "PI-00", "type": "PI", "status": "OPEN", "points": 90})
     return items
 
 
-BASE_BUSY = ["CR-01", "CR-02", "CR-03", "CR-04", "BUG-01"]
+BASE_BUSY = ["CR-01", "CR-02", "CR-03", "BUG-01", "PI-00"]   # 4 ordinary workers + the PI-flow base slot
+
+
+def _fill_base(c):
+    burst = c.pi_burst_slots
+    c.pi_burst_slots = 0                       # PI-00 occupies the base slot above normal_workers
+    _fill(c, BASE_BUSY)
+    c.pi_burst_slots = burst
 
 
 def test_pi_gets_a_burst_slot_when_all_base_slots_are_busy(tmp_path):
     items = _base_items() + [{"key": "PI-01", "type": "PI", "status": "OPEN", "points": 90}]
     c = _burst_coordinator(tmp_path, items, burst=2)
     c.pi_burst_slots = 0
-    _fill(c, BASE_BUSY)
+    _fill_base(c)
     assert c.plan_tasks()["selected"] == []                  # without burst the PI would have to wait
     c.pi_burst_slots = 2
     assert [t["key"] for t in c.plan_tasks()["selected"]] == ["PI-01"]
@@ -196,9 +204,9 @@ def test_burst_slots_are_pi_only_and_stack_up_to_the_limit(tmp_path):
     items = _base_items() + [{"key": "CR-05", "type": "CR", "status": "OPEN", "points": 100}]
     items += [{"key": f"PI-0{i}", "type": "PI", "status": "OPEN", "points": 90} for i in range(1, 4)]
     c = _burst_coordinator(tmp_path, items, burst=2)
-    _fill(c, BASE_BUSY)
+    _fill_base(c)
     sel = [t["key"] for t in c.plan_tasks()["selected"]]
-    assert "CR-05" not in sel                                # an ordinary item never takes a burst slot
+    assert "CR-05" not in sel and "CR-04" not in sel                                # an ordinary item never takes a burst slot
     assert sel == ["PI-01", "PI-02"]                         # two PIs start at once, the third waits
 
 
@@ -208,7 +216,9 @@ def test_running_pi_does_not_take_base_slots_from_ordinary_work(tmp_path):
     c = _burst_coordinator(tmp_path, items, burst=1)
     _fill(c, ["PI-01", "CR-01", "CR-02", "CR-03", "BUG-01"])  # PI sits in its burst slot
     sel = [t["key"] for t in c.plan_tasks()["selected"]]
-    assert sel == ["CR-04"]                                  # a base slot is still free for ordinary work
+    # Two flows: ordinary items (deadline or not) use at most normal_workers (4 here, all busy);
+    # PI-01 sits in its burst slot, so the free base slot goes to the next PI, never to CR-04.
+    assert sel == ["PI-00"]
 
 
 # ---- PI-first integration gate ---------------------------------------------------------------------

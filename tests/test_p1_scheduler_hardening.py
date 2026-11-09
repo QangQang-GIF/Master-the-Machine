@@ -40,7 +40,7 @@ def test_p1_scheduler_priority_tiers(tmp_path):
     # Selected order must be:
     # 1. PI-01 (Tier 0: Product Incident, a speed race timed from reveal)
     # 2. TASK-03 (Tier 1: emergency deadline <= 180s)
-    # 3. CR-01 (Tier 3: Higher ROI than BUG-02: 140/2.5=56 vs 20/1.5=13.3)
+    # 3. BUG-02 (ordinary items are treated alike: same time left -> key order; points are ignored)
     assert selected_keys[0] == "PI-01"
     assert selected_keys[1] == "TASK-03"
-    assert selected_keys[2] == "CR-01"
+    assert selected_keys[2] == "BUG-02"
