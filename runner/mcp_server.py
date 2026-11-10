@@ -1377,6 +1377,18 @@ class MCPHelperServer:
                 http_status=None, request_id=None, summary=f"Calling Game Master start work for {backlog_item_key}")
         return self.adapter.start_working(match_uuid_or_task_id=self.match_uuid, backlog_item_key=backlog_item_key)
 
+    def _timing(self, step: str, key: str, **seconds: float) -> None:
+        """Durations of slow helper steps, for post-match analysis (2SAFTO0S: one dispatch took 74 s, cause unknown)."""
+        try:
+            path = (Path(self.workspace_root) / "team-sdlc-pack" / "state" / _safe_name(self.match_code or "match")
+                    / "timings.ndjson")
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with path.open("a", encoding="utf-8") as fh:
+                fh.write(json.dumps({"at": datetime.now(timezone.utc).isoformat(), "step": step, "key": key,
+                                     **{k: round(v, 2) for k, v in seconds.items()}}) + "\n")
+        except Exception:
+            pass
+
     def dispatch_tasks(self, items: List[Dict[str, Any]]) -> Dict[str, Any]:
         """Start Work + claim for several items selected by plan_tasks, in one call.
 
@@ -1411,6 +1423,7 @@ class MCPHelperServer:
                         started[key] = exc
         out = []
         for key, wid, est in todo:
+            t0 = time.monotonic()
             try:
                 try:
                     self.start_work(key, _prefetched=started[key])
@@ -1419,8 +1432,11 @@ class MCPHelperServer:
                         raise
                     sys.stderr.write(f"Start Work for {key} failed in parallel ({first}); retrying once\n")
                     self.start_work(key)              # Start Work is idempotent (a repeat returns replay=true)
+                t1 = time.monotonic()
                 claim = self.claim_task(key, wid, est)
-                out.append(compact_root_output(self, "claim_task", {"backlogItemKey": key, "workerId": wid}, claim))
+                entry = compact_root_output(self, "claim_task", {"backlogItemKey": key, "workerId": wid}, claim)
+                self._timing("dispatch", key, start_work=t1 - t0, claim=time.monotonic() - t1)
+                out.append(entry)
             except Exception as exc:
                 out.append({"backlogItemKey": key, "error": str(exc)})
         result: Dict[str, Any] = {"dispatched": out}
@@ -1494,6 +1510,7 @@ class MCPHelperServer:
                 delivered = {}
                 result["files"] = delivered
 
+            _t_http = time.monotonic()
             if public_paths:
                 from runner.announced_inputs import resolve_announced_files
                 unavailable = []
@@ -1528,6 +1545,7 @@ class MCPHelperServer:
                 if "unavailableAnnouncedFiles" in result and challenge_rel in result["unavailableAnnouncedFiles"]:
                     result["unavailableAnnouncedFiles"].remove(challenge_rel)
 
+            _t_files = time.monotonic()
             # Attempt official QA test fixture & company context fetching via company tools (no synthetic generation!)
             try:
                 fixture_res = self.fetch_fixture(backlog_item_key, write_to_disk=not bool(self.native))
@@ -1542,6 +1560,8 @@ class MCPHelperServer:
             except Exception:
                 pass
 
+            self._timing("start_work", backlog_item_key, announced_files=_t_files - _t_http,
+                         company_prefetch=time.monotonic() - _t_files)
             if self.native:
                 self.native.register_started(backlog_item_key, result)
 
@@ -1695,6 +1715,10 @@ class MCPHelperServer:
                 native.end_integration(key, success=False)
                 raise RuntimeError(f"{key}: git cherry failed: {cherry.stderr.strip()[:200]}")
             todo = [line.split()[1] for line in cherry.stdout.splitlines() if line.startswith("+ ")]
+            # A worker that merged the root branch has a merge commit; its content already comes with the
+            # commits around it, and cherry-picking a merge needs -m: skip merges.
+            todo = [c for c in todo
+                    if len(git("rev-list", "--parents", "-n", "1", c).stdout.split()) <= 2]
             if todo:
                 pick = git("cherry-pick", "--allow-empty", *todo, t=120)
                 pick = self._resolve_bookkeeping_conflicts(git, pick)
@@ -2712,7 +2736,8 @@ def compact_root_output(server: "MCPHelperServer", tool_name: str, args: Dict[st
         if desc:  # a short excerpt so a worker that skips the file still knows the gist
             summary["description_excerpt"] = desc[:1200] + ("... [truncated: read full_envelope_path]" if len(desc) > 1200 else "")
         summary["metadata"] = {k: meta.get(k) for k in ("match_root", "project_runtime_path", "match_id", "worker_id",
-                                                         "worker_result_path", "attempt_id", "worker_checkpoint_path")
+                                                         "worker_result_path", "attempt_id", "worker_checkpoint_path",
+                                                         "environment_readme")
                                if meta.get(k) is not None}
         if meta.get("company_tools"):
             summary["metadata"]["company_tools"] = [t.get("name") for t in meta["company_tools"] if isinstance(t, dict)]

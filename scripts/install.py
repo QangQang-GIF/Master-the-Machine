@@ -229,6 +229,9 @@ args = ["-m", "runner.mcp_server"]
 cwd = "{target_posix}"
 startup_timeout_sec = 15
 tool_timeout_sec = 300
+# The pack's own helper: its tools run without the per-call auto-review (2SAFTO0S: 161 reviews, all allowed,
+# ~2.4 s each before every Root and worker MCP call).
+default_tools_approval_mode = "approve"
 
 [mcp_servers.mtm_minimal.env]
 PYTHONPATH = "{src_posix}{sep}{target_posix}"

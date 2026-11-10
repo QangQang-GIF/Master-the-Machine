@@ -533,8 +533,9 @@ class NativeTaskCoordinator:
             exclude = common / "info" / "exclude"
             exclude.parent.mkdir(parents=True, exist_ok=True)
             text = exclude.read_text(encoding="utf-8") if exclude.is_file() else ""
-            if "worker_result.json" not in text.split():
-                exclude.write_text(text + ("" if not text or text.endswith("\n") else "\n") + "worker_result.json\n",
+            missing = [p for p in ("worker_result.json", "node_modules.partial-*") if p not in text.split()]
+            if missing:
+                exclude.write_text(text + ("" if not text or text.endswith("\n") else "\n") + "\n".join(missing) + "\n",
                                    encoding="utf-8")
         except Exception:
             pass
@@ -643,7 +644,9 @@ class NativeTaskCoordinator:
                                      "project_runtime_path": str(Path(__file__).resolve().parents[3] / "runner" / "project_runtime.py"),
                                      "match_id": self.match_id, "worker_id": worker_id,
                                      "submit_template": details.get("submitTemplate"),
-                                     "worker_result_path": str(worker_match / "worker_result.json")}}
+                                     "worker_result_path": str(worker_match / "worker_result.json"),
+                                     **({"environment_readme": str(worker_match / "env-require" / "README.md")}
+                                        if (worker_match / "env-require" / "README.md").is_file() else {})}}
             stored = json.loads(row["data"])
             _, server_now, server_remaining = self._clock(db)
             stored["lease"] = {"start_server_epoch": server_now, "start_remaining_seconds": server_remaining,
@@ -734,23 +737,108 @@ class NativeTaskCoordinator:
                 mvs_dst.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copyfile(mvs_challenge_test, mvs_dst)
 
+    @staticmethod
+    def _link_dir(target: Path, link: Path) -> bool:
+        """Directory link without copying: a junction on Windows (no admin rights needed), a symlink elsewhere."""
+        try:
+            if os.name == "nt":
+                import _winapi
+                _winapi.CreateJunction(str(target), str(link))
+            else:
+                os.symlink(target, link, target_is_directory=True)
+            return True
+        except Exception:
+            if os.name == "nt":
+                res = subprocess.run(["cmd", "/c", "mklink", "/J", str(link), str(target)],
+                                     capture_output=True, timeout=10, check=False)
+                return res.returncode == 0
+            return False
+
+    @staticmethod
+    def _link_target(entry: Path) -> Path | None:
+        """Where a node_modules entry that is a symlink/junction points (None for a real directory or file)."""
+        try:
+            if entry.is_symlink() or (os.name == "nt" and getattr(entry, "is_junction", lambda: False)()):
+                return Path(os.path.realpath(entry))
+        except OSError:
+            return None
+        return None
+
     def _provision_worker_sandbox(self, worker_match: Path) -> None:
-        """Link shared read-only dependencies (src/node_modules) into worker worktree for zero-latency sandbox execution."""
-        src_nm = self.match_root / "src" / "node_modules"
-        dst_nm = worker_match / "src" / "node_modules"
-        if src_nm.is_dir() and (worker_match / "src").is_dir() and not dst_nm.exists() and not dst_nm.is_symlink():
+        """Give the worker its own node_modules trees without reinstalling.
+
+        Third-party packages are linked to the prepared root copy (read-only use). Workspace packages (yarn/pnpm/npm
+        workspaces link node_modules/<pkg> to <src>/packages/<pkg>) are linked to the WORKER's own packages, so the
+        worker's builds and tests run its changed source. 2SAFTO0S: the whole root node_modules was one junction, so
+        @actual-app/core etc. resolved to the root checkout; three workers patched vite.config with aliases to work
+        around it and CR-07/BUG-11 then conflicted on that file. Tool caches (.vite, .vitest, .cache) stay per worker.
+        """
+        src_root = self.match_root / "src"
+        worker_src = worker_match / "src"
+        if not src_root.is_dir() or not worker_src.is_dir():
+            return
+        trees = [src_root / "node_modules"]
+        for pattern in ("*/node_modules", "*/*/node_modules"):
+            trees.extend(t for t in src_root.glob(pattern) if t.parent != src_root and "node_modules" not in t.parent.parts)
+        for tree in trees:
+            if tree.is_dir() and self._link_target(tree) is None:
+                rel = tree.relative_to(src_root)
+                if (worker_src / rel).parent.is_dir():
+                    self._mirror_node_modules(tree, worker_src / rel, Path(os.path.realpath(src_root)), worker_src)
+
+    def _mirror_node_modules(self, src_nm: Path, dst_nm: Path, real_src_root: Path, worker_src: Path) -> None:
+        if dst_nm.exists() or dst_nm.is_symlink():
+            return
+        private = {".vite", ".vitest", ".cache", ".vite-temp"}
+
+        def workspace_twin(entry: Path) -> Path | None:
+            target = self._link_target(entry)
+            if target is None:
+                return None
             try:
-                if os.name == "nt":
-                    subprocess.run(
-                        ["cmd", "/c", "mklink", "/J", str(dst_nm), str(src_nm)],
-                        capture_output=True,
-                        timeout=10,
-                        check=False,
-                    )
+                rel = target.relative_to(real_src_root)
+            except ValueError:
+                return None
+            if "node_modules" in rel.parts:
+                return None                      # a store link (e.g. .pnpm): keep the root copy
+            twin = worker_src / rel
+            return twin if twin.exists() else None
+
+        try:
+            dst_nm.mkdir()
+            for entry in src_nm.iterdir():
+                name = entry.name
+                if name in private:
+                    continue
+                if name.startswith("@") and entry.is_dir() and self._link_target(entry) is None:
+                    members = list(entry.iterdir())
+                    if any(workspace_twin(m) for m in members):
+                        scope = dst_nm / name
+                        scope.mkdir()
+                        for m in members:
+                            twin = workspace_twin(m)
+                            if m.is_dir() or twin:
+                                self._link_dir(twin or m, scope / m.name)
+                            else:
+                                shutil.copy2(m, scope / m.name)
+                        continue
+                twin = workspace_twin(entry)
+                if twin is not None:
+                    self._link_dir(twin, dst_nm / name)
+                elif entry.is_dir():
+                    self._link_dir(entry, dst_nm / name)
                 else:
-                    os.symlink(src_nm, dst_nm, target_is_directory=True)
+                    shutil.copy2(entry, dst_nm / name)
+        except Exception:
+            # Never leave a half-built tree (and never rmtree it: on Windows a recursive delete could follow a
+            # junction into the root copy): move it aside and link the prepared copy as before.
+            try:
+                if dst_nm.exists() and not dst_nm.is_symlink():
+                    dst_nm.rename(dst_nm.with_name(f"{dst_nm.name}.partial-{int(time.time())}"))
             except Exception:
                 pass
+            if not dst_nm.exists():
+                self._link_dir(src_nm, dst_nm)
 
     def task_details(self, key: str) -> dict[str, Any]:
         with self._db() as db:

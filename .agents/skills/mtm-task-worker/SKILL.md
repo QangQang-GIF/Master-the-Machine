@@ -24,3 +24,11 @@ Follow `mtm-init` and `mtm-worker`. Root owns Start Work, integration, push, and
      - **NO browser, NO web server!**
      - Check `answers/TASK-03/evidence/task-03-test-data.json` (pre-fetched by Root from the QA store). Never overwrite an official fixture with synthetic data.
      - Compute the exact metrics required by `challenge/TASK-03.md` and `challenge/TASK-03-submit.schema.json`, write the calculation log to `answers/TASK-03/evidence/`, populate `answers/TASK-03/submit.json` (`status: "DONE"`), commit, and finish in < 90s.
+
+3. **Specification items (write tests / implement a spec)**:
+   - Every normative sentence is a rule, including the general statements in the introduction (e.g. "every rule holds for any number of lines in one import and any number of transactions in one change"); hidden checks are named after them. List them before writing cases.
+   - For each entry point include at least one high-volume case (hundreds of rows / transactions in ONE call) and boundary cases at both ends of every window or limit. If a volume case fails, fix the application, not the case.
+
+4. **Reading values from images (vouchers, screenshots, scans)**:
+   - Never trust one look at a digit string. Make zoomed crops of every region that holds an id or a number (e.g. Pillow if installed, or Playwright: open the image in a page at 3x zoom and screenshot a clip) and read each number digit by digit; read it a second time from a different crop. If the two reads differ, read again until two agree.
+   - Copy every number exactly as printed into `answers/<key>/evidence/` (one line per value with where it appears) before computing; compute from those lines with a script and re-check each result against the image.

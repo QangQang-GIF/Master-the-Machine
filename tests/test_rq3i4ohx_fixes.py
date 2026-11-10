@@ -341,3 +341,45 @@ def test_collect_logs_and_batched_company_calls(tmp_path):
     assert len(out["calls"]) == 6 and Path(out["path"]).is_file() and len(calls) == 6
     res = server.collect_logs("x", "rule-engine", str(server.checkout_root.parent / ".workers" / "logs.json"))
     assert res["unique"] == 1 and Path(res["path"]).is_file()
+
+
+# 2SAFTO0S --------------------------------------------------------------------------------------------------
+def test_worker_node_modules_resolve_workspace_packages_to_the_worker(tmp_path):
+    import os
+    from mtm_competition.scheduling.native import NativeTaskCoordinator
+    root_src, worker_src = tmp_path / "root" / "M" / "src", tmp_path / "w" / "M" / "src"
+    for base in (root_src, worker_src):
+        (base / "packages" / "core").mkdir(parents=True)
+        (base / "packages" / "web").mkdir(parents=True)
+    nm = root_src / "node_modules"
+    (nm / "vite").mkdir(parents=True)
+    (nm / "vite" / "index.js").write_text("x")
+    (nm / "@app").mkdir()
+    os.symlink(root_src / "packages" / "core", nm / "@app" / "core", target_is_directory=True)
+    (nm / "@types" / "node").mkdir(parents=True)
+    os.symlink(root_src / "packages" / "web", nm / "web-pkg", target_is_directory=True)
+    (nm / ".vite").mkdir()
+    (nm / ".yarn-state.yml").write_text("state")
+    c = NativeTaskCoordinator.__new__(NativeTaskCoordinator)
+    c.match_root = root_src.parent
+    c._provision_worker_sandbox(worker_src.parent)
+    wnm = worker_src / "node_modules"
+    assert wnm.is_dir() and not wnm.is_symlink()
+    assert os.path.realpath(wnm / "@app" / "core") == os.path.realpath(worker_src / "packages" / "core")
+    assert os.path.realpath(wnm / "web-pkg") == os.path.realpath(worker_src / "packages" / "web")
+    assert os.path.realpath(wnm / "vite") == os.path.realpath(nm / "vite")
+    assert os.path.realpath(wnm / "@types") == os.path.realpath(nm / "@types")
+    assert not (wnm / ".vite").exists() and (wnm / ".yarn-state.yml").read_text() == "state"
+
+
+def test_envelope_points_to_the_environment_readme(native_server):
+    server = native_server
+    (server.match_root / "env-require").mkdir()
+    (server.match_root / "env-require" / "README.md").write_text("On a fresh server, set a local test password")
+    git(server.checkout_root, "add", "-A")
+    git(server.checkout_root, "commit", "-m", "env readme")
+    server.start_work("TASK-01")
+    claim = server.claim_task("TASK-01", "worker-01", 120)
+    from runner.mcp_server import compact_root_output
+    summary = compact_root_output(server, "claim_task", {"backlogItemKey": "TASK-01", "workerId": "worker-01"}, claim)
+    assert summary["taskEnvelope"]["metadata"]["environment_readme"].endswith(str(Path("env-require") / "README.md"))
