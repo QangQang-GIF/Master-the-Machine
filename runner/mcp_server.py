@@ -1327,7 +1327,13 @@ class MCPHelperServer:
         out = []
         for key, wid, est in todo:
             try:
-                self.start_work(key, _prefetched=started[key])
+                try:
+                    self.start_work(key, _prefetched=started[key])
+                except Exception as first:
+                    if not isinstance(started[key], BaseException):
+                        raise
+                    sys.stderr.write(f"Start Work for {key} failed in parallel ({first}); retrying once\n")
+                    self.start_work(key)              # Start Work is idempotent (a repeat returns replay=true)
                 claim = self.claim_task(key, wid, est)
                 out.append(compact_root_output(self, "claim_task", {"backlogItemKey": key, "workerId": wid}, claim))
             except Exception as exc:
@@ -2101,6 +2107,7 @@ class MCPHelperServer:
             if not isinstance(worker_result, dict):
                 raise ValueError(f"{backlog_item_key}: worker_result.json is not a JSON object")
         result = native.record_worker_result(backlog_item_key, worker_result)
+        self._report_worker_tests(backlog_item_key, result)
         if worker_match is not None and details.get("workerId"):
             self._stop_worker_server(worker_match, str(details["workerId"]))
         if isinstance(result, dict) and isinstance(result.get("workerResult"), dict):
@@ -2109,6 +2116,23 @@ class MCPHelperServer:
             result["workerResult"] = {k: wr.get(k) for k in ("status", "answer_status", "verification_status",
                                                              "mvs_passed") if k in wr}
         return result
+
+    def _report_worker_tests(self, key: str, result: Any) -> None:
+        """BACKLOG_TESTS for the Player dashboard from the recorded worker result (RQ3I4OHX: every item showed
+        "Tests: Not reported"). Best effort; never blocks the Root."""
+        try:
+            wr = result.get("workerResult") if isinstance(result, dict) else None
+            if not self.telemetry or not isinstance(wr, dict) or not isinstance(wr.get("test_results"), list):
+                return
+            rows = [t for t in wr["test_results"] if isinstance(t, dict)]
+            passed = sum(1 for t in rows if t.get("passed") is True and t.get("exit_code") == 0)
+            executed, failed = len(rows), len(rows) - passed
+            status = "NOT_RUN" if not executed else ("PASSED" if not failed else "FAILED")
+            self.telemetry.emit_backlog_tests(backlog_id=key, status=status, required=executed, executed=executed,
+                                              passed=passed, failed=failed, skipped=0,
+                                              summary=f"{passed}/{executed} worker verification commands passed")
+        except Exception as exc:
+            sys.stderr.write(f"Warning: BACKLOG_TESTS for {key}: {exc}\n")
 
     def _stop_worker_server(self, worker_match: Path, worker_id: str) -> None:
         runtime = Path(__file__).resolve().parent / "project_runtime.py"
@@ -2156,6 +2180,9 @@ class MCPHelperServer:
         ready = [r.get("key") for r in plan.get("readyToIntegrate") or [] if fresh(("ready", r.get("key")))]
         if ready:
             events["readyToIntegrate"] = ready
+        free = [t.get("key") for t in plan.get("selected") or [] if fresh(("selected", t.get("key")))]
+        if free:
+            events["dispatchable"] = free         # a slot is free for these: dispatch_tasks them
         finished = []
         for row in plan.get("active") or []:
             key, wt = row.get("key"), row.get("worktreeRoot")

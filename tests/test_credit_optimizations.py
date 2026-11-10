@@ -359,8 +359,8 @@ def test_three_lanes_normal_deadline_pi(tmp_path, monkeypatch):
     assert len(plan["selected"]) == 9
 
 
-def test_ordinary_items_never_use_deadline_or_pi_lanes_without_borrowing(tmp_path, monkeypatch):
-    monkeypatch.setenv("MTM_LANE_BORROW", "0")
+def test_ordinary_items_never_use_deadline_or_pi_lanes(tmp_path, monkeypatch):
+    monkeypatch.delenv("MTM_LANE_BORROW", raising=False)          # default: no borrowing (3 / 3 / 3 strict)
     c = _lane_coordinator(tmp_path, monkeypatch)
     items = [{"key": f"TASK-{i:02d}", "type": "TASK", "status": "OPEN", "points": 10} for i in range(1, 8)]
     c.register_projection({"status": "RUNNING", "server_epoch": time.time(), "remaining_seconds": 2400, "items": items})
@@ -438,7 +438,8 @@ def test_bridge_starts_empty_and_keys_cache_by_match(tmp_path, monkeypatch):
 
 
 def test_ordinary_items_borrow_idle_special_slots_keeping_one_free(tmp_path, monkeypatch):
-    """RQ3I4OHX: TASK-05 waited 17 min for a normal slot while PI/deadline slots sat idle."""
+    """Optional (MTM_LANE_BORROW=1, off by default): ordinary items borrow idle special slots."""
+    monkeypatch.setenv("MTM_LANE_BORROW", "1")
     c = _lane_coordinator(tmp_path, monkeypatch)
     items = [{"key": f"TASK-{i:02d}", "type": "TASK", "status": "OPEN", "points": 10} for i in range(1, 10)]
     c.register_projection({"status": "RUNNING", "server_epoch": time.time(), "remaining_seconds": 2400, "items": items})

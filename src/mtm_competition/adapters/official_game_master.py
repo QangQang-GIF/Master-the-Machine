@@ -151,13 +151,6 @@ def _env_seconds(name: str, default: float) -> float:
         return default
 
 
-def _env_int(name: str, default: int) -> int:
-    try:
-        return max(1, int(os.environ.get(name, default)))
-    except (TypeError, ValueError):
-        return default
-
-
 class OfficialGameMasterAdapter(GameMasterAdapter):
     """Production HTTP REST connector for the official BTC tournament platform.
 

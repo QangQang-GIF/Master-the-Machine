@@ -283,3 +283,21 @@ def test_prepare_runs_the_exams_own_setup_script(tmp_path):
     (match / "package.json").write_text('{"packageManager": "yarn@4.17.1"}')
     results = ProjectRuntime(match, "M2").prepare()
     assert results and results[0].ok and (match / "setup.txt").read_text().strip() == "official-setup-ran"
+
+
+def test_recorded_result_reports_backlog_tests(native_server):
+    events = []
+    server = native_server
+    server.telemetry = type("T", (), {"emit_backlog_tests": lambda self, **kw: events.append(kw),
+                                      "__getattr__": lambda self, name: (lambda *a, **k: None)})()
+    finish_worker(server)
+    server.record_worker_result("TASK-01")
+    assert events and events[0]["status"] == "PASSED" and events[0]["passed"] == 1
+
+
+def test_wait_reports_a_free_slot_once(native_server):
+    server = native_server
+    server.refresh_match()
+    events = server._local_wait_events()
+    assert events and events.get("dispatchable") == ["TASK-01"]
+    assert not (server._local_wait_events() or {}).get("dispatchable")

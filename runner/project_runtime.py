@@ -264,7 +264,7 @@ class ProjectRuntime:
         return path
 
     def run(self, argv: Sequence[str], cwd: str | Path | None = None, timeout: float = 180,
-            _env_overrides: dict[str, str] | None = None) -> CommandResult:
+            _env_overrides: dict[str, str] | None = None, _setup: bool = False) -> CommandResult:
         if not argv:
             raise ValueError("argv cannot be empty")
         workdir = self._resolve_cwd(cwd)
@@ -301,7 +301,11 @@ class ProjectRuntime:
                         cmd_args[0] = resolved
             # Enabled by the installer (MTM_RUN_IDLE_TIMEOUT=90 in the workspace shell environment).
             idle = float(os.environ.get("MTM_RUN_IDLE_TIMEOUT", "0") or 0)
-            if idle > 0:
+            if idle > 0 and _setup:
+                # Preparation (install/build) may be silent for minutes (dependency fetch) and run past 10 min:
+                # only a generous hang guard, no worker caps.
+                idle = max(idle, float(os.environ.get("MTM_SETUP_IDLE_TIMEOUT", "600")))
+            elif idle > 0:
                 idle = min(max(idle, 1.0), float(os.environ.get("MTM_RUN_IDLE_MAX", "180")))
                 timeout = min(float(timeout), float(os.environ.get("MTM_RUN_TIMEOUT_MAX", "600")))
                 code, out, err, why = _run_watched(cmd_args, workdir, env, max(0.1, timeout), idle)
@@ -428,12 +432,12 @@ class ProjectRuntime:
             official = [shutil.which("pwsh"), "-NoProfile", "-File", str(ps1)]
         if self.worker_id == "main" and official:
             # The exam's own documented setup (RQ3I4OHX: bundled Yarn install + build) beats a generic guess.
-            results.append(self.run(official, cwd=self.match_root, timeout=900))
+            results.append(self.run(official, cwd=self.match_root, timeout=1800, _setup=True))
             if not results[-1].ok:
                 return results
             doctor = self.doctor_command()
             if doctor:
-                results.append(self.run(doctor, cwd=self.doctor_cwd(), timeout=120))
+                results.append(self.run(doctor, cwd=self.doctor_cwd(), timeout=120, _setup=True))
             return results
         if manifest:
             pm = self._package_manager()
@@ -441,36 +445,36 @@ class ProjectRuntime:
             elif pm == "npm": install = ["npm", "ci"] if (self.app_root / "package-lock.json").exists() else ["npm", "install"]
             elif pm == "yarn": install = ["yarn", "install", "--immutable"]
             else: install = [pm, "install"]
-            results.append(self.run(install, timeout=600))
+            results.append(self.run(install, timeout=600, _setup=True))
             if not results[-1].ok: return results
             if any((self.app_root / p).exists() for p in ("prisma/schema.prisma", "prisma/schema")):
                 if self.worker_id != "main":
-                    results.append(self.run(self._package_cmd("exec", "prisma", "generate"), timeout=180))
+                    results.append(self.run(self._package_cmd("exec", "prisma", "generate"), timeout=180, _setup=True))
                     return results
                 results.extend(self._ensure_scoped_databases())
                 for script in ("db:generate",):
                     if script in manifest.get("scripts", {}):
-                        results.append(self.run(self._package_cmd("run", script), timeout=180))
+                        results.append(self.run(self._package_cmd("run", script), timeout=180, _setup=True))
                         if not results[-1].ok: return results
-                results.append(self.run(self._package_cmd("exec", "prisma", "generate"), timeout=180))
+                results.append(self.run(self._package_cmd("exec", "prisma", "generate"), timeout=180, _setup=True))
                 if not results[-1].ok: return results
                 if "db:deploy" in manifest.get("scripts", {}):
-                    results.append(self.run(self._package_cmd("run", "db:deploy"), timeout=300))
+                    results.append(self.run(self._package_cmd("run", "db:deploy"), timeout=300, _setup=True))
                 elif (self.app_root / "prisma" / "migrations").is_dir():
-                    results.append(self.run(self._package_cmd("exec", "prisma", "migrate", "deploy"), timeout=300))
+                    results.append(self.run(self._package_cmd("exec", "prisma", "migrate", "deploy"), timeout=300, _setup=True))
                 if results and not results[-1].ok: return results
                 if "db:seed" in manifest.get("scripts", {}):
-                    results.append(self.run(self._package_cmd("run", "db:seed"), timeout=300))
+                    results.append(self.run(self._package_cmd("run", "db:seed"), timeout=300, _setup=True))
                     if not results[-1].ok: return results
         if self.worker_id != "main":
             return results
         doctor = self.doctor_command()
         if doctor:
-            results.append(self.run(doctor, cwd=self.doctor_cwd(), timeout=120))
+            results.append(self.run(doctor, cwd=self.doctor_cwd(), timeout=120, _setup=True))
             if not results[-1].ok: return results
         build = self.build_command()
         if build:
-            results.append(self.run(build, timeout=600))
+            results.append(self.run(build, timeout=600, _setup=True))
         return results
 
 

@@ -92,7 +92,7 @@ class NativeTaskCoordinator:
                                  int(os.environ.get("MTM_FINISH_MARGIN_SECONDS", "0") or 0))
         # Idle deadline/PI slots may take ordinary items, always keeping `lane_keep_free` slots open in each
         # special lane (RQ3I4OHX: TASK-05 waited 17 min for a normal slot while 4-5 PI/deadline slots sat idle).
-        self.lane_borrow = os.environ.get("MTM_LANE_BORROW", "1") != "0"
+        self.lane_borrow = os.environ.get("MTM_LANE_BORROW", "0") == "1"
         # A deadline item this close to closing is dispatched before everything else (items with less than
         # flush_seconds + 30 s left are not started at all: they would be flushed before delivering anything).
         self.imminent_seconds = max(self.flush_seconds + 60, int(os.environ.get("MTM_IMMINENT_SECONDS", "600") or 600))
