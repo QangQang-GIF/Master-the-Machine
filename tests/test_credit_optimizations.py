@@ -369,3 +369,53 @@ def test_ordinary_items_never_use_deadline_or_pi_lanes(tmp_path, monkeypatch):
         c.register_started(t["key"], {"files": {}})
         c.claim_task(t["key"], t["key"].lower(), 300)
     assert c.plan_tasks()["laneSlotsFree"] == {"normal": 0, "deadline": 3, "pi": 3}
+
+
+def test_replay_after_another_push_resends_journal_unchanged(native_server, monkeypatch):
+    """Unknown outcome, then another commit lands on the branch: the replay must send the journaled bytes,
+    not re-run Git/guard/auto-heal (which would change the answer or revision and block the item)."""
+    monkeypatch.setenv("MTM_SUBMIT_FAST_REPLAYS", "0")
+    server = native_server
+    finish_worker(server)
+    server.record_worker_result("TASK-01")
+    board, sent = server.adapter, []
+    real = board.submit_work
+
+    def flaky(**kwargs):
+        sent.append(kwargs)
+        if len(sent) == 1:
+            raise TimeoutError("The read operation timed out")
+        return real(**kwargs)
+
+    board.submit_work = flaky
+    with pytest.raises(TimeoutError):
+        server.integrate_and_submit("TASK-01")
+    # another item's commit is pushed meanwhile
+    (server.match_root / "other.txt").write_text("x")
+    git(server.checkout_root, "add", "-A")
+    git(server.checkout_root, "commit", "-m", "other item")
+    git(server.checkout_root, "push", "origin", "main")
+    out = server.integrate_and_submit("TASK-01")
+    assert out["status"] == "ACCEPTED" and len(sent) == 2
+    assert sent[0]["serialized_body_bytes"] == sent[1]["serialized_body_bytes"]
+
+
+def test_422_keeps_item_open_for_one_fix(native_server):
+    class GameMasterError(Exception):
+        def __init__(self, msg, status_code, error_code):
+            super().__init__(msg)
+            self.status_code, self.error_code = status_code, error_code
+    server = native_server
+    finish_worker(server)
+    server.record_worker_result("TASK-01")
+
+    def reject(**kwargs):
+        raise GameMasterError("evidence missing", status_code=422, error_code="VALIDATION_ERROR")
+
+    real = server.adapter.submit_work
+    server.adapter.submit_work = reject
+    with pytest.raises(GameMasterError):
+        server.integrate_and_submit("TASK-01")
+    assert server.native.task_details("TASK-01")["phase"] == "READY_TO_INTEGRATE"   # not CLOSED
+    server.adapter.submit_work = real
+    assert server.integrate_and_submit("TASK-01")["status"] == "ACCEPTED"

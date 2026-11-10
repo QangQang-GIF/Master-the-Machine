@@ -95,7 +95,7 @@ def _terminate_tree(proc: subprocess.Popen[str], grace: float = 2.0) -> None:
 
 def run_web_session(runtime: ProjectRuntime, server_argv: list[str],
                     check_argv: list[str], readiness_url: str | None = None,
-                    timeout: float = 300, readiness_timeout: float = 45) -> CommandResult:
+                    timeout: float = 180, readiness_timeout: float = 45) -> CommandResult:
     """Start a local server, wait for HTTP readiness, run a check, then reap it.
 
     Only loopback URLs on the exact match/worker runtime port are accepted.

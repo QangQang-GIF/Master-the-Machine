@@ -221,7 +221,7 @@ default_subagent_model = "gpt-6.1-sol"
 default_subagent_reasoning_effort = "medium"
 
 [shell_environment_policy]
-set = {{ PYTHONUTF8 = "1", PYTHONIOENCODING = "utf-8", MTM_RUN_IDLE_TIMEOUT = "150" }}
+set = {{ PYTHONUTF8 = "1", PYTHONIOENCODING = "utf-8", MTM_RUN_IDLE_TIMEOUT = "90" }}
 
 [mcp_servers.mtm_minimal]
 command = "{python_exe}"
@@ -242,7 +242,7 @@ MTM_WORKER_EFFORT = "medium"
 MTM_ENV = "production"
 PYTHONUTF8 = "1"
 MTM_COMPANY_TOOL_TIMEOUT = "10"
-MTM_RUN_IDLE_TIMEOUT = "150"
+MTM_RUN_IDLE_TIMEOUT = "90"
 """
     (codex_dir / "config.toml").write_text(codex_toml, encoding="utf-8")
     (target_pack_dir / ".codex").mkdir(parents=True, exist_ok=True)

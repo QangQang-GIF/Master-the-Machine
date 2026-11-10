@@ -12,7 +12,7 @@ Follow `mtm-init` boundaries, TaskEnvelope constraints, and returned submit temp
 **Credit and time discipline (everything you print stays in your context for every later turn):**
 - Company tools are yours: call `call_company_tool`, `collect_logs` (absolute `outPath` in your worktree; `PENDING` means call again with the same arguments later) and `fetch_fixture` directly through the `mtm_minimal` MCP tools. Your helper forwards them to the Root helper, which holds the credentials and retries timeouts. Never ask the Root to fetch for you.
 - ProjectRuntime `run`/`session` summarise long output (exit code, failing lines with log line numbers, tail, full log path); add `--log answers/<key>/evidence/<name>.log` to keep the full output as evidence. Read only line ranges of a log; never `cat` whole logs.
-- A command silent for 150 s is stopped as hung (exit 124); `run` is capped at 900 s. Never start a server through `run` or in the foreground; use `session` for captures.
+- A command silent for 90 s is stopped as hung (exit 124); `run` defaults to 180 s and is capped at 600 s (pass `--timeout` for a known long build). Never start a server through `run` or in the foreground; use `session` for captures.
 - Run the MVS tests and the tests next to your change, with default parallelism. Run a full suite only when the brief requires it, once, at the end.
 - Python runs with UTF-8 (`PYTHONUTF8=1`); read/write files with `encoding="utf-8"`.
 - Before writing `worker_result.json`: every `test_results` row is a real command with `passed: true` and integer `exit_code: 0`; evidence files exist, are nonempty and under `answers/<key>/evidence/`; everything is committed. The Root reads the file itself; your final message is one line.

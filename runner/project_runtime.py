@@ -263,7 +263,7 @@ class ProjectRuntime:
             raise ValueError("command cwd must stay inside match_root")
         return path
 
-    def run(self, argv: Sequence[str], cwd: str | Path | None = None, timeout: float = 300,
+    def run(self, argv: Sequence[str], cwd: str | Path | None = None, timeout: float = 180,
             _env_overrides: dict[str, str] | None = None) -> CommandResult:
         if not argv:
             raise ValueError("argv cannot be empty")
@@ -294,11 +294,11 @@ class ProjectRuntime:
                         cmd_args = ["cmd.exe", "/c", resolved] + cmd_args[1:]
                     elif Path(resolved).suffix.lower() == ".exe":
                         cmd_args[0] = resolved
-            # Enabled by the installer (MTM_RUN_IDLE_TIMEOUT=150 in the workspace shell environment).
+            # Enabled by the installer (MTM_RUN_IDLE_TIMEOUT=90 in the workspace shell environment).
             idle = float(os.environ.get("MTM_RUN_IDLE_TIMEOUT", "0") or 0)
             if idle > 0:
-                idle = min(max(idle, 1.0), float(os.environ.get("MTM_RUN_IDLE_MAX", "300")))
-                timeout = min(float(timeout), float(os.environ.get("MTM_RUN_TIMEOUT_MAX", "900")))
+                idle = min(max(idle, 1.0), float(os.environ.get("MTM_RUN_IDLE_MAX", "180")))
+                timeout = min(float(timeout), float(os.environ.get("MTM_RUN_TIMEOUT_MAX", "600")))
                 code, out, err, why = _run_watched(cmd_args, workdir, env, max(0.1, timeout), idle)
                 if why:
                     err = (err + ("\n" if err and not err.endswith("\n") else "")
@@ -437,7 +437,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     sub.add_parser("prepare")
     run_parser = sub.add_parser("run")
     run_parser.add_argument("--cwd")
-    run_parser.add_argument("--timeout", type=float, default=300)
+    run_parser.add_argument("--timeout", type=float, default=180)
     run_parser.add_argument("--idle-timeout", type=float, help="Stop after this many seconds without output (capped)")
     run_parser.add_argument("--log", help="Also write the full output to this file (e.g. an evidence log)")
     run_parser.add_argument("--full", action="store_true", help="Print the full output instead of a summary")
@@ -445,7 +445,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     session_parser = sub.add_parser("session", help="Run one local server and evidence/check command with shared ephemeral config")
     session_parser.add_argument("--server-script", default="dev")
     session_parser.add_argument("--url")
-    session_parser.add_argument("--timeout", type=float, default=300)
+    session_parser.add_argument("--timeout", type=float, default=180)
     session_parser.add_argument("--log", help="Also write the full output to this file")
     session_parser.add_argument("--full", action="store_true", help="Print the full output instead of a summary")
     session_parser.add_argument("command", nargs=argparse.REMAINDER)

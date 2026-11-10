@@ -351,7 +351,7 @@ class MCPHelperServer:
         """Invoke an authoritative company tool via Match MCP server."""
         if not self._has_company_credentials():
             try:
-                return self._delegate_company("call", {"name": name, "arguments": arguments or {}}, 45)
+                return self._delegate_company("call", {"name": name, "arguments": arguments or {}}, 35)
             except CompanyBridgeUnavailable:
                 pass                       # fall through to the original, explicit error
         if not self.company_tools_client:
@@ -374,7 +374,7 @@ class MCPHelperServer:
         if not self._has_company_credentials():
             try:
                 return self._delegate_company("fetch_fixture", {"backlogItemKey": backlog_item_key, "toolName": tool_name,
-                                                                "arguments": arguments}, 45)
+                                                                "arguments": arguments}, 35)
             except CompanyBridgeUnavailable as exc:
                 return {"status": "UNAVAILABLE", "reason": str(exc)}
         if not self.company_tools_client:
@@ -1444,9 +1444,10 @@ class MCPHelperServer:
             raise ValueError("backlogItemKey is required")
         entry = self._in_flight_entry(backlog_item_key)
         if entry and answer is None and not git_revision:
+            # Unknown outcome earlier: resend exactly the journaled request.
             journaled = json.loads(bytes(entry["request_body_bytes"]).decode("utf-8"))
-            client_submission_id = journaled["clientSubmissionId"]
-            git_revision, answer = journaled["gitRevision"], journaled["answer"]
+            return self._submit_work_impl(journaled["clientSubmissionId"], backlog_item_key,
+                                          journaled["gitRevision"], journaled["answer"], replay=True)
         if answer is None:
             path = Path(self.match_root) / "answers" / backlog_item_key / "submit.json"
             if not path.is_file():
@@ -1509,7 +1510,7 @@ class MCPHelperServer:
             if not (Path(self.match_root) / "answers" / key / "submit.json").is_file():
                 native.end_integration(key, success=False)
                 raise FileNotFoundError(f"{key}: the worker commits do not contain answers/{key}/submit.json")
-        attempts = max(1, int(os.environ.get("MTM_SUBMIT_FAST_REPLAYS", "2")))
+        attempts = max(0, int(os.environ.get("MTM_SUBMIT_FAST_REPLAYS", "2")))
         for attempt in range(attempts + 1):
             try:
                 self.submit_work(backlog_item_key=key)        # raises unless Game Master accepted it
@@ -1527,8 +1528,13 @@ class MCPHelperServer:
         backlog_item_key: str,
         git_revision: str,
         answer: Dict[str, Any],
+        replay: bool = False,
     ) -> Dict[str, Any]:
-        """Guard, journal, submit with exact body bytes, and emit automatic telemetry."""
+        """Guard, journal, submit with exact body bytes, and emit automatic telemetry.
+
+        replay=True resends a journaled IN_FLIGHT request exactly (same bytes, same idempotency key): no
+        commit/pull/push, no guard and no auto-heal, which could change the answer or revision after
+        another item was pushed and leave the item unsubmittable."""
         if not self.adapter or not self.match_uuid or not self.git_guard or not self.journal:
             raise RuntimeError("Session not configured. Call configure_session first.")
 
@@ -1553,7 +1559,7 @@ class MCPHelperServer:
             required_test_ids = announced_test_ids(details)
 
         # Ensure local commits are pushed to remote origin before pre-submission verification
-        if self.checkout_root:
+        if self.checkout_root and not replay:
             try:
                 # Auto-commit any pending evidence or answer files on disk before push
                 status_res = subprocess.run(["git", "-C", str(self.checkout_root), "status", "--porcelain"], capture_output=True, text=True, timeout=10)
@@ -1576,42 +1582,43 @@ class MCPHelperServer:
             except Exception as e:
                 sys.stderr.write(f"Notice: Auto-commit/push before submit: {e}\n")
 
-        # 1. Pre-submission Git Invariant Verification (GIT-01..05) with Self-Healing Retry
-        try:
-            self.git_guard.validate_pre_submission(
-                target_commit_sha=git_revision,
-                assigned_branch_ref=assigned_branch,
-                backlog_item_key=backlog_item_key,
-                answer_payload=answer,
-                match_root=self.match_root,
-                checkout_root=self.checkout_root,
-                require_remote=False if self.descriptor.get("offline") else True,
-                raise_on_error=True,
-                required_test_ids=required_test_ids,
-            )
-        except Exception as gate_err:
-            sys.stderr.write(f"Submission Gate auto-healing retry for {backlog_item_key}: {gate_err}\n")
-            if isinstance(answer, dict):
-                answer["status"] = "PARTIAL"
-            if self.checkout_root:
-                subprocess.run(["git", "-C", str(self.checkout_root), "add", "-A"], capture_output=True, timeout=15)
-                subprocess.run(["git", "-C", str(self.checkout_root), "commit", "-m", f"Auto-heal evidence for {backlog_item_key}"], capture_output=True, timeout=15)
-                rev_res = subprocess.run(["git", "-C", str(self.checkout_root), "rev-parse", "HEAD"], capture_output=True, text=True, timeout=10)
-                if rev_res.returncode == 0 and rev_res.stdout.strip():
-                    git_revision = rev_res.stdout.strip()
-                if not self.descriptor.get("offline"):
-                    subprocess.run(["git", "-C", str(self.checkout_root), "push", "origin", assigned_branch], capture_output=True, text=True, timeout=30)
-            self.git_guard.validate_pre_submission(
-                target_commit_sha=git_revision,
-                assigned_branch_ref=assigned_branch,
-                backlog_item_key=backlog_item_key,
-                answer_payload=answer,
-                match_root=self.match_root,
-                checkout_root=self.checkout_root,
-                require_remote=False if self.descriptor.get("offline") else True,
-                raise_on_error=False,
-                required_test_ids=required_test_ids,
-            )
+        if not replay:
+            # 1. Pre-submission Git Invariant Verification (GIT-01..05) with Self-Healing Retry
+            try:
+                self.git_guard.validate_pre_submission(
+                    target_commit_sha=git_revision,
+                    assigned_branch_ref=assigned_branch,
+                    backlog_item_key=backlog_item_key,
+                    answer_payload=answer,
+                    match_root=self.match_root,
+                    checkout_root=self.checkout_root,
+                    require_remote=False if self.descriptor.get("offline") else True,
+                    raise_on_error=True,
+                    required_test_ids=required_test_ids,
+                )
+            except Exception as gate_err:
+                sys.stderr.write(f"Submission Gate auto-healing retry for {backlog_item_key}: {gate_err}\n")
+                if isinstance(answer, dict):
+                    answer["status"] = "PARTIAL"
+                if self.checkout_root:
+                    subprocess.run(["git", "-C", str(self.checkout_root), "add", "-A"], capture_output=True, timeout=15)
+                    subprocess.run(["git", "-C", str(self.checkout_root), "commit", "-m", f"Auto-heal evidence for {backlog_item_key}"], capture_output=True, timeout=15)
+                    rev_res = subprocess.run(["git", "-C", str(self.checkout_root), "rev-parse", "HEAD"], capture_output=True, text=True, timeout=10)
+                    if rev_res.returncode == 0 and rev_res.stdout.strip():
+                        git_revision = rev_res.stdout.strip()
+                    if not self.descriptor.get("offline"):
+                        subprocess.run(["git", "-C", str(self.checkout_root), "push", "origin", assigned_branch], capture_output=True, text=True, timeout=30)
+                self.git_guard.validate_pre_submission(
+                    target_commit_sha=git_revision,
+                    assigned_branch_ref=assigned_branch,
+                    backlog_item_key=backlog_item_key,
+                    answer_payload=answer,
+                    match_root=self.match_root,
+                    checkout_root=self.checkout_root,
+                    require_remote=False if self.descriptor.get("offline") else True,
+                    raise_on_error=False,
+                    required_test_ids=required_test_ids,
+                )
 
         # 2. Record In-Flight Submission Journal with canonical serialized bytes (API-06, API-07)
         payload = {
@@ -1718,7 +1725,7 @@ class MCPHelperServer:
             # Terminal rejection: 409 [CLOSED / NOT ALLOWED / EXPIRED], 400, 404, 410, 422
             is_terminal_rejection = (
                 (status_code == 409 and not is_already_submitted and any(k in exc_str for k in ("closed", "not allowed", "deadline", "expired")))
-                or (status_code in (400, 404, 410, 422))
+                or (status_code in (404, 410))
             )
 
             if is_terminal_rejection and self.native:
