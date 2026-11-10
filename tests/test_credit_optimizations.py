@@ -302,3 +302,25 @@ def test_test_row_normalization_is_lossless():
     assert "exit_code" not in normalize_test_row({"command": "x", "passed": True})       # nothing invented
     assert passing_row_problem({"command": "x", "passed": True, "exit_code": 2}) == "exit_code must be the integer 0"
     assert passing_row_problem({"command": "", "passed": True, "exit_code": 0}) == "missing command"
+
+
+def test_pi_burst_slots_add_workers_only_for_pi(tmp_path, monkeypatch):
+    monkeypatch.setenv("MTM_PI_BURST_SLOTS", "2")
+    repo = tmp_path / "checkout"
+    (repo / "project").mkdir(parents=True)
+    git(repo, "init", "-b", "main")
+    git(repo, "config", "user.email", "t@example.invalid")
+    git(repo, "config", "user.name", "t")
+    (repo / "project" / "a.txt").write_text("a")
+    git(repo, "add", ".")
+    git(repo, "commit", "-m", "base")
+    c = NativeTaskCoordinator(tmp_path / "state", repo, repo / "project", "project", "MATCH",
+                              max_workers=5, normal_workers=4)
+    items = [{"key": f"TASK-{i:02d}", "type": "TASK", "status": "OPEN", "points": 10} for i in range(1, 8)]
+    items += [{"key": "PI-02", "type": "PI", "status": "OPEN", "points": 90},
+              {"key": "PI-03", "type": "PI", "status": "OPEN", "points": 80}]
+    c.register_projection({"status": "RUNNING", "server_epoch": time.time(), "remaining_seconds": 2400, "items": items})
+    sel = c.plan_tasks()["selected"]
+    assert {t["key"] for t in sel if t["type"] == "PI"} == {"PI-02", "PI-03"}
+    assert sum(t["type"] != "PI" for t in sel) == 4          # ordinary capacity unchanged (normal_workers=4)
+    assert len(sel) == 6

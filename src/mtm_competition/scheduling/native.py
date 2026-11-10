@@ -69,6 +69,9 @@ class NativeTaskCoordinator:
         self.repository_folder = folder.as_posix()
         self.match_id = match_id
         self.max_workers, self.normal_workers = max_workers, normal_workers
+        # Extra worker slots that ONLY Product Incidents may use, on top of max_workers (MTM_PI_BURST_SLOTS).
+        # A PI is ranked by submission time, so it must never wait behind busy ordinary workers.
+        self.pi_burst_slots = max(0, min(8, int(os.environ.get("MTM_PI_BURST_SLOTS", "0") or 0)))
         self.reserve = max(10, int(integration_reserve_seconds))
         self.clock_max_age = max(10, int(clock_max_age_seconds))
         self.workers_root = self.checkout_root.parent / ".workers" / match_id
@@ -237,7 +240,11 @@ class NativeTaskCoordinator:
             self._set_meta(db, "integration_owner", None)
             self._set_meta(db, "integration_acquired_at", None)
             owner = None
-        response = {"matchStatus": status, "availableSlots": max(0, self.max_workers - len(active)),
+        pi_active = sum(json.loads(r["data"]).get("type") == "PI" for r in active)
+        base_free = max(0, self.max_workers - (len(active) - min(pi_active, self.pi_burst_slots)))
+        burst_free = max(0, self.pi_burst_slots - pi_active)
+        response = {"matchStatus": status, "availableSlots": base_free + burst_free,
+                    "baseSlotsFree": base_free, "piBurstSlotsFree": burst_free,
                     "selected": [], "active": [public_row(r) for r in active], "readyToIntegrate": [],
                     "readyDiagnostics": [], "skippedReady": [], "integrationOwner": owner, "integrationBlocked": [],
                     "overdueWorkers": []}
@@ -387,12 +394,19 @@ class NativeTaskCoordinator:
             candidates.append(((prio_tier, prio_sub, row["key"]), task, urgent, slack))
         candidates.sort(key=lambda r: r[0])
         for _, task, urgent, slack in candidates:
-            if len(response["selected"]) >= response["availableSlots"]:
+            if base_free + burst_free <= 0:
                 break
+            is_pi = task.get("type") == "PI"
+            if not is_pi and base_free <= 0:
+                continue                      # PI burst slots are PI-only
             if not urgent and normals >= self.normal_workers:
                 continue
             if self._overlap(busy_paths, task.get("claimed_paths", [])):
                 continue
+            if is_pi and burst_free > 0:
+                burst_free -= 1               # a PI uses a PI-only slot before a shared one
+            else:
+                base_free -= 1
             response["selected"].append({**task, "urgent": urgent, "slackSeconds": slack})
             busy_paths.update(task.get("claimed_paths", []))
             normals += not urgent
@@ -432,6 +446,7 @@ class NativeTaskCoordinator:
                 if (
                     plan.get("matchStatus") in ("RUNNING", "IN_PROGRESS", "STARTED")
                     and plan["availableSlots"] > 0
+                    and (task_data.get("type") == "PI" or plan.get("baseSlotsFree", 1) > 0)
                     and row["phase"] == "QUEUED"
                     and row["started"]
                     and (urgent or normals < self.normal_workers)
