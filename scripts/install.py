@@ -208,15 +208,20 @@ def install_pack(source_dir: Path, workspace_dir: Path) -> None:
     src_posix = (target_pack_dir / "src").as_posix()
     sep = ";" if sys.platform.startswith("win") else ":"
 
+    # Configuration of the main match 1ZY1KQTN (911 points): 4 ordinary + 1 shared slot, 6 threads,
+    # every worker on gpt-6.1-sol medium. Credit/latency limits from the K2EMUW3I/P2RJ4BZU fixes.
     codex_toml = f"""[features]
 multi_agent = true
 multi_agent_v2 = true
 
 [agents]
 enabled = true
-max_concurrent_threads_per_session = 4
+max_concurrent_threads_per_session = 6
 default_subagent_model = "gpt-6.1-sol"
 default_subagent_reasoning_effort = "medium"
+
+[shell_environment_policy]
+set = {{ PYTHONUTF8 = "1", PYTHONIOENCODING = "utf-8", MTM_RUN_IDLE_TIMEOUT = "150" }}
 
 [mcp_servers.mtm_minimal]
 command = "{python_exe}"
@@ -228,9 +233,14 @@ tool_timeout_sec = 120
 [mcp_servers.mtm_minimal.env]
 PYTHONPATH = "{src_posix}{sep}{target_posix}"
 MTM_NATIVE_COORDINATION = "1"
-MTM_NATIVE_MAX_WORKERS = "4"
-MTM_NATIVE_NORMAL_WORKERS = "3"
+MTM_NATIVE_MAX_WORKERS = "5"
+MTM_NATIVE_NORMAL_WORKERS = "4"
+MTM_WORKER_MODEL = "gpt-6.1-sol"
+MTM_WORKER_EFFORT = "medium"
 MTM_ENV = "production"
+PYTHONUTF8 = "1"
+MTM_COMPANY_TOOL_TIMEOUT = "10"
+MTM_RUN_IDLE_TIMEOUT = "150"
 """
     (codex_dir / "config.toml").write_text(codex_toml, encoding="utf-8")
     (target_pack_dir / ".codex").mkdir(parents=True, exist_ok=True)

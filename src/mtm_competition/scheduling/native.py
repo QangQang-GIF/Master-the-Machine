@@ -22,6 +22,34 @@ class NativeCoordinationError(ValueError):
     pass
 
 
+def normalize_test_row(row: Any) -> Any:
+    """Lossless JSON type fixes for one WorkerResult test row. Never invents a value."""
+    if not isinstance(row, dict):
+        return row
+    row = dict(row)
+    passed = row.get("passed")
+    if isinstance(passed, str) and passed.strip().lower() in ("true", "false"):
+        row["passed"] = passed.strip().lower() == "true"
+    code = row.get("exit_code")
+    if isinstance(code, str) and re.fullmatch(r"\s*-?\d+\s*", code):
+        row["exit_code"] = int(code)
+    elif isinstance(code, float) and math.isfinite(code) and code == int(code):
+        row["exit_code"] = int(code)
+    return row
+
+
+def passing_row_problem(row: Any) -> str | None:
+    if not isinstance(row, dict):
+        return "not an object"
+    if not isinstance(row.get("command"), str) or not row["command"].strip():
+        return "missing command"
+    if row.get("passed") is not True:
+        return "passed must be true (record failing checks in diagnostics, not as passing tests)"
+    if type(row.get("exit_code")) is not int or row["exit_code"] != 0:
+        return "exit_code must be the integer 0"
+    return None
+
+
 class NativeTaskCoordinator:
     def __init__(self, state_dir: Path | str, checkout_root: Path | str,
                  match_root: Path | str, repository_folder: str, match_id: str,
@@ -636,11 +664,13 @@ class NativeTaskCoordinator:
                 db.execute("UPDATE tasks SET phase='NEEDS_ATTENTION',result=? WHERE key=?", (json.dumps(result), key))
                 return {"key": key, "phase": "NEEDS_ATTENTION", "status": result["status"]}
 
-            tests = result["test_results"]
-            if not isinstance(tests, list) or any(not isinstance(t, dict) or not isinstance(t.get("command"), str)
-                                or not t["command"].strip() or t.get("passed") is not True
-                                or type(t.get("exit_code")) is not int or t["exit_code"] != 0 for t in tests):
-                raise NativeCoordinationError("Actual passing test commands and exit_code=0 required")
+            # Lossless JSON type fixes ("0" -> 0, "true" -> True) so a typing slip does not cost a Root turn.
+            tests = [normalize_test_row(t) for t in result["test_results"]]
+            result["test_results"] = tests
+            problems = [f"test_results[{i}]: {why}" for i, t in enumerate(tests) for why in [passing_row_problem(t)] if why]
+            if problems:
+                raise NativeCoordinationError("Actual passing test commands and exit_code=0 required. Fix in "
+                                              "worker_result.json: " + "; ".join(problems[:6]))
             def safe(relative: str) -> Path:
                 if not isinstance(relative, str):
                     raise NativeCoordinationError("Result path must be a string")

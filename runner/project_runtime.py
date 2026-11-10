@@ -14,6 +14,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Sequence
@@ -36,6 +37,52 @@ class CommandResult:
     @property
     def ok(self) -> bool:
         return not self.timed_out and self.returncode == 0
+
+
+def _run_watched(cmd_args: list, workdir: Path, env: dict, timeout: float, idle: float):
+    """Run a command and stop its whole process tree when it exceeds `timeout` or prints nothing for `idle`
+    seconds. A hung test or server wait otherwise holds a worker for the full timeout (300 s by default)."""
+    import threading
+    kwargs = {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP} if sys.platform == "win32" else {"start_new_session": True}
+    proc = subprocess.Popen(cmd_args, cwd=workdir, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                            text=True, encoding="utf-8", errors="replace", **kwargs)
+    chunks = {"out": [], "err": []}
+    last = [time.monotonic()]
+
+    def pump(stream, name):
+        for line in iter(stream.readline, ""):
+            chunks[name].append(line)
+            last[0] = time.monotonic()
+        stream.close()
+
+    readers = [threading.Thread(target=pump, args=(proc.stdout, "out"), daemon=True),
+               threading.Thread(target=pump, args=(proc.stderr, "err"), daemon=True)]
+    for r in readers:
+        r.start()
+    started, why = time.monotonic(), None
+    while proc.poll() is None:
+        now = time.monotonic()
+        if now - started > timeout:
+            why = f"timed out after {timeout:.0f}s"
+        elif now - last[0] > idle:
+            why = f"no output for {idle:.0f}s (looks hung)"
+        if why:
+            try:
+                sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+                from mtm_core.runtime.process import terminate_process_tree
+                terminate_process_tree(proc)
+            except Exception:
+                proc.kill()
+            break
+        time.sleep(0.2)
+    try:
+        proc.wait(timeout=10)
+    except Exception:
+        pass
+    for r in readers:
+        r.join(timeout=5)
+    code = proc.returncode if proc.returncode is not None else -1
+    return (124 if why else code), "".join(chunks["out"]), "".join(chunks["err"]), why
 
 
 class ProjectRuntime:
@@ -100,6 +147,9 @@ class ProjectRuntime:
     def _build_env(self) -> dict[str, str]:
         # Shell/process configuration is the caller's final override over files.
         env = {**self._raw_env, **os.environ}
+        # Windows workers hit UnicodeDecodeError in Python checks without UTF-8 mode.
+        env.setdefault("PYTHONUTF8", "1")
+        env.setdefault("PYTHONIOENCODING", "utf-8")
         d_temp = Path("D:/Temp")
         if d_temp.is_dir():
             env["TEMP"] = str(d_temp)
@@ -244,6 +294,17 @@ class ProjectRuntime:
                         cmd_args = ["cmd.exe", "/c", resolved] + cmd_args[1:]
                     elif Path(resolved).suffix.lower() == ".exe":
                         cmd_args[0] = resolved
+            # Enabled by the installer (MTM_RUN_IDLE_TIMEOUT=150 in the workspace shell environment).
+            idle = float(os.environ.get("MTM_RUN_IDLE_TIMEOUT", "0") or 0)
+            if idle > 0:
+                idle = min(max(idle, 1.0), float(os.environ.get("MTM_RUN_IDLE_MAX", "300")))
+                timeout = min(float(timeout), float(os.environ.get("MTM_RUN_TIMEOUT_MAX", "900")))
+                code, out, err, why = _run_watched(cmd_args, workdir, env, max(0.1, timeout), idle)
+                if why:
+                    err = (err + ("\n" if err and not err.endswith("\n") else "")
+                           + f"[mtm] stopped: {why}. Re-run with --timeout/--idle-timeout if this command is known to be slow and silent.\n")
+                return CommandResult(tuple(self._redact(a) for a in args), str(workdir), code, self._redact(out),
+                                     self._redact(err), bool(why))
             result = subprocess.run(cmd_args, cwd=workdir, env=env, shell=False, capture_output=True,
                                     text=True, timeout=max(0.1, timeout), check=False)
             return CommandResult(tuple(self._redact(a) for a in args), str(workdir), result.returncode, self._redact(result.stdout), self._redact(result.stderr))
@@ -377,11 +438,16 @@ def main(argv: Sequence[str] | None = None) -> int:
     run_parser = sub.add_parser("run")
     run_parser.add_argument("--cwd")
     run_parser.add_argument("--timeout", type=float, default=300)
+    run_parser.add_argument("--idle-timeout", type=float, help="Stop after this many seconds without output (capped)")
+    run_parser.add_argument("--log", help="Also write the full output to this file (e.g. an evidence log)")
+    run_parser.add_argument("--full", action="store_true", help="Print the full output instead of a summary")
     run_parser.add_argument("command", nargs=argparse.REMAINDER)
     session_parser = sub.add_parser("session", help="Run one local server and evidence/check command with shared ephemeral config")
     session_parser.add_argument("--server-script", default="dev")
     session_parser.add_argument("--url")
     session_parser.add_argument("--timeout", type=float, default=300)
+    session_parser.add_argument("--log", help="Also write the full output to this file")
+    session_parser.add_argument("--full", action="store_true", help="Print the full output instead of a summary")
     session_parser.add_argument("command", nargs=argparse.REMAINDER)
     args = parser.parse_args(argv)
     runtime = ProjectRuntime(args.match_root, args.match_id, args.worker_id)
@@ -389,12 +455,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         results = runtime.prepare()
         for result in results:
             print(f"$ {shlex.join(result.argv)} [{result.returncode}{', timeout' if result.timed_out else ''}]")
-            if result.stdout: print(result.stdout, end="" if result.stdout.endswith("\n") else "\n")
-            if result.stderr: print(result.stderr, file=sys.stderr, end="" if result.stderr.endswith("\n") else "\n")
+            emit_output(result.stdout, result.stderr, result.returncode, None, label="prepare", runtime=runtime)
             if not result.ok: return result.returncode or 1
         return 0
     command = list(args.command)
     if command[:1] == ["--"]: command = command[1:]
+    started = time.monotonic()
     if args.action == "session":
         scripts = runtime._manifest().get("scripts", {})
         if args.server_script not in scripts:
@@ -409,10 +475,77 @@ def main(argv: Sequence[str] | None = None) -> int:
         from runner.web_session import run_web_session
         result = run_web_session(runtime, server, command, readiness_url=args.url, timeout=args.timeout)
     else:
+        if getattr(args, "idle_timeout", None) is not None:
+            os.environ["MTM_RUN_IDLE_TIMEOUT"] = str(args.idle_timeout)
         result = runtime.run(command, args.cwd, args.timeout)
-    print(result.stdout, end="")
-    print(result.stderr, file=sys.stderr, end="")
-    return result.returncode or (124 if result.timed_out else 0)
+    code = result.returncode or (124 if result.timed_out else 0)
+    emit_output(result.stdout, result.stderr, code, time.monotonic() - started, label=" ".join(command)[:60],
+                runtime=runtime, log_path=args.log, full=args.full, timed_out=result.timed_out)
+    return code
+
+
+# ---- Compact command output --------------------------------------------------------------------
+# Everything a worker prints stays in its model context and is re-read on every later turn. A test or
+# build run can print thousands of lines; the worker needs the verdict, the failures and where the full
+# log is. Short output is printed unchanged. MTM_RUN_FULL_OUTPUT=1 or --full restores the old behaviour.
+
+_SIGNAL = re.compile(r"(error|fail|✗|×|exception|traceback|assert|panic|err!|cannot find|not found|"
+                     r"expected|received|timed? ?out|\bTS\d{4}\b)", re.IGNORECASE)
+
+
+def summarize_output(text: str, max_signal: int = 40, tail: int = 15, width: int = 300) -> str:
+    lines = text.splitlines()
+    signal, seen = [], set()
+    for i, line in enumerate(lines):
+        if _SIGNAL.search(line) and not re.search(r"\b0 (failed|errors?)\b", line, re.IGNORECASE):
+            key = line.strip()[:width]
+            if key and key not in seen:
+                seen.add(key)
+                signal.append(f"{i + 1}: {key}")
+                if len(signal) >= max_signal:
+                    break
+    out = []
+    if signal:
+        out.append(f"[mtm] lines with errors/failures (first {len(signal)}, numbered as in the log):")
+        out.extend(signal)
+    out.append(f"[mtm] last {min(tail, len(lines))} lines:")
+    out.extend(line[:width] for line in lines[-tail:])
+    return "\n".join(out)
+
+
+def _run_log_dir(runtime: "ProjectRuntime") -> Path:
+    # Outside the repository so a worker's `git add` can never pick it up.
+    base = Path(__file__).resolve().parents[1] / "state" / (runtime.match_id or "match") / "run-logs"
+    return base / (runtime.worker_id or "root")
+
+
+def emit_output(stdout: str, stderr: str, code: int, seconds: float | None, label: str, runtime: "ProjectRuntime",
+                log_path: str | None = None, full: bool = False, timed_out: bool = False) -> None:
+    stdout, stderr = stdout or "", stderr or ""
+    combined = stdout + (("\n" if stdout and not stdout.endswith("\n") else "") + stderr if stderr else "")
+    limit = int(os.environ.get("MTM_RUN_OUTPUT_LIMIT", "6000"))
+    written = None
+    if log_path or len(combined) > limit:
+        target = Path(log_path) if log_path else _run_log_dir(runtime) / (
+            time.strftime("%H%M%S") + f"-{os.getpid()}-" + (re.sub(r"[^a-zA-Z0-9]+", "_", label).strip("_")[:40] or "cmd") + ".log")
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(combined, encoding="utf-8")
+            written = target
+        except OSError as exc:
+            print(f"[mtm] could not write log {target}: {exc}", file=sys.stderr)
+    if full or os.environ.get("MTM_RUN_FULL_OUTPUT") == "1" or len(combined) <= limit or written is None:
+        print(stdout, end="")
+        print(stderr, file=sys.stderr, end="")
+        if written is not None:
+            print(f"[mtm] full log also saved: {written}")
+        return
+    took = f" in {seconds:.1f}s" if seconds is not None else ""
+    status = "TIMED OUT" if timed_out else f"exit={code}"
+    print(f"[mtm] {status}{took} · {len(combined.splitlines())} lines ({len(combined) // 1024} KB) · full log: {written}")
+    print(summarize_output(combined))
+    print("[mtm] Output summarised to save context. Read a range of the log only if you need more "
+          "(e.g. lines around a numbered failure); --full prints everything.")
 
 
 if __name__ == "__main__":

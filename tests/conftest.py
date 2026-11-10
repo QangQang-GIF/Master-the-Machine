@@ -16,6 +16,13 @@ for p in [str(ROOT_DIR), str(TESTS_DIR)]:
         sys.path.insert(0, p)
 
 @pytest.fixture(autouse=True)
+def _isolate_company_bridge(monkeypatch, tmp_path_factory):
+    """Each test gets its own company-tool bridge folder (never the repository or a real workspace)."""
+    if "MTM_COMPANY_BRIDGE_DIR" not in os.environ:
+        monkeypatch.setenv("MTM_COMPANY_BRIDGE_DIR", str(tmp_path_factory.mktemp("company-bridge")))
+
+
+@pytest.fixture(autouse=True)
 def _isolate_ambient_db_env(monkeypatch):
     """Isolate tests from developer's ambient host machine database credentials."""
     for key in ("DATABASE_URL", "TEST_DATABASE_URL"):
