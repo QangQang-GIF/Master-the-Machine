@@ -591,12 +591,8 @@ class MCPHelperServer:
             for kb_id in kb_article_ids(description_text or ""):
                 if kb_id not in queries:
                     queries.append(kb_id)
-            if not queries:
-                desc_lower = f"{backlog_item_key} {description_text}".lower()
-                for kw in ("currency", "invoice", "csv", "import", "aging", "contact", "overdue", "heatmap", "export", "position"):
-                    if kw in desc_lower and kw not in queries:
-                        queries.append(kw)
-                queries = queries[:3] or [backlog_item_key]
+            # No keyword/backlog-key fallback: in K2EMUW3I those returned unrelated 17-20 KB articles
+            # ("aging" for CR-07, "BUG-09") that every worker turn then re-read. Workers search themselves.
 
             param_key = "query"
             for candidate_key in ("query", "keyword", "search", "id", "topic", "term"):
@@ -2470,6 +2466,45 @@ def compact_plan(val: Dict[str, Any]) -> Dict[str, Any]:
     return out
 
 
+def slim_worker_envelope(env: Dict[str, Any], context_dir: Path) -> Dict[str, Any]:
+    """The envelope a worker reads first stays in its context for every later turn.
+
+    K2EMUW3I envelopes were 22-135 KB: every delivered file again (already written into the worktree,
+    e.g. an 80 KB fixture), and the same KB results twice. The worker now gets the file list and the KB
+    results as separate files it opens only when needed.
+    """
+    slim = json.loads(json.dumps(env))
+    meta = slim.setdefault("metadata", {})
+    details = meta.get("start_details") if isinstance(meta.get("start_details"), dict) else {}
+    files = details.pop("files", None)
+    if isinstance(files, dict):
+        details["delivered_files"] = sorted(files)
+        details["delivered_files_note"] = "Already written into your worktree (match_root) at these relative paths."
+    ctx = details.pop("companyContext", None) or meta.pop("company_context", None)
+    meta.pop("company_context", None)
+    index = []
+    if isinstance(ctx, dict):
+        context_dir.mkdir(parents=True, exist_ok=True)
+        for kind in ("kb", "logs"):
+            for n, entry in enumerate(ctx.get(kind) or []):
+                if not isinstance(entry, dict):
+                    entry = {"result": entry}
+                label = _safe_name(str(entry.get("query") or entry.get("tool") or f"{kind}-{n}"))
+                target = context_dir / f"{kind}-{n:02d}-{label}.json"
+                body = json.dumps(entry, ensure_ascii=False, indent=1)
+                target.write_text(body, encoding="utf-8")
+                index.append({"kind": kind, "query": entry.get("query"), "path": str(target), "bytes": len(body),
+                              **({"error": entry["error"]} if entry.get("error") else {})})
+    if index:
+        meta["company_context_files"] = index
+    for key in ("submit_template",):            # already in start_details.submitTemplate
+        if details.get("submitTemplate") is not None:
+            meta.pop(key, None)
+    if slim.get("submit_template") is not None and details.get("submitTemplate") is not None:
+        slim.pop("submit_template", None)
+    return slim
+
+
 def compact_root_output(server: "MCPHelperServer", tool_name: str, args: Dict[str, Any], val: Any) -> Any:
     if os.environ.get("MTM_COMPACT_ROOT_OUTPUT", "1") == "0" or not isinstance(val, dict):
         return val
@@ -2510,8 +2545,11 @@ def compact_root_output(server: "MCPHelperServer", tool_name: str, args: Dict[st
         env = val.get("taskEnvelope") if isinstance(val.get("taskEnvelope"), dict) else None
         if env is None:
             return val
-        path = handoff / f"{_safe_name(val.get('workerId') or args.get('workerId') or 'worker')}-envelope.json"
-        path.write_text(json.dumps(env, indent=1), encoding="utf-8")
+        worker_name = _safe_name(val.get('workerId') or args.get('workerId') or 'worker')
+        path = handoff / f"{worker_name}-envelope.json"
+        (handoff / f"{worker_name}-envelope-raw.json").write_text(json.dumps(env, indent=1), encoding="utf-8")
+        path.write_text(json.dumps(slim_worker_envelope(env, handoff / f"{worker_name}-context"), indent=1),
+                        encoding="utf-8")
         meta = env.get("metadata") or {}
         summary = {k: env.get(k) for k in _ENVELOPE_SUMMARY_FIELDS if env.get(k) is not None}
         summary["full_envelope_path"] = str(path)

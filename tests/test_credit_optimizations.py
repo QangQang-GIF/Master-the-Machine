@@ -254,3 +254,12 @@ def test_pi_worker_cap(tmp_path):
     selected = c.plan_tasks()["selected"]
     assert sum(t["type"] == "PI" for t in selected) == 5
     assert sum(t["type"] != "PI" for t in selected) <= 3
+
+
+def test_claim_task_starts_work_itself(native_server):
+    """The Root dispatches with one call: claim_task runs Start Work when it has not run yet."""
+    server = native_server
+    assert [t["key"] for t in server.plan_tasks()["selected"]] == ["TASK-01"]
+    claim = server.claim_task("TASK-01", "worker-01", 120)
+    assert (Path(claim["matchRoot"]) / "challenge/TASK-01-spec.md").read_text() == "Document the new behavior."
+    assert server.native.task_details("TASK-01")["phase"] == "RUNNING"

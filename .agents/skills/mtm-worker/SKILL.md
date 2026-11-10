@@ -7,7 +7,7 @@ description: Unified autonomous engineering worker for MTM BUG, CR, TASK, and PI
 
 Follow `mtm-init` boundaries, TaskEnvelope constraints, and returned submit template. The root coordinator owns Start Work, integration, push, and Submit.
 
-**First step:** the Root hands you a compact TaskEnvelope. If it has `full_envelope_path`, read that JSON file before anything else: it holds the full description, `metadata.start_details` (submit template, MVS, delivered files; the files are also already written into your worktree under `challenge/`), and `metadata.company_context` (official KB / logs). Everything below that mentions TaskEnvelope fields refers to that full file.
+**First step:** the Root hands you a compact TaskEnvelope. If it has `full_envelope_path`, read that JSON file before anything else: it holds the description, `metadata.start_details` (submit template, MVS, and `delivered_files`: the paths of the delivered files, already written into your worktree under `challenge/` and `answers/<key>/evidence/`), and `metadata.company_context_files` (one file per prefetched KB/log result). Open a delivered or context file only when you need it, and read large data files (fixtures, logs) with a script, never into your context. Everything below that mentions TaskEnvelope fields refers to that file.
 
 ## Core Sandbox & Anti-Over-Engineering Rules
 
@@ -31,7 +31,7 @@ Follow `mtm-init` boundaries, TaskEnvelope constraints, and returned submit temp
      `serve-start --server-script start` runs the production server after `pnpm build` (BUG-01 production check). If `serve-start` does not print `"status": "READY"`, or a capture gets "connection refused", fall back to `session`. A `session` call stops the persistent server on the same port, so do not mix them mid-capture.
 
 2. **Pre-Fetched Official Fixtures & MVS Tests (Zero Fixture Missing)**:
-   - Root automatically pre-fetches official QA fixtures (`answers/<key>/evidence/<key.lower()>-test-data.json` + `.source.json`) and company KB/Logs (`metadata.company_context`) during `start_work` / `claim_task`.
+   - Root automatically pre-fetches official QA fixtures (`answers/<key>/evidence/<key.lower()>-test-data.json` + `.source.json`) and the KB articles named in the brief (`metadata.company_context_files`) during `start_work` / `claim_task`.
    - Always check `answers/<key>/evidence/<key.lower()>-test-data.json` FIRST. If it exists, **use it directly and NEVER overwrite it with synthetic data!**
    - If `challenge/<KEY>-mvs.test.ts` exists, copy it unchanged to the path the MVS file names (older projects: `src/tests/<key.lower()>-mvs.test.ts`) and always commit it; the grader replays it.
 
@@ -58,7 +58,7 @@ Follow `mtm-init` boundaries, TaskEnvelope constraints, and returned submit temp
    - **Production logs**: for any count, first/last entry or sum over logs, use the MCP tool `collect_logs(query, service, outPath)` (it returns every entry, not just the newest 20) and compute with a script over the saved file.
 
 6. **Company tools are yours to call (do not ask the Root)**:
-   - Call `call_company_tool` (`kb_search`, `search_logs`, QA data), `collect_logs` and `fetch_fixture` directly through the `mtm_minimal` MCP tools, or `python -m runner.control company call <name> '<json>'` run from `<team workspace>/team-sdlc-pack`. Your helper forwards them to the Root's helper, which holds the credentials and retries timeouts. KB articles named in the brief are already in `metadata.company_context`; query only what is missing.
+   - Call `call_company_tool` (`kb_search`, `search_logs`, QA data), `collect_logs` and `fetch_fixture` directly through the `mtm_minimal` MCP tools, or `python -m runner.control company call <name> '<json>'` run from `<team workspace>/team-sdlc-pack`. Your helper forwards them to the Root's helper, which holds the credentials and retries timeouts. KB articles named in the brief are already in `metadata.company_context_files`; query only what is missing.
    - `collect_logs` needs an absolute `outPath` inside your worktree. A `{"status": "PENDING"}` answer means it is still collecting: do other work, then call again with exactly the same arguments.
    - If a company tool still fails, record the exact error in `worker_result.json` `notes` and continue with what you have.
 

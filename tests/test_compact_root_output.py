@@ -39,7 +39,16 @@ def test_claim_task_keeps_spawn_fields_and_points_to_full_envelope(tmp_path):
         assert summary[k] == env[k]
     assert summary["metadata"]["project_runtime_path"] == "/p/project_runtime.py"
     assert summary["metadata"]["company_tools"] == ["kb_search"]
-    assert json.loads(open(summary["full_envelope_path"], encoding="utf-8").read()) == env
+    # The worker reads a slim envelope: delivered files are listed (they are in its worktree) and KB results
+    # are separate files. The unmodified envelope is kept next to it for audit.
+    slim = json.loads(open(summary["full_envelope_path"], encoding="utf-8").read())
+    assert slim["metadata"]["start_details"]["delivered_files"] == ["a"]
+    assert "files" not in slim["metadata"]["start_details"] and "company_context" not in slim["metadata"]
+    assert len(json.dumps(slim)) < len(json.dumps(env)) - 30000
+    kb_file = slim["metadata"]["company_context_files"][0]["path"]
+    assert BIG in open(kb_file, encoding="utf-8").read()
+    raw = summary["full_envelope_path"].replace("-envelope.json", "-envelope-raw.json")
+    assert json.loads(open(raw, encoding="utf-8").read()) == env
 
 
 def test_plan_tasks_drops_bulky_fields_only(tmp_path):
