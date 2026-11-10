@@ -15,7 +15,9 @@ Follow `mtm-init` boundaries, TaskEnvelope constraints, and returned submit temp
 - A command silent for 90 s is stopped as hung (exit 124); `run` defaults to 180 s and is capped at 600 s (pass `--timeout` for a known long build). Never start a server through `run` or in the foreground; use `session` for captures.
 - Run the MVS tests and the tests next to your change, with default parallelism. Run a full suite only when the brief requires it, once, at the end.
 - Python runs with UTF-8 (`PYTHONUTF8=1`); read/write files with `encoding="utf-8"`.
-- Before writing `worker_result.json`: every `test_results` row is a real command with `passed: true` and integer `exit_code: 0`; evidence files exist, are nonempty and under `answers/<key>/evidence/`; everything is committed. The Root reads the file itself; your final message is one line.
+- **Time**: stop by `finish_by_epoch` (check `python -c "import time;print(int(time.time()))"` between steps). Commit early and often (`answers/<key>/` with each step): at the item deadline the helper submits your LAST COMMIT, and for a deadline item the Game Master refuses anything later. Out of time: set unverified scenarios `NOT_RUN`, `status: "PARTIAL"`, commit, write the result.
+- `worker_result.json` goes to `metadata.worker_result_path` (`<match_root>/worker_result.json`), written LAST and NEVER committed (it is git-ignored; never `git add -f` it). Paths in `changed_files`/`evidence_paths` are relative to `match_root` with forward slashes (`answers/<key>/evidence/x.log`, `src/...`), never absolute and never prefixed with the repository folder; `elapsed_seconds` is a number.
+- Before writing `worker_result.json`: every `test_results` row is a real command with `passed: true` and integer `exit_code: 0`; evidence files exist, are nonempty and under `answers/<key>/evidence/`; everything is committed. Diagnostic logs go under `answers/<key>/evidence/` only, never elsewhere in the repository. The Root reads the file itself; your final message is one line.
 
 ## Core Sandbox & Anti-Over-Engineering Rules
 
@@ -49,5 +51,5 @@ Follow `mtm-init` boundaries, TaskEnvelope constraints, and returned submit temp
      - Seed data directly into DB via Prisma/service scripts BEFORE opening the browser, then capture all required screenshots and HTTP checks in ONE `project_runtime.py ... session` invocation.
 
 4. **Deadline Protection & Output Contract**:
-   - If a UI scenario fails or deadline is within 2 minutes, mark only the uncaptured scenario `NOT_RUN` in `submit.json` (`status: "PARTIAL"`), NEVER fabricate fake/placeholder PNGs, and commit immediately.
+   - If a UI scenario fails or `finish_by_epoch` is reached, mark only the uncaptured scenario `NOT_RUN` in `submit.json` (`status: "PARTIAL"`), NEVER fabricate fake/placeholder PNGs, and commit immediately.
    - Always `git add` and `git commit` all modified source files, `src/tests/<key.lower()>-mvs.test.ts`, `answers/<key>/submit.json`, and `answers/<key>/evidence/*` inside your worktree before writing `worker_result.json`.

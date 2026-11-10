@@ -228,7 +228,7 @@ command = "{python_exe}"
 args = ["-m", "runner.mcp_server"]
 cwd = "{target_posix}"
 startup_timeout_sec = 15
-tool_timeout_sec = 120
+tool_timeout_sec = 300
 
 [mcp_servers.mtm_minimal.env]
 PYTHONPATH = "{src_posix}{sep}{target_posix}"
@@ -243,6 +243,10 @@ MTM_ENV = "production"
 PYTHONUTF8 = "1"
 MTM_COMPANY_TOOL_TIMEOUT = "10"
 MTM_RUN_IDLE_TIMEOUT = "90"
+MTM_GM_SUBMIT_TIMEOUT = "30"
+MTM_GM_START_TIMEOUT = "30"
+MTM_DEADLINE_FLUSH_SECONDS = "240"
+MTM_LANE_BORROW = "1"
 """
     (codex_dir / "config.toml").write_text(codex_toml, encoding="utf-8")
     (target_pack_dir / ".codex").mkdir(parents=True, exist_ok=True)

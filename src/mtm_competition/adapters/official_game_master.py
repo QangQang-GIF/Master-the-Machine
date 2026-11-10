@@ -144,6 +144,20 @@ def build_match_page_url(match_page_url: str, match_id: str) -> str:
     return f"{origin}{specific_path}{query_part}" if origin else f"{specific_path}{query_part}"
 
 
+def _env_seconds(name: str, default: float) -> float:
+    try:
+        return max(1.0, float(os.environ.get(name, default)))
+    except (TypeError, ValueError):
+        return default
+
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        return max(1, int(os.environ.get(name, default)))
+    except (TypeError, ValueError):
+        return default
+
+
 class OfficialGameMasterAdapter(GameMasterAdapter):
     """Production HTTP REST connector for the official BTC tournament platform.
 
@@ -195,6 +209,17 @@ class OfficialGameMasterAdapter(GameMasterAdapter):
 
         # Pre-validate base URL for SEC-01 security compliance
         self._validate_url_security(self.api_base_url)
+
+    def _post_timeout(self, method: str, path: str) -> float:
+        """Read timeout per call. RQ3I4OHX round02: the Game Master took 15-50 s to answer Start Work/Submit
+        POSTs; with 15 s, 6 of 21 POSTs timed out (CR-07's receipt was lost 13 s before its deadline although the
+        server had received it). Start Work and Submit get MTM_GM_START_TIMEOUT / MTM_GM_SUBMIT_TIMEOUT (30 s)."""
+        if str(method).upper() == "POST":
+            if str(path).rstrip("/").endswith("/submissions"):
+                return max(self.timeout, _env_seconds("MTM_GM_SUBMIT_TIMEOUT", 30.0))
+            if str(path).rstrip("/").endswith("/backlogs/start"):
+                return max(self.timeout, _env_seconds("MTM_GM_START_TIMEOUT", 30.0))
+        return self.timeout
 
     def _validate_url_security(self, url: str) -> None:
         """Enforces SEC-01: Prohibits requests to unauthorized admin, grader, or external URLs."""
@@ -414,8 +439,10 @@ class OfficialGameMasterAdapter(GameMasterAdapter):
         retries: Optional[int] = None,
         headers: Optional[Dict[str, str]] = None,
         raw_body: Optional[bytes] = None,
+        timeout: Optional[float] = None,
     ) -> Any:
         url = self._build_url(path)
+        request_timeout = float(timeout) if timeout else self._post_timeout(method, path)
         req_headers = {
             "Accept": "application/json",
             "User-Agent": "MTM-Codex-Agent/1.0.0",
@@ -457,7 +484,7 @@ class OfficialGameMasterAdapter(GameMasterAdapter):
                     headers=req_headers,
                     method=method.upper(),
                 )
-                with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+                with urllib.request.urlopen(req, timeout=request_timeout) as resp:
                     status_code = getattr(resp, "status", getattr(resp, "code", 200))
 
                     # Scheduling anchors to an authenticated server response, never host wall time.
@@ -927,6 +954,8 @@ class OfficialGameMasterAdapter(GameMasterAdapter):
                 payload["artifactUrls"] = artifact_urls
 
         path = f"/api/v1/matches/{match_uuid}/submissions"
+        # One attempt here: an unknown outcome stays IN_FLIGHT and the caller confirms it from the board or
+        # replays the journaled bytes. The read timeout for POSTs is longer (see _post_timeout).
         res = self._request("POST", path, data=payload, headers=headers, raw_body=raw_body, retries=1)
 
         # Ensure standard receipt fields

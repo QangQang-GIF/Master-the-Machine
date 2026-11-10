@@ -116,13 +116,13 @@ def test_official_clock_required_and_deadline_excludes_closed(coordinator):
     c = coordinator
     c.register_projection({'status': 'RUNNING', 'items': [item()]})
     assert not c.plan_tasks()['selected']
-    projection(c, item(deadline_epoch=999_999), item('TASK-01', status='CLOSED'), item('PI-01', deadline_epoch=1_000_150))
+    projection(c, item(deadline_epoch=999_999), item('TASK-01', status='CLOSED'), item('PI-01', deadline_epoch=1_000_400))
     assert [t['key'] for t in c.plan_tasks()['selected']] == ['PI-01']
 
 
 def test_nearest_urgent_deadline_precedes_score(coordinator):
     c = coordinator
-    projection(c, item(deadline_epoch=1_000_500, points=1000), item('CR-01', deadline_epoch=1_000_200, points=1))
+    projection(c, item(deadline_epoch=1_000_900, points=1000), item('CR-01', deadline_epoch=1_000_400, points=1))
     assert [t['key'] for t in c.plan_tasks()['selected']] == ['CR-01', 'BUG-01']
 
 

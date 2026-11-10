@@ -23,8 +23,8 @@ def test_emergency_cutoff_at_120s(tmp_path):
     # Task 2: deadline slack = 90s (<= 120s) -> Should emergency flush
     server_now = 1000
     items = [
-        {"key": "BUG-01", "type": "BUG", "status": "OPEN", "points": 80, "deadline_epoch": 1150},
-        {"key": "BUG-02", "type": "BUG", "status": "OPEN", "points": 100, "deadline_epoch": 1090},
+        {"key": "BUG-01", "type": "BUG", "status": "OPEN", "points": 80, "deadline_epoch": 1300},
+        {"key": "BUG-02", "type": "BUG", "status": "OPEN", "points": 100, "deadline_epoch": 1200},
     ]
     c.register_projection({
         "status": "RUNNING",
@@ -46,9 +46,9 @@ def test_emergency_cutoff_at_120s(tmp_path):
     # Run plan_tasks
     plan = c.plan_tasks()
     
-    # BUG-01 has 150s slack -> stays RUNNING
+    # BUG-01 has 300s slack (> 240 s flush) -> stays RUNNING
     assert c.task_details("BUG-01")["phase"] == "RUNNING"
-    # BUG-02 has 90s slack <= 120s -> auto-promoted to READY_TO_INTEGRATE with emergency cutoff
+    # BUG-02 has 200s slack <= 240s -> auto-promoted to READY_TO_INTEGRATE with the deadline flush
     assert c.task_details("BUG-02")["phase"] == "READY_TO_INTEGRATE"
     res = c.task_details("BUG-02")["workerResult"]
     assert res["status"] == "PARTIAL"

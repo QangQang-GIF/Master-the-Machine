@@ -359,7 +359,8 @@ def test_three_lanes_normal_deadline_pi(tmp_path, monkeypatch):
     assert len(plan["selected"]) == 9
 
 
-def test_ordinary_items_never_use_deadline_or_pi_lanes(tmp_path, monkeypatch):
+def test_ordinary_items_never_use_deadline_or_pi_lanes_without_borrowing(tmp_path, monkeypatch):
+    monkeypatch.setenv("MTM_LANE_BORROW", "0")
     c = _lane_coordinator(tmp_path, monkeypatch)
     items = [{"key": f"TASK-{i:02d}", "type": "TASK", "status": "OPEN", "points": 10} for i in range(1, 8)]
     c.register_projection({"status": "RUNNING", "server_epoch": time.time(), "remaining_seconds": 2400, "items": items})
@@ -419,3 +420,39 @@ def test_422_keeps_item_open_for_one_fix(native_server):
     assert server.native.task_details("TASK-01")["phase"] == "READY_TO_INTEGRATE"   # not CLOSED
     server.adapter.submit_work = real
     assert server.integrate_and_submit("TASK-01")["status"] == "ACCEPTED"
+
+def test_bridge_starts_empty_and_keys_cache_by_match(tmp_path, monkeypatch):
+    bridge = tmp_path / "bridge"
+    bridge.mkdir()
+    (bridge / "res-oldmatchresult000.json").write_text('{"ok": true, "result": "stale"}')
+    (bridge / "req-oldmatchrequest00.json").write_text('{"op": "call", "args": {}}')
+    monkeypatch.setenv("MTM_COMPANY_BRIDGE_DIR", str(bridge))
+    root = MCPHelperServer(workspace_root=tmp_path / "ws")
+    root.match_code, root.bearer_token = "NEW1", "t"
+    root.company_tools_client = type("C", (), {"call_tool": lambda self, n, a: {"match": "NEW1"}})()
+    root._ensure_company_bridge()
+    try:
+        assert not list(bridge.glob("res-*")) and not list(bridge.glob("req-*"))
+    finally:
+        root.running = False
+
+
+def test_ordinary_items_borrow_idle_special_slots_keeping_one_free(tmp_path, monkeypatch):
+    """RQ3I4OHX: TASK-05 waited 17 min for a normal slot while PI/deadline slots sat idle."""
+    c = _lane_coordinator(tmp_path, monkeypatch)
+    items = [{"key": f"TASK-{i:02d}", "type": "TASK", "status": "OPEN", "points": 10} for i in range(1, 10)]
+    c.register_projection({"status": "RUNNING", "server_epoch": time.time(), "remaining_seconds": 2400, "items": items})
+    sel = c.plan_tasks()["selected"]
+    lanes = [t["laneSlot"] for t in sel]
+    assert lanes.count("normal") == 3 and lanes.count("deadline") == 2 and lanes.count("pi") == 2
+    for t in sel:
+        c.register_started(t["key"], {"files": {}})
+        c.claim_task(t["key"], t["key"].lower(), 300)
+    assert c.plan_tasks()["laneSlotsFree"] == {"normal": 0, "deadline": 1, "pi": 1}
+    # the kept slot still takes a PI / a deadline item at once
+    c.register_projection({"status": "RUNNING", "server_epoch": time.time(), "remaining_seconds": 2400,
+                           "items": items + [{"key": "PI-01", "type": "PI", "status": "OPEN", "points": 100},
+                                             {"key": "BUG-09", "type": "BUG", "status": "OPEN", "points": 50,
+                                              "deadline_epoch": time.time() + 1200}]})
+    picked = {t["key"]: t["laneSlot"] for t in c.plan_tasks()["selected"]}
+    assert picked == {"PI-01": "pi", "BUG-09": "deadline"}

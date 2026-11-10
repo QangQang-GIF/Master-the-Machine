@@ -279,6 +279,11 @@ class ProjectRuntime:
                 if str(bin_dir) not in path_value.split(os.pathsep):
                     env["PATH"] = str(bin_dir) + (os.pathsep + path_value if path_value else "")
             cmd_args = list(args)
+            bundled = self._bundled_yarn() if cmd_args and Path(cmd_args[0]).name.lower() in {"yarn", "yarn.cmd"} else None
+            if bundled and not shutil.which("yarn"):
+                # RQ3I4OHX: the project ships Yarn 4 (.yarn/releases/yarn-4.x.cjs) and no global yarn exists;
+                # Popen("yarn") raised FileNotFoundError and preparation crashed.
+                cmd_args = [shutil.which("node") or "node", str(bundled), *cmd_args[1:]]
             if sys.platform == "win32" and cmd_args:
                 base_name = cmd_args[0]
                 resolved = None
@@ -308,6 +313,10 @@ class ProjectRuntime:
             result = subprocess.run(cmd_args, cwd=workdir, env=env, shell=False, capture_output=True,
                                     text=True, timeout=max(0.1, timeout), check=False)
             return CommandResult(tuple(self._redact(a) for a in args), str(workdir), result.returncode, self._redact(result.stdout), self._redact(result.stderr))
+        except (FileNotFoundError, PermissionError) as exc:
+            # A missing program is a command result (exit 127), never a crash of the caller.
+            return CommandResult(tuple(self._redact(a) for a in args), str(workdir), 127, "",
+                                 self._redact(f"[mtm] cannot start {args[0]!r}: {exc}. Is it installed / on PATH?\n"))
         except subprocess.TimeoutExpired as exc:
             out = exc.stdout or ""
             err = exc.stderr or ""
@@ -346,6 +355,24 @@ class ProjectRuntime:
         if command and len(command) >= 4 and Path(command[3]).name.lower() == "doctor.ps1":
             return self.match_root
         return self.app_root
+
+    def _bundled_yarn(self) -> Path | None:
+        """Yarn release committed with the project: .yarnrc.yml yarnPath, else the newest .yarn/releases/*.cjs."""
+        for base in (self.app_root, self.match_root, self.match_root / "src"):
+            rc = base / ".yarnrc.yml"
+            try:
+                if rc.is_file():
+                    for line in rc.read_text(encoding="utf-8").splitlines():
+                        if line.strip().startswith("yarnPath:"):
+                            cand = (base / line.split(":", 1)[1].strip().strip("'\"")).resolve()
+                            if cand.is_file():
+                                return cand
+                releases = sorted((base / ".yarn" / "releases").glob("yarn-*.cjs"))
+                if releases:
+                    return releases[-1]
+            except OSError:
+                continue
+        return None
 
     def _package_manager(self) -> str:
         manifest = self._manifest()
@@ -389,6 +416,25 @@ class ProjectRuntime:
         """Install dependencies; only the root worker provisions/migrates/seeds and builds."""
         results: list[CommandResult] = []
         manifest = self._manifest()
+        env_dir = self.match_root / "env-require"
+        ps1, sh = env_dir / "prepare-source.ps1", env_dir / "prepare-source.sh"
+        official = None
+        if sys.platform == "win32" and ps1.is_file():
+            shell = shutil.which("pwsh") or shutil.which("powershell") or "pwsh"
+            official = [shell, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(ps1)]
+        elif sh.is_file():
+            official = [shutil.which("bash") or "bash", str(sh)]
+        elif ps1.is_file() and shutil.which("pwsh"):
+            official = [shutil.which("pwsh"), "-NoProfile", "-File", str(ps1)]
+        if self.worker_id == "main" and official:
+            # The exam's own documented setup (RQ3I4OHX: bundled Yarn install + build) beats a generic guess.
+            results.append(self.run(official, cwd=self.match_root, timeout=900))
+            if not results[-1].ok:
+                return results
+            doctor = self.doctor_command()
+            if doctor:
+                results.append(self.run(doctor, cwd=self.doctor_cwd(), timeout=120))
+            return results
         if manifest:
             pm = self._package_manager()
             if pm == "pnpm": install = ["pnpm", "install", "--frozen-lockfile"]

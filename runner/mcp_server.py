@@ -100,9 +100,34 @@ def normalize_native_projection(projection: Dict[str, Any], adapter: Any) -> Dic
     return {"status": status, "server_epoch": server, "remaining_seconds": remaining, "items": items}
 
 
+def company_tools_origin(*candidates: Optional[str]) -> str:
+    """Origin (scheme://host) of the Game Master for the Match MCP endpoint <origin>/api/v1/mcp/<match>.
+
+    Player 0.9.45 sends matchPageUrl="https://masterthemachine.tech/match". Used as the base URL it gave
+    .../match/api/v1/mcp/<match> -> HTTP 404 and an empty tool catalog (I5NLYST2, again in RQ3I4OHX round02:
+    no KB, logs or QA fixtures for any item; TASK-12 had to submit placeholders). Only the origin is used.
+    """
+    from urllib.parse import urlsplit
+    for value in candidates:
+        if isinstance(value, str) and value.strip():
+            parts = urlsplit(value.strip())
+            if parts.scheme in ("https", "http") and parts.netloc:
+                return f"{parts.scheme}://{parts.netloc}"
+    return "https://masterthemachine.tech"
+
+
 def announced_test_ids(details: Dict[str, Any]) -> List[str]:
-    """Inventory explicit public scenario IDs, independent of a worker's answer."""
-    ids: set[str] = set()
+    """Scenario IDs the answer must report, independent of a worker's answer.
+
+    Submit-template rows (and structured MVS rows) are authoritative: when they exist only their IDs are
+    required. Prose is scanned only when no structured rows exist, and a bare ID such as ``TC-01`` is dropped
+    when a qualified ID ending in it (``BUG-09-TC-01``) exists. (I5NLYST2: "schedules from TC-01 may stay" in
+    the MVS text made the gate demand a TC-01 row that the official schema forbids.)
+    """
+    details = details or {}
+    structured: set[str] = set()
+    prose: set[str] = set()
+
     def walk(value: Any, rows: bool = False) -> None:
         if isinstance(value, list):
             for row in value:
@@ -111,15 +136,18 @@ def announced_test_ids(details: Dict[str, Any]) -> List[str]:
             if rows:
                 identifier = value.get("id") or value.get("testCaseId") or value.get("scenarioId")
                 if isinstance(identifier, str) and identifier.strip():
-                    ids.add(identifier.strip())
+                    structured.add(identifier.strip())
             for name in ("testResults", "scenarios", "testCases", "cases", "tests", "minimumVerificationScenarios", "mvs"):
                 if name in value:
                     walk(value[name], True)
         elif isinstance(value, str):
-            ids.update(re.findall(r"\b(?:[A-Z0-9]+-)*(?:TC|MVS|SCENARIO|TEST)-\d+(?:-[A-Za-z0-9]+)*\b", value))
+            prose.update(re.findall(r"\b(?:[A-Z0-9]+-)*(?:TC|MVS|SCENARIO|TEST)-\d+(?:-[A-Za-z0-9]+)*\b", value))
+
     walk(details.get("submitTemplate", {}))
     walk(details.get("minimumVerificationScenarios", details.get("mvs")), True)
-    return sorted(ids)
+    if structured:
+        return sorted(structured)
+    return sorted(i for i in prose if not any(o != i and o.endswith("-" + i) for o in prose))
 
 
 def resolve_stored_session_credentials(workspace_root: Path, match_code: Optional[str]) -> Dict[str, Any]:
@@ -180,11 +208,11 @@ class MCPHelperServer:
         if not match_id or not token:
             return
 
-        base_url = (
-            self.match_page_url
-            or self.descriptor.get("gameMasterApiUrl")
-            or self.descriptor.get("baseUrl")
-            or "https://masterthemachine.tech"
+        base_url = company_tools_origin(
+            self.descriptor.get("gameMasterApiUrl"),
+            self.descriptor.get("gameMasterUrl"),
+            self.descriptor.get("baseUrl"),
+            self.match_page_url,
         )
         state_dir = self.workspace_root / "team-sdlc-pack" / "state" / str(match_id)
 
@@ -236,6 +264,12 @@ class MCPHelperServer:
             return
         bridge = self.company_bridge_dir()
         bridge.mkdir(parents=True, exist_ok=True)
+        # A new Root starts with an empty bridge: requests/results of an earlier match must never be served.
+        for stale in [*bridge.glob("req-*.json"), *bridge.glob("res-*.json"), *bridge.glob(".*.tmp")]:
+            try:
+                stale.unlink()
+            except OSError:
+                pass
         self._bridge_busy: set = set()
         self._bridge_lock = threading.Lock()
         self._bridge_thread = threading.Thread(target=self._bridge_loop, name="company-bridge", daemon=True)
@@ -307,7 +341,8 @@ class MCPHelperServer:
         if not beat:
             raise CompanyBridgeUnavailable("Company tools unavailable: no match credentials in this process and the Root "
                                "helper is not serving the company-tool bridge. Report this blocker; do not retry.")
-        rid = hashlib.sha256(json.dumps([op, args], sort_keys=True).encode("utf-8")).hexdigest()[:20]
+        # The match code is part of the identity, so a cached answer is never reused across matches.
+        rid = hashlib.sha256(json.dumps([beat.get("match"), op, args], sort_keys=True).encode("utf-8")).hexdigest()[:20]
         res, req = bridge / f"res-{rid}.json", bridge / f"req-{rid}.json"
         if res.exists() and time.time() - res.stat().st_mtime > 600:
             res.unlink(missing_ok=True)
@@ -1192,6 +1227,7 @@ class MCPHelperServer:
         if self.native:
             self.native.register_projection(normalize_native_projection(projection, self.adapter))
             self._reconcile_native_receipts()
+        self._reconcile_in_flight_from_board(projection)
 
         # Release schedules belong to the server; never infer them from elapsed time.
         proj_wave = projection.get("wave")
@@ -1247,12 +1283,68 @@ class MCPHelperServer:
             "scheduling": normalize_native_projection(projection, self.adapter),
         }
 
-    def start_work(self, backlog_item_key: str) -> Dict[str, Any]:
+    def _start_http(self, backlog_item_key: str) -> Dict[str, Any]:
+        """Only the Start Work request (thread-safe part, used by dispatch_tasks in parallel)."""
+        if self.telemetry:
+            self.telemetry.emit_game_master_api(
+                operation="START_WORK", phase="REQUESTED", backlog_id=backlog_item_key, method="POST",
+                origin=self.adapter.api_base_url, path=f"/api/v1/matches/{self.match_uuid}/backlogs/start",
+                http_status=None, request_id=None, summary=f"Calling Game Master start work for {backlog_item_key}")
+        return self.adapter.start_working(match_uuid_or_task_id=self.match_uuid, backlog_item_key=backlog_item_key)
+
+    def dispatch_tasks(self, items: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """Start Work + claim for several items selected by plan_tasks, in one call.
+
+        RQ3I4OHX: a wave of 4 items took ~4 minutes to dispatch (start_work then claim_task per item, each Start
+        Work 8-20 s against a slow Game Master, plus a Root turn per call). Here the Start Work requests run in
+        parallel and each item comes back as the compact claim summary to spawn from."""
+        from concurrent.futures import ThreadPoolExecutor
+        native = self._native_coordinator()
+        if not isinstance(items, list) or not items:
+            raise ValueError("items: list of {backlogItemKey, workerId, estimatedSeconds}")
+        self.refresh_match()
+        selected = {t["key"] for t in native.plan_tasks().get("selected", [])}
+        todo, skipped = [], []
+        for it in items:
+            key = str((it or {}).get("backlogItemKey") or "")
+            if not key:
+                continue
+            wid = str(it.get("workerId") or re.sub(r"[^a-z0-9]", "", key.lower()))
+            est = int(it.get("estimatedSeconds") or 420)
+            if key not in selected:
+                skipped.append({"backlogItemKey": key, "reason": "not selected by plan_tasks now (capacity/deadline)"})
+                continue
+            todo.append((key, wid, est))
+        started: Dict[str, Any] = {}
+        if todo:
+            with ThreadPoolExecutor(max_workers=min(6, len(todo))) as pool:
+                futures = {key: pool.submit(self._start_http, key) for key, _, _ in todo}
+                for key, fut in futures.items():
+                    try:
+                        started[key] = fut.result()
+                    except Exception as exc:
+                        started[key] = exc
+        out = []
+        for key, wid, est in todo:
+            try:
+                self.start_work(key, _prefetched=started[key])
+                claim = self.claim_task(key, wid, est)
+                out.append(compact_root_output(self, "claim_task", {"backlogItemKey": key, "workerId": wid}, claim))
+            except Exception as exc:
+                out.append({"backlogItemKey": key, "error": str(exc)})
+        result: Dict[str, Any] = {"dispatched": out}
+        if skipped:
+            result["skipped"] = skipped
+        result["spawnInstruction"] = ("Spawn one worker per dispatched entry with its compact taskEnvelope as-is "
+                                      "(fork_turns=\"none\"). Entries with an error were not claimed.")
+        return result
+
+    def start_work(self, backlog_item_key: str, _prefetched: Any = None) -> Dict[str, Any]:
         """Start work on an open backlog item with automatic telemetry."""
         if not self.adapter or not self.match_uuid:
             raise RuntimeError("Session not configured. Call configure_session first.")
 
-        if self.native:
+        if self.native and _prefetched is None:
             self.refresh_match()
             if backlog_item_key not in [t["key"] for t in self.native.plan_tasks()["selected"]]:
                 raise ValueError("Item is not eligible under current server state/capacity/deadline")
@@ -1267,8 +1359,8 @@ class MCPHelperServer:
         origin = self.adapter.api_base_url
         path = f"/api/v1/matches/{self.match_uuid}/backlogs/start"
 
-        # 1. Automatic telemetry: REQUESTED
-        if self.telemetry:
+        # 1. Automatic telemetry: REQUESTED (dispatch_tasks already emitted it with the parallel request)
+        if self.telemetry and _prefetched is None:
             self.telemetry.emit_game_master_api(
                 operation="START_WORK",
                 phase="REQUESTED",
@@ -1282,7 +1374,9 @@ class MCPHelperServer:
             )
 
         try:
-            result = self.adapter.start_working(
+            if isinstance(_prefetched, BaseException):
+                raise _prefetched
+            result = _prefetched if isinstance(_prefetched, dict) else self.adapter.start_working(
                 match_uuid_or_task_id=self.match_uuid,
                 backlog_item_key=backlog_item_key,
             )
@@ -1444,7 +1538,12 @@ class MCPHelperServer:
             raise ValueError("backlogItemKey is required")
         entry = self._in_flight_entry(backlog_item_key)
         if entry and answer is None and not git_revision:
-            # Unknown outcome earlier: resend exactly the journaled request.
+            # Unknown outcome earlier. The request may have arrived (RQ3I4OHX CR-07: read timeout, yet the board
+            # showed it received 13 s before the deadline): confirm from the board first, else resend exactly
+            # the journaled request and let the Game Master decide (no local deadline guard on a replay).
+            confirmed = self._confirm_in_flight_from_board(backlog_item_key)
+            if confirmed:
+                return confirmed
             journaled = json.loads(bytes(entry["request_body_bytes"]).decode("utf-8"))
             return self._submit_work_impl(journaled["clientSubmissionId"], backlog_item_key,
                                           journaled["gitRevision"], journaled["answer"], replay=True)
@@ -1500,6 +1599,7 @@ class MCPHelperServer:
             todo = [line.split()[1] for line in cherry.stdout.splitlines() if line.startswith("+ ")]
             if todo:
                 pick = git("cherry-pick", "--allow-empty", *todo, t=120)
+                pick = self._resolve_bookkeeping_conflicts(git, pick)
                 if pick.returncode != 0:
                     conflicts = git("diff", "--name-only", "--diff-filter=U").stdout.splitlines()
                     git("cherry-pick", "--abort")
@@ -1510,7 +1610,7 @@ class MCPHelperServer:
             if not (Path(self.match_root) / "answers" / key / "submit.json").is_file():
                 native.end_integration(key, success=False)
                 raise FileNotFoundError(f"{key}: the worker commits do not contain answers/{key}/submit.json")
-        attempts = max(0, int(os.environ.get("MTM_SUBMIT_FAST_REPLAYS", "2")))
+        attempts = max(0, int(os.environ.get("MTM_SUBMIT_FAST_REPLAYS", "1")))
         for attempt in range(attempts + 1):
             try:
                 self.submit_work(backlog_item_key=key)        # raises unless Game Master accepted it
@@ -1521,6 +1621,28 @@ class MCPHelperServer:
                 time.sleep(float(os.environ.get("MTM_SUBMIT_REPLAY_DELAY", "3")))
         return {"key": key, "status": "ACCEPTED", "receiptId": native.task_details(key).get("receiptId"),
                 "gitRevision": self._git_head(), "note": "ACCEPTED is a receipt, not a grade."}
+
+    @staticmethod
+    def _resolve_bookkeeping_conflicts(git: Any, pick: Any) -> Any:
+        """Resolve cherry-pick conflicts that touch only worker bookkeeping files (worker_result.json).
+
+        RQ3I4OHX round02: every worker committed its own <folder>/worker_result.json, so CR-07's integration
+        stopped on that file 80 s before its deadline and the Root cherry-picked by hand (submitted 12 s before
+        the item closed). The file is never part of an answer: drop it from the root tree and continue."""
+        for _ in range(50):
+            if pick.returncode == 0:
+                return pick
+            conflicts = [c for c in git("diff", "--name-only", "--diff-filter=U").stdout.splitlines() if c]
+            if not conflicts or any(Path(c).name != "worker_result.json" for c in conflicts):
+                return pick
+            for c in conflicts:
+                git("rm", "-q", "-f", "--", c)
+            cont = git("-c", "core.editor=true", "cherry-pick", "--continue", t=120)
+            if cont.returncode != 0 and ("empty" in (cont.stderr + cont.stdout).lower()
+                                         or "nothing to commit" in (cont.stderr + cont.stdout).lower()):
+                cont = git("cherry-pick", "--skip", t=120)
+            pick = cont
+        return pick
 
     def _submit_work_impl(
         self,
@@ -1550,7 +1672,7 @@ class MCPHelperServer:
             raise ValueError("No assigned branch configured for submission")
 
         required_test_ids: List[str] = []
-        if self.native:
+        if self.native and not replay:
             self.refresh_match()
             self.native.assert_can_submit(backlog_item_key)
             # Rechecking an existing lock is idempotent; another item cannot push in between.
@@ -1685,7 +1807,8 @@ class MCPHelperServer:
             )
 
             if self.native:
-                self.native.mark_submitted(backlog_item_key, str(server_sub_id))
+                # A real receipt is authoritative even when a replay runs without the integration lock.
+                self.native.confirm_submission(backlog_item_key, str(server_sub_id))
 
             req_id = receipt.get("requestId") or submission_obj.get("requestId")
 
@@ -1823,6 +1946,72 @@ class MCPHelperServer:
             raise RuntimeError("Native scheduling requires START_GAME with MTM_NATIVE_COORDINATION=1")
         return self.native
 
+    def _reconcile_in_flight_from_board(self, projection: Dict[str, Any]) -> List[str]:
+        """Resolve unknown-outcome submissions from the public board.
+
+        A read timeout does not mean the request was lost. RQ3I4OHX round02: CR-07's POST timed out after the
+        server had received it (board: receivedAt 09:28:35, GRADED), but the journal stayed IN_FLIGHT, the Player
+        showed CR-07 UNFINISHED and the replay was refused locally. A board submission received after the
+        journaled request was created is that request: record it as the receipt."""
+        if not self.journal or not self.match_uuid or not isinstance(projection, dict):
+            return []
+        try:
+            pending = self.journal.get_all_in_flight(self.match_uuid)
+        except Exception:
+            return []
+        if not pending:
+            return []
+        items = {}
+        for item in projection.get("backlogItems", projection.get("backlog", [])) or []:
+            if isinstance(item, dict):
+                k = item.get("key") or item.get("backlogItemKey") or item.get("backlogId")
+                if k:
+                    items[str(k)] = item
+        resolved: List[str] = []
+        for entry in pending:
+            key = entry.get("backlog_item_key")
+            sub = (items.get(key) or {}).get("submission")
+            if not isinstance(sub, dict):
+                continue
+            receipt = sub.get("latestSubmissionId") or sub.get("id")
+            received = _epoch(sub.get("receivedAt"))
+            if not receipt or received is None or received < float(entry.get("created_at") or 0) - 120:
+                continue
+            try:
+                self.journal.record_receipt(match_uuid=self.match_uuid, backlog_item_key=key,
+                                            receipt_id=str(receipt), http_code=201)
+                if self.native:
+                    try:
+                        self.native.confirm_submission(key, str(receipt))
+                    except Exception as exc:
+                        sys.stderr.write(f"Warning: confirm_submission {key}: {exc}\n")
+                if self.telemetry:
+                    self.telemetry.emit_game_master_api(
+                        operation="SUBMIT", phase="SUCCEEDED", backlog_id=key, method="POST",
+                        origin=getattr(self.adapter, "api_base_url", None),
+                        path=f"/api/v1/matches/{self.match_uuid}/submissions", http_status=201, request_id=None,
+                        summary=f"Submission accepted for {key} (receipt confirmed from the board after an unknown outcome)")
+                    self.telemetry.emit_backlog_status(
+                        backlog_id=key, title=self._get_backlog_title(key), status="SUBMITTED",
+                        summary=f"Submission accepted for {key}", revision=entry.get("git_revision"),
+                        receipt_id=str(receipt))
+                resolved.append(key)
+            except Exception as exc:
+                sys.stderr.write(f"Warning: board reconciliation for {key}: {exc}\n")
+        return resolved
+
+    def _confirm_in_flight_from_board(self, key: str) -> Optional[Dict[str, Any]]:
+        try:
+            self.refresh_match()
+        except Exception as exc:
+            sys.stderr.write(f"Warning: refresh before replay of {key}: {exc}\n")
+            return None
+        entry = self.journal.get_entry(self.match_uuid, key) if (self.journal and self.match_uuid) else None
+        if entry and entry.get("state") == "ACCEPTED" and entry.get("receipt_id"):
+            return {"submission": {"id": entry["receipt_id"], "backlogItemKey": key, "status": "ACCEPTED"},
+                    "replay": True, "confirmedFromBoard": True}
+        return None
+
     def _reconcile_native_receipts(self) -> None:
         if not self.native or not self.journal or not self.match_uuid:
             return
@@ -1946,45 +2135,95 @@ class MCPHelperServer:
         return self._native_coordinator().reconcile_worker(
             backlog_item_key, confirmed_stopped=confirmed_stopped, reason=reason, requeue=requeue)
 
-    def wait_for_update(self, timeout_ms: int = 55000) -> Dict[str, Any]:
-        """Bounded serial polling detecting wave releases and match status transitions."""
-        bounded_ms = min(max(100, timeout_ms), 55000)
-        start_time = time.time()
-        elapsed_ms = 0
-        poll_interval = 2.0
+    def _local_wait_events(self) -> Optional[Dict[str, Any]]:
+        """Events the Root must act on that the public board does not show: a worker wrote its result, a deadline
+        flush cut a worker off, or a result is ready to integrate. Checked locally every 2 s (no Game Master call)."""
+        if not self.native:
+            return None
+        try:
+            plan = self.native.plan_tasks()
+        except Exception:
+            return None
+        events: Dict[str, Any] = {}
+        seen = self.__dict__.setdefault("_wait_seen", set())
+        def fresh(tag: tuple) -> bool:          # each event is reported once, so a stuck item cannot spin the Root
+            if tag in seen:
+                return False
+            seen.add(tag)
+            return True
+        if plan.get("deadlineFlushed"):
+            events["deadlineFlushed"] = [r.get("key") for r in plan["deadlineFlushed"]]
+        ready = [r.get("key") for r in plan.get("readyToIntegrate") or [] if fresh(("ready", r.get("key")))]
+        if ready:
+            events["readyToIntegrate"] = ready
+        finished = []
+        for row in plan.get("active") or []:
+            key, wt = row.get("key"), row.get("worktreeRoot")
+            if not key or not wt:
+                continue
+            f = Path(wt) / self.native.repository_folder / "worker_result.json"
+            try:
+                if not f.is_file():
+                    continue
+                lease = (self.native.task_details(key).get("data") or {}).get("lease") or {}
+                if f.stat().st_mtime < float(lease.get("claimed_local_epoch") or 0) - 1:
+                    continue
+                if (json.loads(f.read_text(encoding="utf-8-sig")).get("task_id") == key
+                        and fresh(("result", key, int(f.stat().st_mtime)))):
+                    finished.append(key)
+            except Exception:
+                continue
+        if finished:
+            events["workerResultsAvailable"] = finished
+        return events or None
 
-        while elapsed_ms < bounded_ms:
-            # Poll match state and waves
-            if self.adapter:
+    def wait_for_update(self, timeout_ms: int = 55000) -> Dict[str, Any]:
+        """Wait for something the Root must act on: a new item/wave, a match state change, a worker result on disk,
+        a deadline flush or a ready result. Returns at once when one is already pending.
+
+        The board is polled every MTM_WAIT_BOARD_POLL seconds (default 6); local events every 2 s. With nothing
+        running or ready the wait may last up to MTM_WAIT_IDLE_MAX_MS (default 110 s), so an idle Root spends
+        half as many turns (RQ3I4OHX: 6 Root turns of pure polling after the last submission)."""
+        busy = True
+        if self.native:
+            try:
+                details = self.native.plan_tasks()
+                busy = bool(details.get("active") or details.get("readyToIntegrate") or details.get("selected"))
+            except Exception:
+                busy = True
+        cap = 55000 if busy else max(55000, int(os.environ.get("MTM_WAIT_IDLE_MAX_MS", "110000")))
+        bounded_ms = min(max(100, int(timeout_ms or 55000)), cap)
+        if not busy and int(timeout_ms or 0) >= 55000:
+            bounded_ms = cap
+        board_every = max(2.0, float(os.environ.get("MTM_WAIT_BOARD_POLL", "6")))
+        start_time = time.time()
+        last_board = 0.0
+        elapsed_ms = 0
+
+        while True:
+            events = self._local_wait_events()
+            if events:
+                return {"status": "EVENT", "matchState": self.match_state, **events,
+                        "elapsedMs": int((time.time() - start_time) * 1000)}
+            if self.adapter and time.time() - last_board >= board_every:
+                last_board = time.time()
                 old_wave = self.current_wave
-                res = self.refresh_match()
+                try:
+                    res = self.refresh_match()
+                except Exception as exc:
+                    sys.stderr.write(f"Warning: wait_for_update refresh: {exc}\n")
+                    res = {}
                 new_items = res.get("newlyDiscovered", [])
                 if new_items or self.current_wave > old_wave:
-                    return {
-                        "status": "UPDATED",
-                        "matchState": self.match_state,
-                        "wave": self.current_wave,
-                        "newItems": new_items,
-                        "elapsedMs": int((time.time() - start_time) * 1000),
-                    }
-                if self.match_state == "FINISHED":
-                    return {
-                        "status": "FINISHED",
-                        "matchState": "FINISHED",
-                        "elapsedMs": int((time.time() - start_time) * 1000),
-                    }
-                if self.match_state == "PAUSED":
-                    return {
-                        "status": "PAUSED",
-                        "matchState": "PAUSED",
-                        "elapsedMs": int((time.time() - start_time) * 1000),
-                    }
-
-            remaining_sec = (bounded_ms - elapsed_ms) / 1000.0
-            sleep_sec = min(poll_interval, remaining_sec)
-            if sleep_sec > 0:
-                time.sleep(sleep_sec)
+                    return {"status": "UPDATED", "matchState": self.match_state, "wave": self.current_wave,
+                            "newItems": new_items, "elapsedMs": int((time.time() - start_time) * 1000)}
+                if self.match_state in ("FINISHED", "PAUSED"):
+                    return {"status": self.match_state, "matchState": self.match_state,
+                            "elapsedMs": int((time.time() - start_time) * 1000)}
             elapsed_ms = int((time.time() - start_time) * 1000)
+            if elapsed_ms >= bounded_ms:
+                break
+            time.sleep(min(2.0, (bounded_ms - elapsed_ms) / 1000.0))
 
         return {"status": "TIMEOUT", "elapsedMs": elapsed_ms, "matchState": self.match_state}
 
@@ -2006,6 +2245,8 @@ def get_tool_definitions() -> List[Dict[str, Any]]:
          {"backlogItemKey": {"type": "string"}, "workerId": {"type": "string"}, "estimatedSeconds": {"type": "integer", "minimum": 10, "default": 420}}, ["backlogItemKey", "workerId"]),
         ("record_worker_result", "Validate a finished worker's result and artifacts before integration. Omit workerResult: the helper reads the worker's worker_result.json itself. Returns phase and a short verdict.",
          {"backlogItemKey": {"type": "string"}, "workerResult": {"type": "object", "description": "Optional; only when no worker_result.json exists"}}, ["backlogItemKey"]),
+        ("dispatch_tasks", "Start Work + claim for several items that plan_tasks selected, in one call (Start Work requests run in parallel). Returns one compact claim summary per item to spawn a worker from.",
+         {"items": {"type": "array", "items": {"type": "object", "properties": {"backlogItemKey": {"type": "string"}, "workerId": {"type": "string"}, "estimatedSeconds": {"type": "integer", "minimum": 10, "default": 420}}, "required": ["backlogItemKey"]}}}, ["items"]),
         ("integrate_and_submit", "The whole submit path in one call: integration lock, cherry-pick the worker commits onto the root checkout (skips commits already there), then submit_work from answers/<key>/submit.json. Returns ACCEPTED+receiptId, or CONFLICT with files. An unknown-outcome submit is resent with the same journaled body.",
          {"backlogItemKey": {"type": "string"}}, ["backlogItemKey"]),
         ("integration_gate", "Root-only exclusive integration/push/submit lock. Begin before Git mutation; failed releases after reconciliation. Submit receipt releases success.",
@@ -2061,7 +2302,7 @@ def get_tool_definitions() -> List[Dict[str, Any]]:
                 "properties": {
                     "clientSubmissionId": {"type": "string", "description": "Optional UUID v4; default: the journaled one for an unresolved submit, else a new one"},
                     "backlogItemKey": {"type": "string", "description": "Backlog item key"},
-                    "gitRevision": {"type": "string", "description": "Full remote-pushed 40-character Git SHA"},
+                    "gitRevision": {"type": "string", "description": "Optional; default: the root checkout HEAD after integration. It is a new SHA created by cherry-pick and never equals the worker's own commit SHA."},
                     "answer": {"type": "object", "description": "Optional; default: answers/<key>/submit.json in the root checkout. Do not paste it."},
                 },
                 "required": ["backlogItemKey"],
@@ -2084,7 +2325,7 @@ def get_tool_definitions() -> List[Dict[str, Any]]:
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "timeoutMs": {"type": "integer", "description": "Timeout in milliseconds (max 55000). Use 55000: it returns early on any change.", "default": 55000}
+                    "timeoutMs": {"type": "integer", "description": "Use 55000. It returns early on a new item, a match state change, a worker result on disk, a deadline flush or a ready result; with nothing running it may wait up to 110 s.", "default": 55000}
                 },
             },
         },
@@ -2135,7 +2376,7 @@ _BULKY_FIELDS = ("descriptionMd", "description", "start_details", "startInstruct
                  "company_context", "submitTemplate", "minimumVerificationScenarios", "mvs", "onStartFiles",
                  "releaseFiles", "prior_attempts")
 _ENVELOPE_SUMMARY_FIELDS = ("task_id", "task_type", "title", "worker_id", "repository_path", "match_root", "base_revision",
-                            "points", "deadline_epoch", "time_budget_seconds", "model", "reasoning_effort", "backend",
+                            "points", "deadline_epoch", "time_budget_seconds", "finish_by_epoch", "finish_rule", "model", "reasoning_effort", "backend",
                             "lane", "agent_profile", "selected_skills", "allowed_paths",
                             "evidence_required", "attempt_id", "result_contract")
 
@@ -2198,6 +2439,34 @@ def compact_plan(val: Dict[str, Any]) -> Dict[str, Any]:
     return out
 
 
+def compact_refresh(val: Dict[str, Any]) -> Dict[str, Any]:
+    """refresh_match for the Root: one short row per item.
+
+    The full result carried every item's descriptionMd twice (backlogItems and scheduling.items): about 4 KB
+    per item, re-read on every later Root turn (RQ3I4OHX: 4+ refreshes of 12 items). Item briefs reach the
+    workers through start_work/claim_task; the Root decides from status, points and time left."""
+    sched = val.get("scheduling") if isinstance(val.get("scheduling"), dict) else {}
+    server = sched.get("server_epoch")
+    left = {}
+    for it in sched.get("items") or []:
+        if isinstance(it, dict) and it.get("deadline_epoch") is not None and server is not None:
+            left[str(it.get("key"))] = max(0, int(float(it["deadline_epoch"]) - float(server)))
+    rows = []
+    for it in val.get("backlogItems") or []:
+        if not isinstance(it, dict):
+            continue
+        key = str(it.get("key") or it.get("backlogItemKey") or it.get("backlogId") or it.get("id"))
+        sub = it.get("submission") if isinstance(it.get("submission"), dict) else {}
+        row = {"key": key, "type": it.get("type") or it.get("backlogType"), "status": it.get("status"),
+               "workStatus": it.get("workStatus"), "points": it.get("points"),
+               "deadlineSecondsLeft": left.get(key), "scoreStatus": sub.get("scoreStatus")}
+        rows.append({k: v for k, v in row.items() if v not in (None, "", [], {})})
+    out = {"status": val.get("status"), "matchCode": val.get("matchCode"), "wave": val.get("wave"),
+           "remainingSeconds": int(sched["remaining_seconds"]) if sched.get("remaining_seconds") is not None else None,
+           "newlyDiscovered": val.get("newlyDiscovered") or None, "items": rows}
+    return {k: v for k, v in out.items() if v is not None}
+
+
 def slim_worker_envelope(env: Dict[str, Any], context_dir: Path) -> Dict[str, Any]:
     """The envelope a worker reads first stays in its context for every later turn.
 
@@ -2252,6 +2521,8 @@ def compact_root_output(server: "MCPHelperServer", tool_name: str, args: Dict[st
                 if isinstance(out.get(key), list):
                     out[key] = [_slim_row(r) for r in out[key]]
             return out
+        if tool_name == "refresh_match":
+            return compact_refresh(val)
         if tool_name not in ("start_work", "claim_task"):
             return val
         handoff = Path(server.workspace_root) / "team-sdlc-pack" / "state" / _safe_name(server.match_code or "match") / "handoff"
@@ -2359,6 +2630,8 @@ def run_mcp_stdio_server():
                     )
                 elif tool_name == "integrate_and_submit":
                     val = server.integrate_and_submit(tool_args["backlogItemKey"])
+                elif tool_name == "dispatch_tasks":
+                    val = server.dispatch_tasks(tool_args.get("items") or [])
                 elif tool_name == "report_progress":
                     val = server.report_progress(tool_args.get("event", {}))
                 elif tool_name == "wait_for_update":

@@ -81,6 +81,22 @@ class NativeTaskCoordinator:
         self.lane_mode = self.deadline_slots > 0
         self.reserve = max(10, int(integration_reserve_seconds))
         self.clock_max_age = max(10, int(clock_max_age_seconds))
+        # Deadline handling (RQ3I4OHX round02): CR-07 (20 min from release) was cut off at 73 s, then needed
+        # 61 s to integrate and submit through a slow Game Master; it arrived 13 s before the item closed.
+        #  - flush_seconds: a running worker is cut off (its committed work becomes ready) when its item deadline
+        #    or the match end is this close;
+        #  - finish_margin: a worker's time budget ends this long before the deadline/match end, leaving room for
+        #    record + integrate + push + submit.
+        self.flush_seconds = max(30, int(os.environ.get("MTM_DEADLINE_FLUSH_SECONDS", "240") or 240))
+        self.finish_margin = max(self.reserve, self.flush_seconds + 60,
+                                 int(os.environ.get("MTM_FINISH_MARGIN_SECONDS", "0") or 0))
+        # Idle deadline/PI slots may take ordinary items, always keeping `lane_keep_free` slots open in each
+        # special lane (RQ3I4OHX: TASK-05 waited 17 min for a normal slot while 4-5 PI/deadline slots sat idle).
+        self.lane_borrow = os.environ.get("MTM_LANE_BORROW", "1") != "0"
+        # A deadline item this close to closing is dispatched before everything else (items with less than
+        # flush_seconds + 30 s left are not started at all: they would be flushed before delivering anything).
+        self.imminent_seconds = max(self.flush_seconds + 60, int(os.environ.get("MTM_IMMINENT_SECONDS", "600") or 600))
+        self.lane_keep_free = max(0, int(os.environ.get("MTM_LANE_KEEP_FREE", "1") or 0))
         self.workers_root = self.checkout_root.parent / ".workers" / match_id
         if not self.workers_root.resolve().is_relative_to(self.checkout_root.parent):
             raise NativeCoordinationError("Worker root escapes challenge workspace")
@@ -258,45 +274,62 @@ class NativeTaskCoordinator:
                     "selected": [], "active": [public_row(r) for r in active], "readyToIntegrate": [],
                     "readyDiagnostics": [], "skippedReady": [], "integrationOwner": owner, "integrationBlocked": [],
                     "overdueWorkers": []}
-        # Emergency Deadline Flush: auto-promote active tasks with <= 120s remaining before deadline
+        # Deadline flush: a running worker whose item deadline (or the match end) is within flush_seconds is cut
+        # off. Its committed work becomes READY_TO_INTEGRATE so the Root submits now; answers/<key> files it has
+        # not committed yet are committed for it (source edits are not: they may be half-written).
+        response["deadlineFlushed"] = []
         for row in list(active):
             task = json.loads(row["data"])
             deadline = task.get("deadline_epoch")
-            slack = min(remaining, float(deadline) - now) if (clock_ready and deadline is not None) else None
-            if clock_ready and slack is not None and 0 < slack <= 120:
+            slack = (min(remaining, float(deadline) - now if deadline is not None else remaining)
+                     if clock_ready else None)
+            if clock_ready and slack is not None and 0 < slack <= self.flush_seconds:
                 key = row["key"]
                 wt = Path(row["worktree"]) / self.repository_folder
                 ans_file = wt / "answers" / key / "submit.json"
-                has_changes = False
+                if not (ans_file.is_file() or self._worker_has_work(wt, task)):
+                    continue                  # nothing to submit yet; an empty template would earn nothing
                 try:
-                    diff_res = subprocess.run(["git", "-C", str(wt), "status", "--porcelain"],
-                                              capture_output=True, text=True, timeout=5, check=False)
-                    if diff_res.returncode == 0 and diff_res.stdout.strip():
-                        has_changes = True
-                except Exception:
-                    pass
-                if ans_file.is_file() or has_changes:
                     if not ans_file.is_file():
                         ans_file.parent.mkdir(parents=True, exist_ok=True)
-                        tpl = task.get("start_details", {}).get("submitTemplate") or {
-                            "schemaVersion": 1, "backlogId": key, "status": "PARTIAL", "evidenceFiles": []
-                        }
+                        tpl = dict(task.get("start_details", {}).get("submitTemplate") or {
+                            "schemaVersion": 1, "backlogId": key, "evidenceFiles": []})
                         tpl["status"] = "PARTIAL"
-                        ans_file.write_text(json.dumps(tpl, indent=2), encoding='utf-8')
-                    emergency_result = {
-                        "task_id": key, "worker_id": row["worker_id"], "status": "PARTIAL",
-                        "skill_ids": ["mtm-emergency-flush"], "changed_files": [f"answers/{key}/submit.json"],
-                        "test_results": [{"command": "emergency-deadline-cutoff", "passed": True, "exit_code": 0}],
-                        "evidence_paths": [], "elapsed_seconds": 0,
-                        "note": f"Hard cutoff triggered at {int(slack)}s remaining before deadline"
-                    }
-                    db.execute("UPDATE tasks SET phase='READY_TO_INTEGRATE',result=? WHERE key=?",
-                               (json.dumps(emergency_result), key))
-                    active.remove(row)
-                    row_copy = dict(row)
-                    row_copy["phase"] = "READY_TO_INTEGRATE"
-                    row_copy["result"] = json.dumps(emergency_result)
-                    ready.append(row_copy)
+                        ans_file.write_text(json.dumps(tpl, indent=2), encoding="utf-8")
+                    subprocess.run(["git", "-C", str(wt), "add", "-A", "--", f"answers/{key}"],
+                                   capture_output=True, text=True, timeout=15, check=False)
+                    staged = subprocess.run(["git", "-C", str(wt), "diff", "--cached", "--quiet"],
+                                            capture_output=True, timeout=15, check=False)
+                    if staged.returncode == 1:
+                        subprocess.run(["git", "-C", str(wt), "commit", "-q", "-m",
+                                        f"{key}: deadline flush of answers/{key}"],
+                                       capture_output=True, text=True, timeout=20, check=False)
+                except Exception:
+                    pass
+                stored = {}
+                try:
+                    stored = json.loads(row["result"]) if row.get("result") else {}
+                except Exception:
+                    stored = {}
+                emergency_result = {
+                    "task_id": key, "worker_id": row["worker_id"], "status": "PARTIAL",
+                    "skill_ids": ["mtm-emergency-flush"], "changed_files": [f"answers/{key}/submit.json"],
+                    "test_results": [], "evidence_paths": [], "elapsed_seconds": 0, "deadline_flush": True,
+                    "note": f"Hard cutoff triggered at {int(slack)}s before the item deadline or match end (deadline flush)"}
+                if isinstance(stored, dict) and stored.get("status"):
+                    emergency_result = {**stored, "deadline_flush": True}
+                db.execute("UPDATE tasks SET phase='READY_TO_INTEGRATE',result=? WHERE key=?",
+                           (json.dumps(emergency_result), key))
+                active.remove(row)
+                row_copy = dict(row)
+                row_copy["phase"] = "READY_TO_INTEGRATE"
+                row_copy["result"] = json.dumps(emergency_result)
+                ready.append(row_copy)
+                response["deadlineFlushed"].append({"key": key, "workerId": row["worker_id"],
+                                                    "slackSeconds": int(slack),
+                                                    "requiredAction": "integrate_and_submit now; then stop this worker"})
+        if not response["deadlineFlushed"]:
+            response.pop("deadlineFlushed")
 
         for row in active:
             task = json.loads(row["data"])
@@ -373,8 +406,8 @@ class NativeTaskCoordinator:
                 continue
             deadline = task.get("deadline_epoch")
             slack = min(remaining, float(deadline) - now if deadline is not None else remaining)
-            if slack <= self.reserve + 10:
-                continue
+            if slack <= max(self.reserve + 10, self.flush_seconds + 30):
+                continue                      # it would be flushed before a worker could deliver anything
             urgent = self._urgent(task, now)
             estimate = max(10, float(task.get("estimated_seconds", 420)))
             points = float(task.get("points", 0))
@@ -387,7 +420,7 @@ class NativeTaskCoordinator:
             is_pi = (task.get("type") == "PI")
             has_deadline = (deadline is not None or task.get("deadlineMinutes") is not None)
 
-            if deadline is not None and slack <= 180:
+            if deadline is not None and slack <= self.imminent_seconds:
                 prio_tier = 0
                 prio_sub = slack
             elif is_pi:
@@ -441,22 +474,70 @@ class NativeTaskCoordinator:
         return "normal"
 
     def _lane_free(self, running: list[dict]) -> dict[str, int]:
-        """Free slots per lane. Running deadline/PI items fill their own lane first, the rest sit in normal."""
+        """Free slots per lane. Running deadline/PI items fill their own lane first, the rest sit in normal;
+        ordinary items beyond the normal lane are borrowed slots and use up deadline, then PI capacity."""
         counts = {"normal": 0, "deadline": 0, "pi": 0}
         for t in running:
             counts[self._task_class(t)] += 1
         own_dl = min(counts["deadline"], self.deadline_slots)
         own_pi = min(counts["pi"], self.pi_burst_slots)
         normal_used = counts["normal"] + (counts["deadline"] - own_dl) + (counts["pi"] - own_pi)
-        return {"normal": max(0, self.normal_workers - normal_used),
+        free = {"normal": max(0, self.normal_workers - normal_used),
                 "deadline": max(0, self.deadline_slots - own_dl),
                 "pi": max(0, self.pi_burst_slots - own_pi)}
+        overflow = max(0, normal_used - self.normal_workers)
+        for keep in (self.lane_keep_free, 0):       # mirror _lane_for: borrow down to the kept slot first
+            for lane in ("deadline", "pi"):
+                take = min(overflow, max(0, free[lane] - keep))
+                free[lane] -= take
+                overflow -= take
+        return free
 
     def _lane_for(self, task: dict, lanes: dict[str, int]) -> str | None:
         cls = self._task_class(task)
         if cls != "normal" and lanes.get(cls, 0) > 0:
             return cls
-        return "normal" if lanes.get("normal", 0) > 0 else None
+        if lanes.get("normal", 0) > 0:
+            return "normal"
+        if cls == "normal" and self.lane_borrow:
+            for spare in ("deadline", "pi"):
+                if lanes.get(spare, 0) > self.lane_keep_free:
+                    return spare
+        return None
+
+    def _worker_has_work(self, wt: Path, task: dict) -> bool:
+        try:
+            status = subprocess.run(["git", "-C", str(wt), "status", "--porcelain", "--", "."],
+                                    capture_output=True, text=True, timeout=10, check=False)
+            if status.returncode == 0 and status.stdout.strip():
+                return True
+            head = subprocess.run(["git", "-C", str(wt), "rev-parse", "HEAD"], capture_output=True, text=True,
+                                  timeout=10, check=False).stdout.strip()
+            base = str(task.get("base_revision") or self._meta_base_revision(task) or "")
+            return bool(head and base and head != base)
+        except Exception:
+            return False
+
+    @staticmethod
+    def _meta_base_revision(task: dict) -> str | None:
+        lease = task.get("lease") or {}
+        return lease.get("base_revision")
+
+    def _exclude_bookkeeping(self) -> None:
+        """Keep worker_result.json out of every commit (info/exclude is shared by all worktrees).
+        RQ3I4OHX: workers committed it, and the copies conflicted at integration."""
+        try:
+            common = Path(self._git("rev-parse", "--git-common-dir"))
+            if not common.is_absolute():
+                common = (self.checkout_root / common).resolve()
+            exclude = common / "info" / "exclude"
+            exclude.parent.mkdir(parents=True, exist_ok=True)
+            text = exclude.read_text(encoding="utf-8") if exclude.is_file() else ""
+            if "worker_result.json" not in text.split():
+                exclude.write_text(text + ("" if not text or text.endswith("\n") else "\n") + "worker_result.json\n",
+                                   encoding="utf-8")
+        except Exception:
+            pass
 
     def plan_tasks(self) -> dict[str, Any]:
         with self._db() as db:
@@ -513,6 +594,7 @@ class NativeTaskCoordinator:
             base = self._git("rev-parse", "HEAD")
             if self._git("cat-file", "-t", f"{base}:{self.repository_folder}") != "tree":
                 raise NativeCoordinationError("Assigned repository folder is not a tracked directory")
+            self._exclude_bookkeeping()
             try:
                 # Materialize only this match, excluding old round source/answers.
                 self._git("worktree", "add", "--detach", "--no-checkout", str(target), base)
@@ -538,7 +620,8 @@ class NativeTaskCoordinator:
             slack = eligible.get("slackSeconds")
             if slack is None:
                 slack = min(remaining, float(deadline) - now if deadline is not None else remaining) if (now is not None and remaining is not None) else (remaining or 2400)
-            budget = min(max(10, int(estimated_seconds)), max(10, int(slack - self.reserve)))
+            # The budget ends finish_margin before the deadline/match end (record + integrate + submit need it).
+            budget = min(max(10, int(estimated_seconds)), max(60, int(slack - self.finish_margin)))
             worker_model = os.environ.get("MTM_WORKER_MODEL", "gpt-6.1-sol" if os.environ.get("MTM_ENV") == "production" else "gpt-6-luna")
             worker_effort = os.environ.get("MTM_WORKER_EFFORT", "medium" if os.environ.get("MTM_ENV") == "production" else "low")
             envelope = {"task_id": key, "task_type": task_type, "title": eligible.get("title", key),
@@ -546,7 +629,12 @@ class NativeTaskCoordinator:
                         "match_root": str(worker_match), "base_revision": base, "points": int(eligible.get("points", 0)),
                         "deadline_epoch": eligible.get("deadline_epoch"),
                         "selected_skills": ["mtm-init", f"mtm-{task_type.lower()}-worker", "mtm-verification", "mtm-evidence"],
-                        "time_budget_seconds": budget, "model": worker_model, "reasoning_effort": worker_effort, "backend": "codex",
+                        "time_budget_seconds": budget,
+                        "finish_by_epoch": round(time.time() + budget),
+                        "finish_rule": ("Stop by finish_by_epoch (compare with python -c \"import time;print(int(time.time()))\"): "
+                                        "commit what works, set submit.json status PARTIAL for anything unverified, write "
+                                        "worker_result.json. At the item deadline the helper flushes your last commit."),
+                        "model": worker_model, "reasoning_effort": worker_effort, "backend": "codex",
                         "evidence_required": details.get("evidence_required", eligible.get("evidence_required", [])),
                         "mvs": self._mvs_list(details.get("minimumVerificationScenarios", details.get("mvs"))),
                         "submit_template": details.get("submitTemplate"), "allowed_paths": [str(worker_match)],
@@ -559,7 +647,7 @@ class NativeTaskCoordinator:
             stored = json.loads(row["data"])
             _, server_now, server_remaining = self._clock(db)
             stored["lease"] = {"start_server_epoch": server_now, "start_remaining_seconds": server_remaining,
-                               "budget_seconds": budget}
+                               "budget_seconds": budget, "claimed_local_epoch": time.time(), "base_revision": base}
             db.execute("UPDATE tasks SET phase='RUNNING',worker_id=?,worktree=?,data=? WHERE key=?",
                        (worker_id, str(target), json.dumps(stored), key))
             return {"taskEnvelope": envelope, "worktreeRoot": str(target), "matchRoot": str(worker_match), "match_root": str(worker_match), "workerId": worker_id}
@@ -697,18 +785,79 @@ class NativeTaskCoordinator:
                 self._set_meta(db, "integration_acquired_at", None)
             return {"key": key, "phase": phase}
 
+    def _normalize_worker_result(self, key: str, result: dict[str, Any]) -> dict[str, Any]:
+        """Lossless fixes for slips that each cost the Root a model turn (RQ3I4OHX: 4 rejected results):
+        a missing optional list, elapsed_seconds as a string, a path given with backslashes, an absolute
+        path inside the match root, or a path prefixed with the repository folder."""
+        result.setdefault("task_id", key)
+        for field in ("skill_ids", "changed_files", "evidence_paths", "test_results"):
+            if result.get(field) is None:
+                result[field] = []
+        el = result.get("elapsed_seconds")
+        if isinstance(el, str):
+            try:
+                result["elapsed_seconds"] = float(el.strip())
+            except ValueError:
+                result["elapsed_seconds"] = 0
+        elif el is None:
+            result["elapsed_seconds"] = 0
+        prefix = self.repository_folder.rstrip("/") + "/"
+        def rel(path: Any) -> Any:
+            if not isinstance(path, str):
+                return path
+            text = path.strip().replace("\\", "/")
+            for base in {str(self.match_root).replace("\\", "/"), str(self.match_root.resolve()).replace("\\", "/")}:
+                if base and text.lower().startswith(base.lower().rstrip("/") + "/"):
+                    text = text[len(base.rstrip("/")) + 1:]
+            marker = "/" + prefix
+            if re.match(r"^[A-Za-z]:/", text) or text.startswith("/"):
+                if marker.lower() in text.lower():         # .../worktree/<folder>/answers/... -> answers/...
+                    text = text[text.lower().rindex(marker.lower()) + len(marker):]
+            while text.startswith("./"):
+                text = text[2:]
+            if text.startswith(prefix):
+                text = text[len(prefix):]
+            return text
+        for field in ("changed_files", "evidence_paths"):
+            if isinstance(result.get(field), list):
+                result[field] = [rel(v) for v in result[field]]
+        return result
+
     def record_worker_result(self, key: str, worker_result: dict[str, Any]) -> dict[str, Any]:
         key = self._key(key)
-        result = dict(worker_result)
+        result = self._normalize_worker_result(key, dict(worker_result))
         with self._db() as db:
             row = self._task(db, key)
-            if row["phase"] != "RUNNING" or result.get("task_id") != key:
-                raise NativeCoordinationError("Result does not match an active task")
+            if result.get("task_id") != key:
+                raise NativeCoordinationError(f"worker_result.json task_id is {result.get('task_id')!r}, expected {key!r}")
+            if row["phase"] in ("READY_TO_INTEGRATE", "INTEGRATING", "INTEGRATED", "SUBMITTED", "CLOSED"):
+                stored = json.loads(row["result"]) if row["result"] else {}
+                if row["phase"] == "READY_TO_INTEGRATE" and isinstance(stored, dict) and (
+                        stored.get("deadline_flush") or "mtm-emergency-flush" in (stored.get("skill_ids") or [])):
+                    # The worker finished after a deadline flush: its own result replaces the flush placeholder
+                    # when it is valid; otherwise the flushed state stands. Never an error for the Root.
+                    db.execute("UPDATE tasks SET phase='RUNNING' WHERE key=?", (key,))
+                    try:
+                        return self._record_validated(db, row, key, result)
+                    except NativeCoordinationError as exc:
+                        db.execute("UPDATE tasks SET phase='READY_TO_INTEGRATE' WHERE key=?", (key,))
+                        return {"key": key, "phase": "READY_TO_INTEGRATE", "workerResult": {"status": stored.get("status")},
+                                "note": f"Deadline-flushed result kept ({exc}). Call integrate_and_submit now."}
+                return {"key": key, "phase": row["phase"], "workerResult": {"status": stored.get("status")},
+                        "note": "Already recorded; nothing to do" if row["phase"] in ("SUBMITTED", "CLOSED")
+                        else "Already ready. Call integrate_and_submit."}
+            if row["phase"] != "RUNNING":
+                raise NativeCoordinationError(f"Result does not match an active task (phase {row['phase']})")
+            return self._record_validated(db, row, key, result)
+
+    def _record_validated(self, db, row, key: str, result: dict[str, Any]) -> dict[str, Any]:
+        if True:  # body kept at its original indentation
             if result.get("worker_id", row["worker_id"]) != row["worker_id"]:
                 raise NativeCoordinationError("Result worker mismatch")
             required = {"task_id", "status", "skill_ids", "changed_files", "test_results", "evidence_paths", "elapsed_seconds"}
             if not required.issubset(result):
-                raise NativeCoordinationError("WorkerResult contract fields missing")
+                raise NativeCoordinationError("WorkerResult contract fields missing: "
+                                              + ", ".join(sorted(required - set(result))))
             allowed_statuses = ('READY_FOR_REVIEW', 'PARTIAL', 'DONE', 'BLOCKED', 'TIMED_OUT', 'FAILED', 'ESCALATE')
             if (result['status'] not in allowed_statuses
                     or any(not isinstance(result[field], list) or any(not isinstance(v, str) for v in result[field])
@@ -740,13 +889,13 @@ class NativeTaskCoordinator:
                     raise NativeCoordinationError("Result path must be a string")
                 p = PurePosixPath(relative)
                 if p.is_absolute() or ".." in p.parts or "\\" in relative or re.match(r"^[A-Za-z]:", relative):
-                    raise NativeCoordinationError("Result path is not contained")
+                    raise NativeCoordinationError(f"Result path is not contained (use a path relative to match_root): {relative}")
                 if any(part in ('.git', '.codex', '.agents', '.mtm', 'node_modules', '__pycache__', '.cache')
                        or part.startswith('.env') or part == 'exam-info.json' for part in p.parts):
-                    raise NativeCoordinationError("Result path targets a protected file or directory")
+                    raise NativeCoordinationError(f"Result path targets a protected file or directory: {relative}")
                 resolved = (worker_match / relative).resolve()
                 if not resolved.is_relative_to(worker_match.resolve()):
-                    raise NativeCoordinationError("Result path escapes worker match root")
+                    raise NativeCoordinationError(f"Result path escapes worker match root: {relative}")
                 return resolved
             for changed in result["changed_files"]:
                 safe(changed)
@@ -757,11 +906,11 @@ class NativeTaskCoordinator:
             for relative in evidence:
                 file = safe(relative)
                 if not relative.startswith(prefix) or not file.is_file() or not file.stat().st_size:
-                    raise NativeCoordinationError("Evidence must exist, be nonempty, and belong to current task")
+                    raise NativeCoordinationError(f"Evidence must exist, be nonempty and sit under {prefix}: {relative}")
             task = json.loads(row["data"])
             required_evidence = task.get("start_details", {}).get("evidence_required", task.get("evidence_required", []))
             if not set(required_evidence).issubset(evidence):
-                raise NativeCoordinationError("Required evidence missing from worker result")
+                raise NativeCoordinationError("Required evidence missing from worker result: " + ", ".join(sorted(set(required_evidence) - set(evidence))))
             db.execute("UPDATE tasks SET phase='READY_TO_INTEGRATE',result=? WHERE key=?", (json.dumps(result), key))
             return {"key": key, "phase": "READY_TO_INTEGRATE", "worktreeRoot": row["worktree"], "workerResult": result}
 
@@ -812,6 +961,21 @@ class NativeTaskCoordinator:
                 self._set_meta(db, "integration_owner", None)
                 self._set_meta(db, "integration_acquired_at", None)
             return {"key": key, "phase": phase}
+
+    def confirm_submission(self, key: str, receipt_id: str) -> None:
+        """Record a real server receipt regardless of phase or lock: the Game Master is authoritative.
+        Used by a journaled replay (which runs without the integration lock) and by board reconciliation."""
+        if not isinstance(receipt_id, str) or not receipt_id.strip():
+            raise NativeCoordinationError("A real server receipt is required")
+        key = self._key(key)
+        with self._db() as db:
+            row = self._task(db, key)
+            if row["phase"] == "SUBMITTED" and row["receipt"] == receipt_id:
+                return
+            db.execute("UPDATE tasks SET phase='SUBMITTED',receipt=? WHERE key=?", (receipt_id, key))
+            if self._meta(db, "integration_owner") == key:
+                self._set_meta(db, "integration_owner", None)
+                self._set_meta(db, "integration_acquired_at", None)
 
     def mark_submitted(self, key: str, receipt_id: str) -> None:
         if not isinstance(receipt_id, str) or not receipt_id.strip():
