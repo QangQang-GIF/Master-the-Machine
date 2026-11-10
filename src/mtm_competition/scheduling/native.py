@@ -69,11 +69,6 @@ class NativeTaskCoordinator:
         self.repository_folder = folder.as_posix()
         self.match_id = match_id
         self.max_workers, self.normal_workers = max_workers, normal_workers
-        # Strong lane (MTM_STRONG_SLOT=1, main match 1ZY1KQTN): the slots above normal_workers run a stronger
-        # model/effort (MTM_STRONG_MODEL/MTM_STRONG_EFFORT, default gpt-6.1-sol/high). PI and "[Heavy Task]"
-        # items take a free strong slot first; an ordinary item uses it only when every normal slot is busy.
-        self.strong_slot = os.environ.get("MTM_STRONG_SLOT", "0") == "1"
-        self.strong_slots = max(0, max_workers - normal_workers) if self.strong_slot else 0
         self.reserve = max(10, int(integration_reserve_seconds))
         self.clock_max_age = max(10, int(clock_max_age_seconds))
         self.workers_root = self.checkout_root.parent / ".workers" / match_id
@@ -394,7 +389,7 @@ class NativeTaskCoordinator:
         for _, task, urgent, slack in candidates:
             if len(response["selected"]) >= response["availableSlots"]:
                 break
-            if not urgent and normals >= (self.max_workers if self.strong_slot else self.normal_workers):
+            if not urgent and normals >= self.normal_workers:
                 continue
             if self._overlap(busy_paths, task.get("claimed_paths", [])):
                 continue
@@ -439,7 +434,7 @@ class NativeTaskCoordinator:
                     and plan["availableSlots"] > 0
                     and row["phase"] == "QUEUED"
                     and row["started"]
-                    and (urgent or normals < (self.max_workers if self.strong_slot else self.normal_workers))
+                    and (urgent or normals < self.normal_workers)
                 ):
                     eligible = task_data
                 else:
@@ -482,17 +477,6 @@ class NativeTaskCoordinator:
             budget = min(max(10, int(estimated_seconds)), max(10, int(slack - self.reserve)))
             worker_model = os.environ.get("MTM_WORKER_MODEL", "gpt-6.1-sol" if os.environ.get("MTM_ENV") == "production" else "gpt-6-luna")
             worker_effort = os.environ.get("MTM_WORKER_EFFORT", "medium" if os.environ.get("MTM_ENV") == "production" else "low")
-            lane, agent_profile = "normal", "team_feature_worker"
-            if self.strong_slot:
-                running = [json.loads(r["data"]) for r in db.execute("SELECT data FROM tasks WHERE phase='RUNNING'").fetchall()]
-                strong_busy = sum(1 for t in running if t.get("lane") == "strong")
-                normal_busy = len(running) - strong_busy
-                heavy = str(eligible.get("title", "")).strip().lower().startswith("[heavy task]")
-                if strong_busy < self.strong_slots and (heavy or str(task_type).upper() == "PI"
-                                                        or normal_busy >= self.normal_workers):
-                    lane, agent_profile = "strong", "team_strong_worker"
-                    worker_model = os.environ.get("MTM_STRONG_MODEL", "gpt-6.1-sol")
-                    worker_effort = os.environ.get("MTM_STRONG_EFFORT", "high")
             envelope = {"task_id": key, "task_type": task_type, "title": eligible.get("title", key),
                         "description": specification or eligible.get("description") or eligible.get("descriptionMd", ""), "repository_path": str(target),
                         "match_root": str(worker_match), "base_revision": base, "points": int(eligible.get("points", 0)),
@@ -502,14 +486,13 @@ class NativeTaskCoordinator:
                         "evidence_required": details.get("evidence_required", eligible.get("evidence_required", [])),
                         "mvs": self._mvs_list(details.get("minimumVerificationScenarios", details.get("mvs"))),
                         "submit_template": details.get("submitTemplate"), "allowed_paths": [str(worker_match)],
-                        "worker_id": worker_id, "lane": lane, "agent_profile": agent_profile,
+                        "worker_id": worker_id,
                         "metadata": {"match_root": str(worker_match), "start_details": details,
                                      "project_runtime_path": str(Path(__file__).resolve().parents[3] / "runner" / "project_runtime.py"),
                                      "match_id": self.match_id, "worker_id": worker_id,
                                      "submit_template": details.get("submitTemplate"),
                                      "worker_result_path": str(worker_match / "worker_result.json")}}
             stored = json.loads(row["data"])
-            stored["lane"] = lane
             _, server_now, server_remaining = self._clock(db)
             stored["lease"] = {"start_server_epoch": server_now, "start_remaining_seconds": server_remaining,
                                "budget_seconds": budget}
