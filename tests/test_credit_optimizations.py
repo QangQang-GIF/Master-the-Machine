@@ -302,3 +302,31 @@ def test_test_row_normalization_is_lossless():
     assert "exit_code" not in normalize_test_row({"command": "x", "passed": True})       # nothing invented
     assert passing_row_problem({"command": "x", "passed": True, "exit_code": 2}) == "exit_code must be the integer 0"
     assert passing_row_problem({"command": "", "passed": True, "exit_code": 0}) == "missing command"
+
+
+def test_strong_lane_runs_pi_first_on_sol_high(tmp_path, monkeypatch):
+    """Main match 1ZY1KQTN: 4 normal workers (sol medium) + 1 strong worker (sol high) that takes PI/Heavy first."""
+    monkeypatch.setenv("MTM_STRONG_SLOT", "1")
+    monkeypatch.setenv("MTM_WORKER_MODEL", "gpt-6.1-sol")
+    monkeypatch.setenv("MTM_WORKER_EFFORT", "medium")
+    repo = tmp_path / "checkout"
+    (repo / "project").mkdir(parents=True)
+    git(repo, "init", "-b", "main")
+    git(repo, "config", "user.email", "t@example.invalid")
+    git(repo, "config", "user.name", "t")
+    (repo / "project" / "a.txt").write_text("a")
+    git(repo, "add", ".")
+    git(repo, "commit", "-m", "base")
+    c = NativeTaskCoordinator(tmp_path / "state", repo, repo / "project", "project", "MATCH",
+                              max_workers=5, normal_workers=4)
+    items = [{"key": f"TASK-0{i}", "type": "TASK", "status": "OPEN", "points": 10} for i in range(1, 5)]
+    items.append({"key": "PI-02", "type": "PI", "status": "OPEN", "points": 90})
+    c.register_projection({"status": "RUNNING", "server_epoch": time.time(), "remaining_seconds": 2400, "items": items})
+    lanes = {}
+    for t in c.plan_tasks()["selected"]:
+        c.register_started(t["key"], {"files": {}})
+        env = c.claim_task(t["key"], t["key"].lower(), 300)["taskEnvelope"]
+        lanes[t["key"]] = (env["lane"], env["reasoning_effort"], env["agent_profile"])
+    assert lanes["PI-02"] == ("strong", "high", "team_strong_worker")
+    assert all(v == ("normal", "medium", "team_feature_worker") for k, v in lanes.items() if k != "PI-02")
+    assert len(lanes) == 5
