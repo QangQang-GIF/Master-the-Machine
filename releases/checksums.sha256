@@ -10,7 +10,7 @@ f552e27e1966878d76fdc9bec03e0136532981c044f9d04197eca5b7f8e9186d  .agents/skills
 b2a89c4c97a33b1bf28fc48d2ee94dddf8124b2099325f54733270cdb16513a4  .agents/skills/mtm-init/tests/negative.md
 038ff1f7a826472017e5010e6e131e5cc78b0a11b8b0c93451ef7fa396864f69  .agents/skills/mtm-init/tests/positive.md
 d547ef13c148312797f7bb5c70bfa7c37bc01e0e647ecfd16870770ef1b5135b  .agents/skills/mtm-pi-worker/SKILL.md
-3b11baa84e2ecc2b4dc2c708d0e6f066a1d65772e6212afe06270efd9e1683b2  .agents/skills/mtm-task-worker/SKILL.md
+6274e2cd8038968bcb14e40a1a224e9ada71c82f436d957f6bbf04e1f4555259  .agents/skills/mtm-task-worker/SKILL.md
 9629a1b905b547c04a4fd99c0f0cc25713a1ef22023f991c9f155deb442fde25  .agents/skills/mtm-verification/SKILL.md
 9fdb4fef4b2c0e554b7c574c3659f67aeb21d7bf2bec76eb91a4c502ffd8d163  .agents/skills/mtm-worker/SKILL.md
 ef441374dad1675f0063623eb3a11ced2f6187ee9806d3c8e91e9c0ebe14e049  .agents/skills/team-orchestrator/SKILL.md
