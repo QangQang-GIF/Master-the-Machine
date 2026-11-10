@@ -10,7 +10,7 @@ Follow `mtm-init` and `mtm-worker`. Score depends on time from reveal to PASS. R
 1. **Zero Browser / Zero Server Overhead**:
    - Production incidents (`PI-01`, etc.) are urgent backend/service fixes. **Do NOT start a web server or Playwright browser** unless `.png` evidence is explicitly listed in `submit.json`.
 2. **Pre-Fetched Incident Context**:
-   - Check `metadata.company_context` in TaskEnvelope and `answers/<key>/evidence/` first. If additional production logs or KB rules are needed, query via `runner.control company`.
+   - Check `metadata.company_context` in TaskEnvelope and `answers/<key>/evidence/` first. For impact figures (affected count, total amount, first bad timestamp) run `collect_logs(query, service, outPath=<match_root>/answers/<key>/evidence/logs-<service>.json)` and compute them with a script from that file; never submit placeholder totals while `complete` is true. Extra KB rules: one `call_company_tools` call.
 3. **Surgical Fix & Sandbox Verification (< 2 Minutes Total)**:
    - Diagnose the root cause from `challenge/<key>.md` and incident logs (e.g., `refreshInvoiceStatus` after payment creation or voiding in `src/src/server/services/accounting/posting.ts`).
    - Apply the minimal surgical fix in `src/`.

@@ -301,3 +301,43 @@ def test_wait_reports_a_free_slot_once(native_server):
     events = server._local_wait_events()
     assert events and events.get("dispatchable") == ["TASK-01"]
     assert not (server._local_wait_events() or {}).get("dispatchable")
+
+
+def test_integrate_after_manual_conflict_resolution_skips_the_empty_pick(native_server):
+    """2SAFTO0S CR-07: after the Root resolved a conflict by hand, integrate_and_submit failed on
+    'The previous cherry-pick is now empty'."""
+    server = native_server
+    worker, match, _, _ = finish_worker(server)
+    # the root already holds the worker change, applied by hand with a different resolution (other patch-id)
+    (server.match_root / "README.md").write_text("After: documented behavior.\nPlus the other worker's line.\n")
+    git(server.checkout_root, "add", "-A")
+    git(server.checkout_root, "commit", "-m", "manual resolution")
+    git(server.checkout_root, "push", "origin", "main")
+    server.record_worker_result("TASK-01")
+    head = git(worker, "rev-parse", "HEAD")
+    # the Root applies the worker commit by hand, keeping its own resolution of README.md
+    git(server.checkout_root, "cherry-pick", "--strategy-option=ours", head)
+    git(server.checkout_root, "push", "origin", "main")
+    out = server.integrate_and_submit("TASK-01")
+    assert out["status"] == "ACCEPTED"
+    assert "Plus the other worker's line" in (server.match_root / "README.md").read_text()
+
+
+def test_collect_logs_and_batched_company_calls(tmp_path):
+    server = MCPHelperServer(workspace_root=tmp_path)
+    server.match_code, server.checkout_root = "M1", tmp_path / "matches" / "M1"
+    server.checkout_root.mkdir(parents=True)
+    calls = []
+    server._has_company_credentials = lambda: True
+
+    def fake_call(name, args):
+        calls.append((name, args))
+        if name == "search_logs":
+            return {"entries": [{"ts": "2025-10-15T08:00:00Z", "message": "x", "context": {"seq": 1}}], "total": 1}
+        return {"article": args.get("query")}
+    server.call_company_tool = fake_call
+    out = server.call_company_tools([{"name": "kb_search", "arguments": {"query": f"KB-{i}"}} for i in range(6)],
+                                    str(server.checkout_root.parent / ".workers" / "kb.json"))
+    assert len(out["calls"]) == 6 and Path(out["path"]).is_file() and len(calls) == 6
+    res = server.collect_logs("x", "rule-engine", str(server.checkout_root.parent / ".workers" / "logs.json"))
+    assert res["unique"] == 1 and Path(res["path"]).is_file()

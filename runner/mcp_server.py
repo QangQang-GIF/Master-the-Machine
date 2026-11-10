@@ -288,7 +288,7 @@ class MCPHelperServer:
                 for req in sorted(bridge.glob("req-*.json")):
                     rid = req.stem[4:]
                     with self._bridge_lock:
-                        if rid in self._bridge_busy or len(self._bridge_busy) >= 3:
+                        if rid in self._bridge_busy or len(self._bridge_busy) >= 4:
                             continue
                         self._bridge_busy.add(rid)
                     threading.Thread(target=self._bridge_serve, args=(req, rid), daemon=True).start()
@@ -394,6 +394,91 @@ class MCPHelperServer:
         if not self.company_tools_client:
             raise RuntimeError("Company tools bridge not initialized (missing match credentials or match ID).")
         return self.company_tools_client.call_tool(name, arguments)
+
+    def collect_logs(self, query: str = "", service: str = "", out_path: Optional[str] = None,
+                     tool: str = "search_logs", max_calls: int = 600) -> Dict[str, Any]:
+        """Collect EVERY matching production-log entry (search_logs caps each call at ~20 newest entries).
+
+        Narrows by timestamp prefix until every partition is complete, deduplicates by context.seq and writes
+        all entries, ordered by context.seq, to a JSON file. Returns only a summary plus the file path, so the
+        worker computes counts/first entries/sums with a script. (2SAFTO0S: the skills named collect_logs but
+        this pack lacked it; PI-02 submitted placeholder impact totals "due to log result caps" and PI-03 paged
+        search_logs one day at a time in 25 worker turns.)
+        """
+        from mtm_competition.adapters.log_collector import collect_all
+
+        if not self._has_company_credentials() and out_path:
+            try:
+                return self._delegate_company("collect_logs", {"query": query or "", "service": service or "",
+                                                               "outPath": str(out_path), "maxCalls": int(max_calls)}, 30)
+            except CompanyBridgeUnavailable:
+                pass
+
+        def search(q: str, svc: str) -> Dict[str, Any]:
+            args: Dict[str, Any] = {"query": q}
+            if svc:
+                args["service"] = svc
+            return self.call_company_tool(tool, args)
+
+        result = collect_all(search, query or "", service or "", max_calls=max(10, min(int(max_calls), 2000)))
+        base = Path(self.workspace_root) / "team-sdlc-pack" / "state" / str(self.match_code or self.match_uuid or "match") / "logs"
+        if out_path:
+            target = Path(out_path)
+            allowed = [base.resolve()]
+            if self.checkout_root:
+                allowed.append(Path(self.checkout_root).resolve().parent)
+            if not target.is_absolute() or not any(target.resolve().is_relative_to(a) for a in allowed):
+                raise ValueError("outPath must be an absolute path inside a worker worktree or the match state folder")
+        else:
+            digest = hashlib.sha256(f"{tool}|{service}|{query}".encode("utf-8")).hexdigest()[:12]
+            target = base / f"{(service or 'all')}-{digest}.json"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        payload = json.dumps({k: v for k, v in result.items()}, ensure_ascii=False, indent=1)
+        target.write_text(payload, encoding="utf-8")
+        entries = result["entries"]
+        first, last = (entries[0], entries[-1]) if entries else ({}, {})
+        return {"path": str(target), "sha256": hashlib.sha256(payload.encode("utf-8")).hexdigest(),
+                "total": result["total"], "unique": result["unique"], "complete": result["complete"],
+                "calls": result["calls"], "elapsedSeconds": result["elapsedSeconds"],
+                "incompletePartitions": result["incompletePartitions"][:10],
+                "firstEntry": {k: first.get(k) for k in ("ts", "service", "message", "context")} if first else None,
+                "lastEntry": {k: last.get(k) for k in ("ts", "service", "message", "context")} if last else None,
+                "note": "Entries are ordered by context.seq. Analyse the file with a script; do not paste it into context."}
+
+    def call_company_tools(self, calls: List[Dict[str, Any]], out_path: Optional[str] = None) -> Dict[str, Any]:
+        """Several company-tool calls in one tool call, run 4 at a time.
+
+        2SAFTO0S: workers spent a model turn per lookup (KB-BANK-RULE-01..30, search_logs per day): 94 calls.
+        With outPath the full results go to that JSON file and only a per-call summary comes back."""
+        from concurrent.futures import ThreadPoolExecutor
+        if not isinstance(calls, list) or not calls:
+            raise ValueError("calls: list of {name, arguments}")
+        calls = calls[:50]
+
+        def one(c: Dict[str, Any]) -> Dict[str, Any]:
+            name, args = str((c or {}).get("name", "")), (c or {}).get("arguments") or {}
+            try:
+                return {"name": name, "arguments": args, "result": self.call_company_tool(name, args)}
+            except Exception as exc:
+                return {"name": name, "arguments": args, "error": str(exc)}
+
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            results = list(pool.map(one, calls))
+        if not out_path:
+            return {"results": results}
+        target = Path(out_path)
+        if not target.is_absolute():
+            raise ValueError("outPath must be an absolute path inside your worktree")
+        target.parent.mkdir(parents=True, exist_ok=True)
+        body = json.dumps(results, ensure_ascii=False, indent=1)
+        target.write_text(body, encoding="utf-8")
+        summary = [{"i": i, "name": r["name"], "arguments": r["arguments"],
+                    **({"error": r["error"]} if "error" in r else {"bytes": len(json.dumps(r.get("result"), ensure_ascii=False))})}
+                   for i, r in enumerate(results)]
+        pending = sum(1 for r in results if isinstance(r.get("result"), dict) and r["result"].get("status") == "PENDING")
+        return {"path": str(target), "calls": summary,
+                **({"pending": pending, "note": "Some calls are still running; call again with the same arguments."}
+                   if pending else {"note": "Read the file with a script; do not paste it into context."})}
 
     def fetch_fixture(
         self,
@@ -1598,7 +1683,14 @@ class MCPHelperServer:
                 raise RuntimeError(f"{key}: cannot read worker HEAD: {head.stderr.strip()[:200]}")
             git = lambda *a, t=60: subprocess.run(["git", "-C", str(self.checkout_root), *a], capture_output=True,
                                                    text=True, timeout=t)
-            cherry = git("cherry", "HEAD", head.stdout.strip())
+            folder = native.repository_folder
+            answers = f"{folder}/answers/{key}"
+            same_answers = (git("cat-file", "-e", f"HEAD:{answers}/submit.json").returncode == 0
+                            and git("diff", "--quiet", "HEAD", head.stdout.strip(), "--", answers).returncode == 0)
+            # Already integrated by hand (a conflict the Root resolved): the root HEAD carries exactly the
+            # worker's answers/<key>. Replaying its commits again would only conflict or come out empty.
+            cherry = (subprocess.CompletedProcess([], 0, "", "") if same_answers
+                      else git("cherry", "HEAD", head.stdout.strip()))
             if cherry.returncode != 0:
                 native.end_integration(key, success=False)
                 raise RuntimeError(f"{key}: git cherry failed: {cherry.stderr.strip()[:200]}")
@@ -1612,7 +1704,9 @@ class MCPHelperServer:
                     native.end_integration(key, success=False)
                     return {"key": key, "status": "CONFLICT", "conflicts": [c for c in conflicts if c][:20],
                             "error": (pick.stderr or pick.stdout).strip()[:400],
-                            "next": "REWORK via reconcile_worker(requeue=true), or integrate manually and call integrate_and_submit again."}
+                            "next": ("Resolve by hand: integration_gate(begin), git cherry-pick the worker commits in the root checkout, "
+                                     "keep BOTH sides' intent in each conflicted file, commit, then call integrate_and_submit again "
+                                     "(it skips commits already applied and submits). Or REWORK via reconcile_worker(requeue=true).")}
             if not (Path(self.match_root) / "answers" / key / "submit.json").is_file():
                 native.end_integration(key, success=False)
                 raise FileNotFoundError(f"{key}: the worker commits do not contain answers/{key}/submit.json")
@@ -1639,6 +1733,12 @@ class MCPHelperServer:
             if pick.returncode == 0:
                 return pick
             conflicts = [c for c in git("diff", "--name-only", "--diff-filter=U").stdout.splitlines() if c]
+            text = (pick.stderr + pick.stdout).lower()
+            if not conflicts and ("now empty" in text or "nothing to commit" in text):
+                # 2SAFTO0S CR-07: the Root had resolved a conflict by hand and committed it; on the next call
+                # git cherry still listed the original commit, whose replay is now empty. Skip it.
+                pick = git("cherry-pick", "--skip", t=120)
+                continue
             if not conflicts or any(Path(c).name != "worker_result.json" for c in conflicts):
                 return pick
             for c in conflicts:
@@ -2209,7 +2309,7 @@ class MCPHelperServer:
         a deadline flush or a ready result. Returns at once when one is already pending.
 
         The board is polled every MTM_WAIT_BOARD_POLL seconds (default 6); local events every 2 s. With nothing
-        running or ready the wait may last up to MTM_WAIT_IDLE_MAX_MS (default 110 s), so an idle Root spends
+        running or ready the wait may last up to MTM_WAIT_IDLE_MAX_MS (default 240 s; new items still return within ~6 s), so an idle Root spends
         half as many turns (RQ3I4OHX: 6 Root turns of pure polling after the last submission)."""
         busy = True
         if self.native:
@@ -2218,7 +2318,7 @@ class MCPHelperServer:
                 busy = bool(details.get("active") or details.get("readyToIntegrate") or details.get("selected"))
             except Exception:
                 busy = True
-        cap = 55000 if busy else max(55000, int(os.environ.get("MTM_WAIT_IDLE_MAX_MS", "110000")))
+        cap = 55000 if busy else max(55000, int(os.environ.get("MTM_WAIT_IDLE_MAX_MS", "240000")))
         bounded_ms = min(max(100, int(timeout_ms or 55000)), cap)
         if not busy and int(timeout_ms or 0) >= 55000:
             bounded_ms = cap
@@ -2352,7 +2452,7 @@ def get_tool_definitions() -> List[Dict[str, Any]]:
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "timeoutMs": {"type": "integer", "description": "Use 55000. It returns early on a new item, a match state change, a worker result on disk, a deadline flush or a ready result; with nothing running it may wait up to 110 s.", "default": 55000}
+                    "timeoutMs": {"type": "integer", "description": "Use 55000. It returns early on a new item, a match state change, a worker result on disk, a deadline flush or a ready result; with nothing running it may wait up to 240 s (a new item still returns within seconds).", "default": 55000}
                 },
             },
         },
@@ -2374,6 +2474,31 @@ def get_tool_definitions() -> List[Dict[str, Any]]:
                     "arguments": {"type": "object", "description": "Arguments object passed to the tool"},
                 },
                 "required": ["name", "arguments"],
+            },
+        },
+        {
+            "name": "collect_logs",
+            "description": "Collect ALL production-log entries matching query/service (search_logs returns only ~20 newest per call). Narrows by timestamp automatically, writes every entry ordered by context.seq to a JSON file and returns a summary with the path and complete=true/false. Use it for any count, first/last entry or sum over logs, then compute with a script. PENDING: call again with the same arguments.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "Words that must all appear in an entry (may be empty)"},
+                    "service": {"type": "string", "description": "Optional service filter, e.g. rule-engine, deploy"},
+                    "outPath": {"type": "string", "description": "Absolute output path inside your worktree, e.g. <match_root>/answers/<key>/evidence/logs-rule-engine.json"},
+                    "maxCalls": {"type": "integer", "minimum": 10, "maximum": 2000, "default": 600},
+                },
+            },
+        },
+        {
+            "name": "call_company_tools",
+            "description": "Several company-tool calls (e.g. 20 KB articles or log queries) in ONE call, run in parallel. With outPath the full results are written to that JSON file and only a per-call summary is returned.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "calls": {"type": "array", "maxItems": 50, "items": {"type": "object", "properties": {"name": {"type": "string"}, "arguments": {"type": "object"}}, "required": ["name"]}},
+                    "outPath": {"type": "string", "description": "Optional absolute path inside your worktree for the full results"},
+                },
+                "required": ["calls"],
             },
         },
         {
@@ -2677,6 +2802,11 @@ def run_mcp_stdio_server():
                     val = server.list_company_tools()
                 elif tool_name == "call_company_tool":
                     val = server.call_company_tool(tool_args.get("name", ""), tool_args.get("arguments", {}))
+                elif tool_name == "collect_logs":
+                    val = server.collect_logs(tool_args.get("query", ""), tool_args.get("service", ""),
+                                              tool_args.get("outPath"), max_calls=tool_args.get("maxCalls", 600))
+                elif tool_name == "call_company_tools":
+                    val = server.call_company_tools(tool_args.get("calls") or [], tool_args.get("outPath"))
                 elif tool_name == "fetch_fixture":
                     val = server.fetch_fixture(
                         tool_args.get("backlogItemKey", ""),
