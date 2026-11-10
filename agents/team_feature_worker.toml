@@ -13,7 +13,8 @@ CORE COMPETITION RULES (HONEST & AUTHORITATIVE SDLC):
    - For any item requiring test data or fixtures: Always call `fetch_fixture` or `call_company_tool` to obtain the official QA fixture from Match MCP.
    - NEVER generate synthetic test fixtures under official fixture names (e.g. `answers/<ID>/evidence/*-test-data.json`) - doing so will be rejected by the automated grader with 0 points.
    - If a specification or brief refers to company policies, documentation, or standards (e.g., KB-*, CRM standards, accounting rules), query the `kb` tool via `call_company_tool` before writing code.
-   - For production incidents (PI items), query the `logs` tool via `call_company_tool` for official production observability traces.
+   - For production incidents (PI items), use `collect_logs` (complete, saved to a file) or `call_company_tool` for official production observability traces.
+   - Call company tools yourself; your helper forwards them to the Root helper (credentials stay there). Never ask the Root to fetch KB/logs for you.
 
 2. Evidence Integrity:
    - Every file referenced in `evidenceFiles` and `testResults` must physically exist, be non-empty, and contain real verification output.

@@ -48,7 +48,7 @@ class CompanyToolsClient:
         base_url: str,
         match_id: str,
         api_key: str,
-        timeout: float = 15.0,
+        timeout: float = 25.0,
         state_dir: Optional[Path] = None,
     ) -> None:
         self.match_id = match_id
@@ -105,6 +105,34 @@ class CompanyToolsClient:
         raise ValueError(f"Unable to parse Match MCP response: {text[:300]}")
 
     def _send_rpc(self, method: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """Send a JSON-RPC request, retrying transient failures (timeout, connection error, 429, 5xx).
+
+        K2EMUW3I: 15 of 44 company-tool calls and 3 of 7 log collections failed with "The read operation
+        timed out" and the same call succeeded seconds later. Each failure that reaches the Root costs a full
+        model turn, so bounded retries happen here. Business errors are never retried.
+        """
+        retries = max(0, int(os.environ.get("MTM_COMPANY_TOOL_RETRIES", "2")))
+        delay = 1.0
+        for attempt in range(retries + 1):
+            try:
+                return self._send_rpc_once(method, params)
+            except RuntimeError as exc:
+                if attempt >= retries or not self._is_transient(exc):
+                    raise
+                time.sleep(delay)
+                delay *= 2
+        raise RuntimeError("unreachable")
+
+    @staticmethod
+    def _is_transient(exc: BaseException) -> bool:
+        text = str(exc).lower()
+        if "timed out" in text or "timeout" in text or "connection error" in text or "temporarily" in text:
+            return True
+        import re as _re
+        match = _re.search(r"match mcp http (\d{3})", text)
+        return bool(match and (match.group(1) == "429" or match.group(1).startswith("5")))
+
+    def _send_rpc_once(self, method: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         """Send JSON-RPC request to Match MCP endpoint."""
         rpc_payload = {
             "jsonrpc": "2.0",
@@ -142,6 +170,8 @@ class CompanyToolsClient:
             raise RuntimeError(f"Match MCP HTTP {exc.code} {exc.reason}: {err_body}") from exc
         except urllib.error.URLError as exc:
             raise RuntimeError(f"Match MCP connection error: {exc.reason}") from exc
+        except (TimeoutError, OSError) as exc:   # socket read timeouts surface here, not as URLError
+            raise RuntimeError(f"Match MCP connection error: {exc}") from exc
 
     def discover_tools(self) -> List[Dict[str, Any]]:
         """Query tools/list from Match MCP and categorize tools."""

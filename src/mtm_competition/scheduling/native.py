@@ -25,6 +25,37 @@ class NativeCoordinationError(ValueError):
     pass
 
 
+def normalize_test_row(row: Any) -> Any:
+    """Lossless JSON type fixes for one WorkerResult test row. Never invents a value."""
+    if not isinstance(row, dict):
+        return row
+    row = dict(row)
+    passed = row.get("passed")
+    if isinstance(passed, str) and passed.strip().lower() in ("true", "false"):
+        row["passed"] = passed.strip().lower() == "true"
+    code = row.get("exit_code")
+    if isinstance(code, str) and re.fullmatch(r"\s*-?\d+\s*", code):
+        row["exit_code"] = int(code)
+    elif isinstance(code, float) and not isinstance(code, bool) and math.isfinite(code) and code == int(code):
+        row["exit_code"] = int(code)
+    return row
+
+
+def describe_test_row_problem(row: Any) -> str | None:
+    if not isinstance(row, dict):
+        return "not an object"
+    if not isinstance(row.get("command"), str) or not row["command"].strip():
+        return "missing command"
+    if not isinstance(row.get("passed"), bool):
+        return "passed must be true/false"
+    code = row.get("exit_code")
+    if code is not None and type(code) is not int:
+        return "exit_code must be an integer"
+    if row["passed"] is True and code != 0:
+        return "passed=true needs exit_code=0"
+    return None
+
+
 class NativeTaskCoordinator:
     def __init__(self, state_dir: Path | str, checkout_root: Path | str,
                  match_root: Path | str, repository_folder: str, match_id: str,
@@ -32,7 +63,8 @@ class NativeTaskCoordinator:
                  integration_reserve_seconds: int = 90, clock_max_age_seconds: int = 120,
                  integration_lease_seconds: float = 8.0, submit_unknown_ttl_seconds: float = 120.0,
                  pi_burst_slots: int = 0, pi_integration_gate_seconds: float = 45.0,
-                 flush_lead_seconds: float | None = None, max_reconcile_attempts: int = 3):
+                 flush_lead_seconds: float | None = None, max_reconcile_attempts: int = 3,
+                 pi_max_workers: int | None = None):
         if not 1 <= normal_workers < max_workers <= 16:
             raise NativeCoordinationError("Require 1 <= normal_workers < max_workers <= 16")
         if not re.fullmatch(r"[A-Za-z0-9_-]{1,80}", match_id):
@@ -50,6 +82,10 @@ class NativeTaskCoordinator:
         # Extra worker slots that ONLY Product Incidents may use, on top of max_workers. PIs arrive at
         # unknown times and are a speed race, so a PI must never wait behind busy ordinary workers.
         self.pi_burst_slots = max(0, min(8, int(pi_burst_slots)))
+        # Optional hard cap on PI workers running at once (None = only slot capacity limits PIs).
+        if pi_max_workers is None and os.environ.get("MTM_PI_MAX_WORKERS"):
+            pi_max_workers = int(os.environ["MTM_PI_MAX_WORKERS"])
+        self.pi_max_workers = None if pi_max_workers is None else max(0, int(pi_max_workers))
         # While a finished PI waits to integrate, ordinary items may not START integrating for this long
         # (a lock holder is never interrupted). Time-limited so a stuck PI cannot starve everything else.
         self.pi_integration_gate_seconds = max(0.0, float(pi_integration_gate_seconds))
@@ -446,6 +482,7 @@ class NativeTaskCoordinator:
         terminal = {r["key"] for r in rows if r["phase"] == "SUBMITTED"}
         busy_paths = {p for r in [*active, *ready] if r["phase"] != "CLOSED" for p in json.loads(r["data"]).get("claimed_paths", [])}
         normals = sum(not self._urgent(json.loads(r["data"]), now) for r in active)
+        pis = sum(json.loads(r["data"]).get("type") == "PI" for r in active)
         candidates = []
         for row in rows:
             task = json.loads(row["data"])
@@ -473,6 +510,8 @@ class NativeTaskCoordinator:
             is_pi_task = task.get("type") == "PI"
             if not is_pi_task and base_free <= 0:
                 continue                      # burst slots are PI-only
+            if is_pi_task and self.pi_max_workers is not None and pis >= self.pi_max_workers:
+                continue                      # PI cap reached
             if not urgent and normals >= self.normal_workers:
                 continue
             if self._overlap(busy_paths, task.get("claimed_paths", [])):
@@ -484,6 +523,7 @@ class NativeTaskCoordinator:
             response["selected"].append({**task, "urgent": urgent, "slackSeconds": slack})
             busy_paths.update(task.get("claimed_paths", []))
             normals += not urgent
+            pis += is_pi_task
         return response
 
     def _release_integration(self, db) -> None:
@@ -529,6 +569,10 @@ class NativeTaskCoordinator:
                     and row["phase"] == "QUEUED"
                     and row["started"]
                     and (urgent or normals < self.normal_workers)
+                    and not (task_data.get("type") == "PI" and self.pi_max_workers is not None
+                             and sum(json.loads(r["data"]).get("type") == "PI" for r in
+                                     db.execute("SELECT data FROM tasks WHERE phase='RUNNING'").fetchall())
+                             >= self.pi_max_workers)
                 ):
                     eligible = task_data
                 else:
@@ -830,14 +874,17 @@ class NativeTaskCoordinator:
                 return {"key": key, "phase": "NEEDS_ATTENTION", "status": result["status"]}
 
             # S6': failing tests are recorded honestly (passed=false) instead of being rejected, so nobody has to
-            # move them out of test_results. Each row must still describe a real command.
-            tests = result["test_results"]
-            if any(not isinstance(t, dict) or not isinstance(t.get("command"), str) or not t["command"].strip()
-                   or not isinstance(t.get("passed"), bool)
-                   or (t.get("exit_code") is not None and type(t.get("exit_code")) is not int)
-                   or (t.get("passed") is True and t.get("exit_code") != 0) for t in tests):
+            # move them out of test_results. Each row must still describe a real command. Lossless type fixes
+            # ("0" -> 0, "true" -> True) are applied here so a JSON typing slip does not cost a Root round trip;
+            # values are never invented.
+            tests = [normalize_test_row(t) for t in result["test_results"]]
+            result["test_results"] = tests
+            if isinstance(result.get("diagnostic_test_results"), list):
+                result["diagnostic_test_results"] = [normalize_test_row(t) for t in result["diagnostic_test_results"]]
+            problems = [f"test_results[{i}]: {why}" for i, t in enumerate(tests) for why in [describe_test_row_problem(t)] if why]
+            if problems:
                 raise NativeCoordinationError("Each test result needs a command, a boolean passed and an integer exit_code "
-                                              "(exit_code=0 when passed)")
+                                              "(exit_code=0 when passed). Fix in worker_result.json: " + "; ".join(problems[:6]))
             if not tests and not result["evidence_paths"]:
                 raise NativeCoordinationError("An integratable result needs test commands or evidence paths")
             def safe(relative: str) -> Path:

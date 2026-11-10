@@ -101,6 +101,9 @@ class ProjectRuntime:
     def _build_env(self) -> dict[str, str]:
         # Shell/process configuration is the caller's final override over files.
         env = {**self._raw_env, **os.environ}
+        # Windows workers hit UnicodeDecodeError in Python checks without UTF-8 mode (K2EMUW3I BUG-09 rework).
+        env.setdefault("PYTHONUTF8", "1")
+        env.setdefault("PYTHONIOENCODING", "utf-8")
         d_temp = Path("D:/Temp")
         if d_temp.is_dir():
             env["TEMP"] = str(d_temp)

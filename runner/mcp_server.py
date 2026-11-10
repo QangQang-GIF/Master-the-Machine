@@ -237,15 +237,149 @@ class MCPHelperServer:
                     base_url=base_url,
                     match_id=str(match_id),
                     api_key=str(token),
-                    timeout=15.0,
+                    timeout=25.0,
                     state_dir=state_dir,
                 )
             self.company_tools = self.company_tools_client.discover_tools()
         except Exception as exc:
             sys.stderr.write(f"Warning: company tools discovery: {exc}\n")
+        if self.company_tools_client:
+            self._ensure_company_bridge()
+
+    # ---- Company-tool bridge for worker sessions -------------------------------------------------
+    # K2EMUW3I: native worker sessions could not call company tools (their helper process has no
+    # match credentials), so the Root fetched 44 KB/log results and copied them into worker folders:
+    # ~80 Root model turns. A worker's helper (MCP or `runner.control company ...`) now drops a request
+    # file into the bridge folder and the Root's helper process, which holds the credentials in memory,
+    # answers it on a background thread. No credential, HTTP listener or bearer ever leaves the Root.
+
+    BRIDGE_OPS = ("list", "call", "collect_logs", "fetch_fixture")
+
+    def company_bridge_dir(self) -> Path:
+        """Folder the Root helper serves. In a team workspace both candidates below are the same folder."""
+        override = os.environ.get("MTM_COMPANY_BRIDGE_DIR")
+        if override:
+            return Path(override)
+        return Path(self.workspace_root) / "team-sdlc-pack" / "state" / "company-bridge"
+
+    def _bridge_candidates(self) -> List[Path]:
+        override = os.environ.get("MTM_COMPANY_BRIDGE_DIR")
+        if override:
+            return [Path(override)]
+        # A worker CLI (`runner.control company ...`) runs with its worktree as cwd, so also look next to
+        # this file: <TeamWorkspace>/team-sdlc-pack/runner/mcp_server.py -> team-sdlc-pack/state/company-bridge.
+        return [self.company_bridge_dir(), Path(__file__).resolve().parents[1] / "state" / "company-bridge"]
+
+    def _has_company_credentials(self) -> bool:
+        return bool(self.company_tools_client or self.bearer_token or self.descriptor.get("apiKeySecret")
+                    or self.descriptor.get("bearerToken"))
+
+    def _ensure_company_bridge(self) -> None:
+        if getattr(self, "_bridge_thread", None) is not None or os.environ.get("MTM_COMPANY_BRIDGE", "1") == "0":
+            return
+        bridge = self.company_bridge_dir()
+        bridge.mkdir(parents=True, exist_ok=True)
+        self._bridge_busy: set = set()
+        self._bridge_lock = threading.Lock()
+        self._bridge_thread = threading.Thread(target=self._bridge_loop, name="company-bridge", daemon=True)
+        self._bridge_thread.start()
+
+    def _bridge_loop(self) -> None:
+        bridge = self.company_bridge_dir()
+        last_beat = 0.0
+        while self.running:
+            try:
+                now = time.time()
+                if now - last_beat >= 2:
+                    _atomic_write_json(bridge / "root.json", {"pid": os.getpid(), "match": self.match_code,
+                                                              "updated": now})
+                    last_beat = now
+                for req in sorted(bridge.glob("req-*.json")):
+                    rid = req.stem[4:]
+                    with self._bridge_lock:
+                        if rid in self._bridge_busy or len(self._bridge_busy) >= 3:
+                            continue
+                        self._bridge_busy.add(rid)
+                    threading.Thread(target=self._bridge_serve, args=(req, rid), daemon=True).start()
+            except Exception as exc:
+                sys.stderr.write(f"Warning: company bridge loop: {exc}\n")
+            time.sleep(0.5)
+
+    def _bridge_serve(self, req: Path, rid: str) -> None:
+        bridge = self.company_bridge_dir()
+        try:
+            try:
+                request = json.loads(req.read_text(encoding="utf-8"))
+                op, args = request.get("op"), request.get("args") or {}
+                if op not in self.BRIDGE_OPS or not isinstance(args, dict):
+                    raise ValueError(f"unsupported bridge operation {op!r}")
+                if op == "list":
+                    value: Any = self.list_company_tools()
+                elif op == "call":
+                    value = self.call_company_tool(str(args.get("name", "")), args.get("arguments") or {})
+                elif op == "collect_logs":
+                    value = self.collect_logs(args.get("query", ""), args.get("service", ""), args.get("outPath"),
+                                              max_calls=int(args.get("maxCalls", 600)))
+                else:   # fetch_fixture: content only; the worker writes it into its own worktree
+                    value = self.fetch_fixture(str(args.get("backlogItemKey", "")), tool_name=args.get("toolName"),
+                                               arguments=args.get("arguments"), write_to_disk=False)
+                response = {"ok": True, "result": value}
+            except Exception as exc:
+                response = {"ok": False, "error": str(exc)[:2000]}
+            response["finished"] = time.time()
+            _atomic_write_json(bridge / f"res-{rid}.json", response)
+            try:
+                req.unlink()
+            except OSError:
+                pass
+        finally:
+            with self._bridge_lock:
+                self._bridge_busy.discard(rid)
+
+    def _delegate_company(self, op: str, args: Dict[str, Any], wait_seconds: float) -> Any:
+        """Worker side: ask the Root's helper to run a company-tool operation and wait for its answer."""
+        bridge, beat = self.company_bridge_dir(), {}
+        for candidate in self._bridge_candidates():
+            try:
+                found = json.loads((candidate / "root.json").read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            if time.time() - float(found.get("updated") or 0) <= 15 and found.get("pid") != os.getpid():
+                bridge, beat = candidate, found
+                break
+        if not beat:
+            raise CompanyBridgeUnavailable("Company tools unavailable: no match credentials in this process and the Root "
+                               "helper is not serving the company-tool bridge. Report this blocker; do not retry.")
+        rid = hashlib.sha256(json.dumps([op, args], sort_keys=True).encode("utf-8")).hexdigest()[:20]
+        res, req = bridge / f"res-{rid}.json", bridge / f"req-{rid}.json"
+        if res.exists() and time.time() - res.stat().st_mtime > 600:
+            res.unlink(missing_ok=True)
+        if not res.exists() and not req.exists():
+            _atomic_write_json(req, {"op": op, "args": args, "created": time.time()})
+        deadline = time.time() + wait_seconds
+        while time.time() < deadline:
+            if res.exists():
+                try:
+                    response = json.loads(res.read_text(encoding="utf-8"))
+                except Exception:
+                    time.sleep(0.3)
+                    continue
+                if not response.get("ok"):
+                    res.unlink(missing_ok=True)       # an error is not cached: a later call retries
+                    raise RuntimeError(response.get("error") or "company tool failed")
+                return response.get("result")
+            time.sleep(0.5)
+        return {"status": "PENDING", "requestId": rid,
+                "note": "Still running in the Root helper. Call again with exactly the same arguments to get the result."}
 
     def list_company_tools(self) -> List[Dict[str, Any]]:
         """List discovered tools from the official Match MCP server."""
+        if not self._has_company_credentials():
+            try:
+                listed = self._delegate_company("list", {}, 60)
+            except CompanyBridgeUnavailable:
+                return []
+            return listed if isinstance(listed, list) else []
         if not self.company_tools_client:
             self._init_company_tools()
         if self.company_tools_client:
@@ -257,6 +391,11 @@ class MCPHelperServer:
 
     def call_company_tool(self, name: str, arguments: Dict[str, Any]) -> Any:
         """Invoke an authoritative company tool via Match MCP server."""
+        if not self._has_company_credentials():
+            try:
+                return self._delegate_company("call", {"name": name, "arguments": arguments or {}}, 100)
+            except CompanyBridgeUnavailable:
+                pass                       # fall through to the original, explicit error
         if not self.company_tools_client:
             self._init_company_tools()
         if not self.company_tools_client:
@@ -272,6 +411,13 @@ class MCPHelperServer:
         worker computes counts/first entries/sums with a script instead of reading pages into its context.
         """
         from mtm_competition.adapters.log_collector import collect_all
+
+        if not self._has_company_credentials() and out_path:
+            try:
+                return self._delegate_company("collect_logs", {"query": query or "", "service": service or "",
+                                                               "outPath": str(out_path), "maxCalls": int(max_calls)}, 100)
+            except CompanyBridgeUnavailable:
+                pass
 
         def search(q: str, svc: str) -> Dict[str, Any]:
             args: Dict[str, Any] = {"query": q}
@@ -315,6 +461,12 @@ class MCPHelperServer:
         Fetch authoritative QA test data fixture from Match MCP and save with source metadata.
         NEVER generates synthetic fixtures!
         """
+        if not self._has_company_credentials():
+            try:
+                return self._delegate_company("fetch_fixture", {"backlogItemKey": backlog_item_key, "toolName": tool_name,
+                                                                "arguments": arguments}, 100)
+            except CompanyBridgeUnavailable as exc:
+                return {"status": "UNAVAILABLE", "reason": str(exc)}
         if not self.company_tools_client:
             self._init_company_tools()
         if not self.company_tools_client:
@@ -435,16 +587,16 @@ class MCPHelperServer:
             kb_tool_name = kb_tools[0]["name"]
             kb_props = ((kb_tools[0].get("inputSchema") or {}).get("properties") or {})
             queries: List[str] = []
-            for kb_id in re.findall(r"\bKB-\d+\b", description_text or "", flags=re.IGNORECASE):
-                q = kb_id.upper()
-                if q not in queries:
-                    queries.append(q)
-            desc_lower = f"{backlog_item_key} {description_text}".lower()
-            for kw in ("currency", "invoice", "csv", "import", "aging", "contact", "overdue", "heatmap", "export", "position"):
-                if kw in desc_lower and kw not in queries:
-                    queries.append(kw)
+            # Article ids look like KB-12, KB-SUP-9901, KB-BANK-RULE-06 (the old \bKB-\d+\b missed all but the first).
+            for kb_id in kb_article_ids(description_text or ""):
+                if kb_id not in queries:
+                    queries.append(kb_id)
             if not queries:
-                queries.append(backlog_item_key)
+                desc_lower = f"{backlog_item_key} {description_text}".lower()
+                for kw in ("currency", "invoice", "csv", "import", "aging", "contact", "overdue", "heatmap", "export", "position"):
+                    if kw in desc_lower and kw not in queries:
+                        queries.append(kw)
+                queries = queries[:3] or [backlog_item_key]
 
             param_key = "query"
             for candidate_key in ("query", "keyword", "search", "id", "topic", "term"):
@@ -452,13 +604,19 @@ class MCPHelperServer:
                     param_key = candidate_key
                     break
 
-            for q in queries[:3]:
+            from concurrent.futures import ThreadPoolExecutor
+
+            def one(q: str) -> Optional[Dict[str, Any]]:
                 try:
                     res = self.company_tools_client.call_tool(kb_tool_name, {param_key: q})
-                    if res:
-                        context["kb"].append({"query": q, "tool": kb_tool_name, "result": res})
-                except Exception:
-                    continue
+                    return {"query": q, "tool": kb_tool_name, "result": res} if res else None
+                except Exception as exc:
+                    return {"query": q, "tool": kb_tool_name, "error": str(exc)[:300]}
+
+            with ThreadPoolExecutor(max_workers=4) as pool:
+                for entry in pool.map(one, queries[:12]):
+                    if entry:
+                        context["kb"].append(entry)
 
         if log_tools and (backlog_item_key.upper().startswith("PI-") or "incident" in (description_text or "").lower()):
             log_tool_name = log_tools[0]["name"]
@@ -710,6 +868,7 @@ class MCPHelperServer:
                 "max_workers": self.native.max_workers,
                 "normal_workers": self.native.normal_workers,
                 "pi_burst_slots": self.native.pi_burst_slots,
+                "pi_max_workers": self.native.pi_max_workers,
                 "source": "env" if len(present) == len(env_names) else ("partial env" if present else "mcp_server default"),
             }
             sys.stderr.write(f"Effective native worker config: {self.effective_worker_config}\n")
@@ -1438,16 +1597,82 @@ class MCPHelperServer:
 
     def submit_work(
         self,
-        client_submission_id: str,
-        backlog_item_key: str,
-        git_revision: str,
-        answer: Dict[str, Any],
+        client_submission_id: Optional[str] = None,
+        backlog_item_key: str = "",
+        git_revision: Optional[str] = None,
+        answer: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
-        """Submit with a heartbeat on the integration lease for the whole duration of the call."""
+        """Submit with a heartbeat on the integration lease for the whole duration of the call.
+
+        Omitted arguments are filled from disk instead of the Root's context: `answer` from the root
+        checkout's answers/<key>/submit.json, `gitRevision` from the root checkout HEAD, and
+        `clientSubmissionId` from the journal (a replay keeps its identity) or a fresh UUID.
+        """
+        if not backlog_item_key:
+            raise ValueError("backlogItemKey is required")
+        if answer is None:
+            path = Path(self.match_root) / "answers" / backlog_item_key / "submit.json"
+            if not path.is_file():
+                raise FileNotFoundError(f"{backlog_item_key}: {path} not found in the root checkout; integrate first")
+            answer = json.loads(path.read_text(encoding="utf-8-sig"))
+        if not git_revision:
+            git_revision = self._git_rev()
+        if not client_submission_id:
+            entry = self.journal.get_in_flight(self.match_uuid, backlog_item_key) if (self.journal and self.match_uuid) else None
+            client_submission_id = (entry or {}).get("client_submission_id") or str(uuid.uuid4())
         try:
             return self._submit_work_impl(client_submission_id, backlog_item_key, git_revision, answer)
         finally:
             self._stop_integration_heartbeat()
+
+    def integrate_and_submit(self, backlog_item_key: str) -> Dict[str, Any]:
+        """One call for the whole SUBMIT path: integration lock -> cherry-pick the worker's commits onto
+        the root checkout -> submit_work (which validates, rebases, pushes, journals and sends).
+
+        Commits already present on the root (a replay after an unknown outcome) are not picked again.
+        A conflict aborts the cherry-pick, releases the lock and is returned with the conflicting files.
+        """
+        native = self._native_coordinator()
+        key = backlog_item_key
+        reconciliation = native.reconciliation_state()
+        replay = bool(reconciliation and reconciliation.get("key") == key)
+        if not replay:
+            self.refresh_match()
+            native.begin_integration(key)
+            details = native.task_details(key)
+            worktree = details.get("worktreeRoot")
+            if not worktree:
+                native.end_integration(key, success=False)
+                raise ValueError(f"{key}: no worker worktree to integrate")
+            worker_head = subprocess.run(["git", "-C", worktree, "rev-parse", "HEAD"], capture_output=True,
+                                         text=True, timeout=15)
+            if worker_head.returncode != 0:
+                native.end_integration(key, success=False)
+                raise RuntimeError(f"{key}: cannot read worker HEAD: {worker_head.stderr.strip()[:200]}")
+            head = worker_head.stdout.strip()
+            # Commits on the worker branch whose patch is not on the root yet ('+' lines), oldest first.
+            cherry = self._git_checked("cherry", "HEAD", head, timeout=30)
+            if cherry.returncode != 0:
+                native.end_integration(key, success=False)
+                raise RuntimeError(f"{key}: git cherry failed: {cherry.stderr.strip()[:200]}")
+            todo = [line.split()[1] for line in cherry.stdout.splitlines() if line.startswith("+ ")]
+            if todo:
+                pick = self._git_checked("cherry-pick", "--allow-empty", *todo, timeout=120)
+                if pick.returncode != 0:
+                    status = self._git_checked("diff", "--name-only", "--diff-filter=U", timeout=15)
+                    self._git_checked("cherry-pick", "--abort", timeout=30)
+                    native.end_integration(key, success=False)
+                    return {"key": key, "status": "CONFLICT",
+                            "conflicts": [f for f in status.stdout.splitlines() if f][:20],
+                            "error": (pick.stderr or pick.stdout).strip()[:400],
+                            "next": "Resolve by REWORK (reconcile_worker requeue=true) or integrate manually, then call integrate_and_submit again."}
+            if not (Path(self.match_root) / "answers" / key / "submit.json").is_file():
+                native.end_integration(key, success=False)
+                raise FileNotFoundError(f"{key}: the worker commits do not contain answers/{key}/submit.json")
+        self.submit_work(backlog_item_key=key)        # raises unless Game Master accepted it
+        return {"key": key, "status": "ACCEPTED", "receiptId": native.task_details(key).get("receiptId"),
+                "gitRevision": self._git_rev(), "replayed": replay,
+                "note": "ACCEPTED is a receipt, not a grade."}
 
     def _submit_work_impl(
         self,
@@ -1886,8 +2111,42 @@ class MCPHelperServer:
                     pass
         return res
 
-    def record_worker_result(self, backlog_item_key: str, worker_result: Dict[str, Any]) -> Dict[str, Any]:
-        return self._native_coordinator().record_worker_result(backlog_item_key, worker_result)
+    def record_worker_result(self, backlog_item_key: str, worker_result: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """Record a worker's result. Without `worker_result` the helper reads the worker's own
+        worker_result.json from its worktree, so the Root never copies the file through its context.
+        Any dev server the worker left running is stopped afterwards (harmless if none)."""
+        native = self._native_coordinator()
+        details = native.task_details(backlog_item_key)
+        worker_match = Path(details["worktreeRoot"]) / native.repository_folder if details.get("worktreeRoot") else None
+        if worker_result is None:
+            if worker_match is None:
+                raise ValueError(f"{backlog_item_key}: no worker worktree; pass workerResult explicitly")
+            path = worker_match / "worker_result.json"
+            if not path.is_file():
+                raise FileNotFoundError(f"{backlog_item_key}: worker has not written {path.name} yet")
+            worker_result = json.loads(path.read_text(encoding="utf-8-sig"))
+            if not isinstance(worker_result, dict):
+                raise ValueError(f"{backlog_item_key}: worker_result.json is not a JSON object")
+        result = native.record_worker_result(backlog_item_key, worker_result)
+        if worker_match is not None and details.get("workerId"):
+            self._stop_worker_server(worker_match, str(details["workerId"]))
+        if isinstance(result, dict) and isinstance(result.get("workerResult"), dict):
+            # The Root needs the verdict, not the whole result echoed back.
+            wr = result["workerResult"]
+            result["workerResult"] = {k: wr.get(k) for k in ("status", "answer_status", "verification_status",
+                                                             "mvs_passed") if k in wr}
+        return result
+
+    def _stop_worker_server(self, worker_match: Path, worker_id: str) -> None:
+        runtime = Path(__file__).resolve().parent / "project_runtime.py"
+        if not runtime.is_file() or not self.match_code:
+            return
+        try:
+            subprocess.run([sys.executable, str(runtime), "--match-root", str(worker_match), "--match-id",
+                            str(self.match_code), "--worker-id", worker_id, "serve-stop"],
+                           capture_output=True, text=True, timeout=30)
+        except Exception as exc:
+            sys.stderr.write(f"Warning: serve-stop for {worker_id}: {exc}\n")
 
     def integration_gate(self, backlog_item_key: str, action: str = "begin") -> Dict[str, Any]:
         native = self._native_coordinator()
@@ -1983,13 +2242,25 @@ class MCPHelperServer:
         return {"status": "TIMEOUT", "elapsedMs": elapsed_ms, "matchState": self.match_state, "eventCursor": cursor}
 
 
+class CompanyBridgeUnavailable(RuntimeError):
+    """No credentials in this process and no live Root helper serving the company-tool bridge."""
+
+
+def _atomic_write_json(path: Path, value: Any) -> None:
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
+    tmp.write_text(json.dumps(value, ensure_ascii=False), encoding="utf-8")
+    os.replace(tmp, path)
+
+
 def get_tool_definitions() -> List[Dict[str, Any]]:
     native_tools = [
         ("plan_tasks", "Refresh server board and return eligible native tasks, reserved urgent capacity, and ready integrations.", {}, []),
         ("claim_task", "Reserve an eligible task after Start Work; return isolated worktree and sanitized TaskEnvelope for native spawn.",
          {"backlogItemKey": {"type": "string"}, "workerId": {"type": "string"}, "estimatedSeconds": {"type": "integer", "minimum": 10, "default": 420}}, ["backlogItemKey", "workerId"]),
-        ("record_worker_result", "Validate completed native WorkerResult and required local artifacts before root integration.",
-         {"backlogItemKey": {"type": "string"}, "workerResult": {"type": "object"}}, ["backlogItemKey", "workerResult"]),
+        ("record_worker_result", "Validate a finished worker's result and artifacts before integration. Omit workerResult: the helper reads the worker's worker_result.json itself and stops any server it left running. Returns phase + decision.",
+         {"backlogItemKey": {"type": "string"}, "workerResult": {"type": "object", "description": "Optional; only when no worker_result.json exists"}}, ["backlogItemKey"]),
+        ("integrate_and_submit", "The whole SUBMIT path in one call: integration lock, cherry-pick the worker commits onto the root checkout (skips commits already there), then submit_work from answers/<key>/submit.json (validate, rebase, push, journal, send). Returns ACCEPTED+receiptId, or CONFLICT with files. Also replays an unknown-outcome submit.",
+         {"backlogItemKey": {"type": "string"}}, ["backlogItemKey"]),
         ("integration_gate", "Root-only exclusive integration/push/submit lock. Begin before Git mutation; failed releases after reconciliation. Submit receipt releases success.",
          {"backlogItemKey": {"type": "string"}, "action": {"type": "string", "enum": ["begin", "failed"], "default": "begin"}}, ["backlogItemKey"]),
         ("reconcile_worker", "Reconcile a stopped/completed failed native worker. Never confirm stopped while it is still writing.",
@@ -2041,16 +2312,16 @@ def get_tool_definitions() -> List[Dict[str, Any]]:
         },
         {
             "name": "submit_work",
-            "description": "Submit completed work with git revision and answer payload. Strictly verifies Git invariants before submission.",
+            "description": "Low-level submit (prefer integrate_and_submit). Strictly verifies Git invariants before submission.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "clientSubmissionId": {"type": "string", "description": "Client-generated UUID v4"},
+                    "clientSubmissionId": {"type": "string", "description": "Optional UUID v4; default: the journaled one for a replay, else a new one"},
                     "backlogItemKey": {"type": "string", "description": "Backlog item key"},
-                    "gitRevision": {"type": "string", "description": "Full 40-character SHA of the root checkout HEAD that is pushed to the assigned branch after integrating the worker commit. Integration (cherry-pick/merge) always creates a new SHA, so it never equals the worker's own commit SHA; submit_work verifies the answer file parity and that the remote branch is at this SHA."},
-                    "answer": {"type": "object", "description": "Answer payload matching submitTemplate"},
+                    "gitRevision": {"type": "string", "description": "Optional (default root HEAD). Full 40-character SHA of the root checkout HEAD that is pushed to the assigned branch after integrating the worker commit. Integration (cherry-pick/merge) always creates a new SHA, so it never equals the worker's own commit SHA; submit_work verifies the answer file parity and that the remote branch is at this SHA."},
+                    "answer": {"type": "object", "description": "Optional; default: answers/<key>/submit.json in the root checkout. Do not paste it."},
                 },
-                "required": ["clientSubmissionId", "backlogItemKey", "gitRevision", "answer"],
+                "required": ["backlogItemKey"],
             },
         },
         {
@@ -2070,7 +2341,7 @@ def get_tool_definitions() -> List[Dict[str, Any]]:
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "timeoutMs": {"type": "integer", "description": "Timeout in milliseconds (max 55000)", "default": 5000},
+                    "timeoutMs": {"type": "integer", "description": "Timeout in milliseconds (max 55000). Use 55000: it returns early on any event.", "default": 55000},
                     "sinceEventId": {"type": "integer", "description": "Event cursor from the previous response (defaults to this server's cursor)"}
                 },
             },
@@ -2141,8 +2412,62 @@ _ENVELOPE_SUMMARY_FIELDS = ("task_id", "task_type", "title", "worker_id", "repos
                             "evidence_required", "attempt_id", "result_contract")
 
 
+def kb_article_ids(text: str) -> List[str]:
+    """KB article ids in order of appearance: KB-12, KB-SUP-9901, KB-BANK-RULE-06 (upper-cased, unique)."""
+    out: List[str] = []
+    for match in re.findall(r"\bKB-[A-Za-z0-9]+(?:-[A-Za-z0-9]+)*\b", text or "", flags=re.IGNORECASE):
+        kb_id = match.upper()
+        if kb_id not in out:
+            out.append(kb_id)
+    return out
+
+
 def _safe_name(value: str) -> str:
     return re.sub(r"[^A-Za-z0-9_.-]+", "_", str(value))[:120] or "item"
+
+
+# Row fields the Root never needs to decide its next call (paths are resolved by the helper itself).
+_ROOT_DROP_FIELDS = set(_BULKY_FIELDS) | {"worktreeRoot", "worktree", "match_root", "claimed_paths", "lease",
+                                         "attempt_id", "result", "workerResult", "data", "deadlineEpoch", "deadline_epoch",
+                                         "revealedElapsedSec", "deadlineMinutes", "title"}
+
+
+def _slim_value(v: Any) -> Any:
+    if isinstance(v, float):
+        return round(v)
+    if isinstance(v, dict):
+        return {k: _slim_value(x) for k, x in v.items() if x not in (None, [], {}, "")}
+    return v
+
+
+def _slim_row(row: Any) -> Any:
+    if not isinstance(row, dict):
+        return row
+    return {k: _slim_value(v) for k, v in row.items() if k not in _ROOT_DROP_FIELDS and v not in (None, [], {}, "")}
+
+
+def compact_plan(val: Dict[str, Any]) -> Dict[str, Any]:
+    """plan_tasks for the Root: one short row per item, no paths, no duplicated diagnostics, no empty lists.
+
+    Every poll result stays in the Root's context for the rest of the match and is re-read on every later
+    model call, so each byte here is paid many times (K2EMUW3I: ~29M cached input tokens on the Root).
+    """
+    out: Dict[str, Any] = {}
+    ready_keys = {r.get("key") for r in val.get("readyToIntegrate") or [] if isinstance(r, dict)}
+    for key, value in val.items():
+        if key == "active" and isinstance(value, list):
+            out["active"] = [f"{r.get('key')}:{r.get('workerId') or r.get('worker_id') or '?'}" if isinstance(r, dict) else r
+                             for r in value]
+        elif key == "readyDiagnostics" and isinstance(value, list):
+            rest = [_slim_row(r) for r in value if not (isinstance(r, dict) and r.get("key") in ready_keys)]
+            if rest:
+                out[key] = rest
+        elif isinstance(value, list):
+            if value:
+                out[key] = [_slim_row(r) for r in value]
+        elif value not in (None, {}, ""):
+            out[key] = _slim_value(value)
+    return out
 
 
 def compact_root_output(server: "MCPHelperServer", tool_name: str, args: Dict[str, Any], val: Any) -> Any:
@@ -2150,11 +2475,15 @@ def compact_root_output(server: "MCPHelperServer", tool_name: str, args: Dict[st
         return val
     try:
         if tool_name == "plan_tasks":
-            out = dict(val)
-            for key in ("selected", "active", "readyToIntegrate", "readyDiagnostics", "skippedReady", "integrationBlocked", "overdueWorkers"):
+            return compact_plan(val)
+        if tool_name == "wait_for_update" and val.get("status") == "EVENT":
+            out = {k: v for k, v in val.items() if v not in (None, [], {})}
+            if isinstance(out.get("events"), list):
+                out["events"] = [{k: e.get(k) for k in ("id", "type", "key") if e.get(k) is not None}
+                                 if isinstance(e, dict) else e for e in out["events"]]
+            for key in ("deadlineFlushRequests", "workerResultsAvailable", "reconciliationRequired"):
                 if isinstance(out.get(key), list):
-                    out[key] = [{k: v for k, v in r.items() if k not in _BULKY_FIELDS} if isinstance(r, dict) else r
-                                for r in out[key]]
+                    out[key] = [_slim_row(r) for r in out[key]]
             return out
         if tool_name not in ("start_work", "claim_task"):
             return val
@@ -2253,21 +2582,23 @@ def run_mcp_stdio_server():
                     val = server.start_work(tool_args.get("backlogItemKey", ""))
                 elif tool_name == "submit_work":
                     val = server.submit_work(
-                        client_submission_id=tool_args.get("clientSubmissionId", ""),
+                        client_submission_id=tool_args.get("clientSubmissionId") or None,
                         backlog_item_key=tool_args.get("backlogItemKey", ""),
-                        git_revision=tool_args.get("gitRevision", ""),
-                        answer=tool_args.get("answer", {}),
+                        git_revision=tool_args.get("gitRevision") or None,
+                        answer=tool_args.get("answer"),
                     )
+                elif tool_name == "integrate_and_submit":
+                    val = server.integrate_and_submit(tool_args["backlogItemKey"])
                 elif tool_name == "report_progress":
                     val = server.report_progress(tool_args.get("event", {}))
                 elif tool_name == "wait_for_update":
-                    val = server.wait_for_update(tool_args.get("timeoutMs", 5000), tool_args.get("sinceEventId"))
+                    val = server.wait_for_update(tool_args.get("timeoutMs", 55000), tool_args.get("sinceEventId"))
                 elif tool_name == "plan_tasks":
                     val = server.plan_tasks()
                 elif tool_name == "claim_task":
                     val = server.claim_task(tool_args["backlogItemKey"], tool_args["workerId"], tool_args.get("estimatedSeconds", 420))
                 elif tool_name == "record_worker_result":
-                    val = server.record_worker_result(tool_args["backlogItemKey"], tool_args["workerResult"])
+                    val = server.record_worker_result(tool_args["backlogItemKey"], tool_args.get("workerResult"))
                 elif tool_name == "integration_gate":
                     val = server.integration_gate(tool_args["backlogItemKey"], tool_args.get("action", "begin"))
                 elif tool_name == "reconcile_worker":

@@ -46,7 +46,8 @@ def test_plan_tasks_drops_bulky_fields_only(tmp_path):
     val = {"availableSlots": 2, "selected": [{"key": "BUG-01", "type": "BUG", "deadlineEpoch": 5, "descriptionMd": BIG,
                                               "start_details": {"files": {"a": BIG}}, "slackSeconds": 100}]}
     out = compact_root_output(server(tmp_path), "plan_tasks", {}, val)
-    assert out["selected"] == [{"key": "BUG-01", "type": "BUG", "deadlineEpoch": 5, "slackSeconds": 100}]
+    # Paths, epochs and bulky fields are dropped; slackSeconds already says how much time is left.
+    assert out["selected"] == [{"key": "BUG-01", "type": "BUG", "slackSeconds": 100}]
     assert out["availableSlots"] == 2
 
 

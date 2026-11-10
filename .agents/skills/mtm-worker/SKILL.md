@@ -56,3 +56,13 @@ Follow `mtm-init` boundaries, TaskEnvelope constraints, and returned submit temp
    - Do not wait for the whole item to be finished before committing: an uncommitted half-done item scores nothing.
    - When the budget ends or Root asks you to stop, stop coding, make sure the last committed `submit.json` matches what is really verified, and write `worker_result.json`.
    - **Production logs**: for any count, first/last entry or sum over logs, use the MCP tool `collect_logs(query, service, outPath)` (it returns every entry, not just the newest 20) and compute with a script over the saved file.
+
+6. **Company tools are yours to call (do not ask the Root)**:
+   - Call `call_company_tool` (`kb_search`, `search_logs`, QA data), `collect_logs` and `fetch_fixture` directly through the `mtm_minimal` MCP tools, or `python -m runner.control company call <name> '<json>'` run from `<team workspace>/team-sdlc-pack`. Your helper forwards them to the Root's helper, which holds the credentials and retries timeouts. KB articles named in the brief are already in `metadata.company_context`; query only what is missing.
+   - `collect_logs` needs an absolute `outPath` inside your worktree. A `{"status": "PENDING"}` answer means it is still collecting: do other work, then call again with exactly the same arguments.
+   - If a company tool still fails, record the exact error in `worker_result.json` `notes` and continue with what you have.
+
+7. **Hand-off gate (one Root call per result)**:
+   - Before writing `worker_result.json`, re-run the MVS/test commands you report and check: every `test_results` row has `command` (string), `passed` (true/false) and the real integer `exit_code` (0 when passed); every `evidence_paths` file exists, is nonempty and is under `answers/<key>/evidence/`; `answers/<key>/submit.json` matches what really passed; everything is committed. Status `READY_FOR_REVIEW`/`DONE` only when every announced MVS passes; otherwise `PARTIAL`.
+   - Python checks run with UTF-8 (`PYTHONUTF8=1` is set by ProjectRuntime and the workspace shell); read and write files with `encoding="utf-8"`.
+   - The Root reads `worker_result.json` itself; your final message is one line (`<key> <status>`).
