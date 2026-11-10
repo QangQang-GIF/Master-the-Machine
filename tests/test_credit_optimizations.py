@@ -324,3 +324,48 @@ def test_pi_burst_slots_add_workers_only_for_pi(tmp_path, monkeypatch):
     assert {t["key"] for t in sel if t["type"] == "PI"} == {"PI-02", "PI-03"}
     assert sum(t["type"] != "PI" for t in sel) == 4          # ordinary capacity unchanged (normal_workers=4)
     assert len(sel) == 6
+
+
+def _lane_coordinator(tmp_path, monkeypatch):
+    monkeypatch.setenv("MTM_DEADLINE_SLOTS", "3")
+    monkeypatch.setenv("MTM_PI_BURST_SLOTS", "3")
+    repo = tmp_path / "checkout"
+    (repo / "project").mkdir(parents=True)
+    git(repo, "init", "-b", "main")
+    git(repo, "config", "user.email", "t@example.invalid")
+    git(repo, "config", "user.name", "t")
+    (repo / "project" / "a.txt").write_text("a")
+    git(repo, "add", ".")
+    git(repo, "commit", "-m", "base")
+    return NativeTaskCoordinator(tmp_path / "state", repo, repo / "project", "project", "MATCH",
+                                 max_workers=4, normal_workers=3)
+
+
+def test_three_lanes_normal_deadline_pi(tmp_path, monkeypatch):
+    c = _lane_coordinator(tmp_path, monkeypatch)
+    now = time.time()
+    items = [{"key": f"TASK-{i:02d}", "type": "TASK", "status": "OPEN", "points": 10} for i in range(1, 6)]
+    items += [{"key": f"CR-0{i}", "type": "CR", "status": "OPEN", "points": 100, "deadlineMinutes": 20} for i in range(1, 5)]
+    items += [{"key": f"PI-0{i}", "type": "PI", "status": "OPEN", "points": 90} for i in range(1, 5)]
+    c.register_projection({"status": "RUNNING", "server_epoch": now, "remaining_seconds": 2400, "items": items})
+    plan = c.plan_tasks()
+    assert plan["laneSlotsFree"] == {"normal": 3, "deadline": 3, "pi": 3}
+    by_lane = {}
+    for t in plan["selected"]:
+        by_lane.setdefault(t["laneSlot"], []).append(t["key"])
+    assert len(by_lane["pi"]) == 3 and all(k.startswith("PI-") for k in by_lane["pi"])
+    assert len(by_lane["deadline"]) == 3 and all(k.startswith("CR-") for k in by_lane["deadline"])
+    assert len(by_lane["normal"]) == 3                  # 4th PI / 4th CR overflow before ordinary items
+    assert len(plan["selected"]) == 9
+
+
+def test_ordinary_items_never_use_deadline_or_pi_lanes(tmp_path, monkeypatch):
+    c = _lane_coordinator(tmp_path, monkeypatch)
+    items = [{"key": f"TASK-{i:02d}", "type": "TASK", "status": "OPEN", "points": 10} for i in range(1, 8)]
+    c.register_projection({"status": "RUNNING", "server_epoch": time.time(), "remaining_seconds": 2400, "items": items})
+    sel = c.plan_tasks()["selected"]
+    assert len(sel) == 3 and {t["laneSlot"] for t in sel} == {"normal"}
+    for t in sel:                                        # claiming fills the normal lane
+        c.register_started(t["key"], {"files": {}})
+        c.claim_task(t["key"], t["key"].lower(), 300)
+    assert c.plan_tasks()["laneSlotsFree"] == {"normal": 0, "deadline": 3, "pi": 3}

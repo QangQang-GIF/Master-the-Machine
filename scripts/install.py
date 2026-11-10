@@ -208,15 +208,15 @@ def install_pack(source_dir: Path, workspace_dir: Path) -> None:
     src_posix = (target_pack_dir / "src").as_posix()
     sep = ";" if sys.platform.startswith("win") else ":"
 
-    # Main match 1ZY1KQTN (911 points) capacity, 4 ordinary + 1 shared slot, every worker on gpt-6.1-sol
-    # medium, plus 2 PI-only slots so an incident never waits (8 threads = 7 workers + root). Credit/latency limits from the K2EMUW3I/P2RJ4BZU fixes.
+    # Three lanes, every worker on gpt-6.1-sol medium: 3 normal slots (any item), 3 slots only for items
+    # with a deadline, 3 slots only for PIs; deadline/PI items overflow into normal (10 threads = 9 + root). Credit/latency limits from the K2EMUW3I/P2RJ4BZU fixes.
     codex_toml = f"""[features]
 multi_agent = true
 multi_agent_v2 = true
 
 [agents]
 enabled = true
-max_concurrent_threads_per_session = 8
+max_concurrent_threads_per_session = 10
 default_subagent_model = "gpt-6.1-sol"
 default_subagent_reasoning_effort = "medium"
 
@@ -233,9 +233,10 @@ tool_timeout_sec = 120
 [mcp_servers.mtm_minimal.env]
 PYTHONPATH = "{src_posix}{sep}{target_posix}"
 MTM_NATIVE_COORDINATION = "1"
-MTM_NATIVE_MAX_WORKERS = "5"
-MTM_NATIVE_NORMAL_WORKERS = "4"
-MTM_PI_BURST_SLOTS = "2"
+MTM_NATIVE_MAX_WORKERS = "4"
+MTM_NATIVE_NORMAL_WORKERS = "3"
+MTM_DEADLINE_SLOTS = "3"
+MTM_PI_BURST_SLOTS = "3"
 MTM_WORKER_MODEL = "gpt-6.1-sol"
 MTM_WORKER_EFFORT = "medium"
 MTM_ENV = "production"

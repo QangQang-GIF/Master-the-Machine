@@ -72,6 +72,13 @@ class NativeTaskCoordinator:
         # Extra worker slots that ONLY Product Incidents may use, on top of max_workers (MTM_PI_BURST_SLOTS).
         # A PI is ranked by submission time, so it must never wait behind busy ordinary workers.
         self.pi_burst_slots = max(0, min(8, int(os.environ.get("MTM_PI_BURST_SLOTS", "0") or 0)))
+        # Lane mode (MTM_DEADLINE_SLOTS > 0): three separate lanes, e.g. 3 normal + 3 deadline + 3 PI.
+        #   normal lane   = normal_workers slots, any item;
+        #   deadline lane = slots only non-PI items with a deadline may use;
+        #   PI lane       = the PI burst slots, only Product Incidents.
+        # A deadline item or PI uses its own lane first and overflows into a free normal slot.
+        self.deadline_slots = max(0, min(8, int(os.environ.get("MTM_DEADLINE_SLOTS", "0") or 0)))
+        self.lane_mode = self.deadline_slots > 0
         self.reserve = max(10, int(integration_reserve_seconds))
         self.clock_max_age = max(10, int(clock_max_age_seconds))
         self.workers_root = self.checkout_root.parent / ".workers" / match_id
@@ -243,8 +250,11 @@ class NativeTaskCoordinator:
         pi_active = sum(json.loads(r["data"]).get("type") == "PI" for r in active)
         base_free = max(0, self.max_workers - (len(active) - min(pi_active, self.pi_burst_slots)))
         burst_free = max(0, self.pi_burst_slots - pi_active)
-        response = {"matchStatus": status, "availableSlots": base_free + burst_free,
+        lanes = self._lane_free([json.loads(r["data"]) for r in active]) if self.lane_mode else None
+        response = {"matchStatus": status,
+                    "availableSlots": sum(lanes.values()) if lanes else base_free + burst_free,
                     "baseSlotsFree": base_free, "piBurstSlotsFree": burst_free,
+                    **({"laneSlotsFree": dict(lanes)} if lanes else {}),
                     "selected": [], "active": [public_row(r) for r in active], "readyToIntegrate": [],
                     "readyDiagnostics": [], "skippedReady": [], "integrationOwner": owner, "integrationBlocked": [],
                     "overdueWorkers": []}
@@ -394,6 +404,16 @@ class NativeTaskCoordinator:
             candidates.append(((prio_tier, prio_sub, row["key"]), task, urgent, slack))
         candidates.sort(key=lambda r: r[0])
         for _, task, urgent, slack in candidates:
+            if lanes is not None:
+                if sum(lanes.values()) <= 0:
+                    break
+                lane = self._lane_for(task, lanes)
+                if lane is None or self._overlap(busy_paths, task.get("claimed_paths", [])):
+                    continue
+                lanes[lane] -= 1
+                response["selected"].append({**task, "urgent": urgent, "slackSeconds": slack, "laneSlot": lane})
+                busy_paths.update(task.get("claimed_paths", []))
+                continue
             if base_free + burst_free <= 0:
                 break
             is_pi = task.get("type") == "PI"
@@ -411,6 +431,32 @@ class NativeTaskCoordinator:
             busy_paths.update(task.get("claimed_paths", []))
             normals += not urgent
         return response
+
+    @staticmethod
+    def _task_class(task: dict) -> str:
+        if task.get("type") == "PI":
+            return "pi"
+        if task.get("deadline_epoch") is not None or task.get("deadlineMinutes") is not None:
+            return "deadline"
+        return "normal"
+
+    def _lane_free(self, running: list[dict]) -> dict[str, int]:
+        """Free slots per lane. Running deadline/PI items fill their own lane first, the rest sit in normal."""
+        counts = {"normal": 0, "deadline": 0, "pi": 0}
+        for t in running:
+            counts[self._task_class(t)] += 1
+        own_dl = min(counts["deadline"], self.deadline_slots)
+        own_pi = min(counts["pi"], self.pi_burst_slots)
+        normal_used = counts["normal"] + (counts["deadline"] - own_dl) + (counts["pi"] - own_pi)
+        return {"normal": max(0, self.normal_workers - normal_used),
+                "deadline": max(0, self.deadline_slots - own_dl),
+                "pi": max(0, self.pi_burst_slots - own_pi)}
+
+    def _lane_for(self, task: dict, lanes: dict[str, int]) -> str | None:
+        cls = self._task_class(task)
+        if cls != "normal" and lanes.get(cls, 0) > 0:
+            return cls
+        return "normal" if lanes.get("normal", 0) > 0 else None
 
     def plan_tasks(self) -> dict[str, Any]:
         with self._db() as db:
@@ -443,13 +489,16 @@ class NativeTaskCoordinator:
                     not self._urgent(json.loads(r["data"]), now_val)
                     for r in db.execute("SELECT data FROM tasks WHERE phase='RUNNING'").fetchall()
                 )
+                lane_ok = (self._lane_for(task_data, dict(plan["laneSlotsFree"])) is not None
+                           if self.lane_mode and plan.get("laneSlotsFree") is not None else
+                           ((task_data.get("type") == "PI" or plan.get("baseSlotsFree", 1) > 0)
+                            and (urgent or normals < self.normal_workers)))
                 if (
                     plan.get("matchStatus") in ("RUNNING", "IN_PROGRESS", "STARTED")
                     and plan["availableSlots"] > 0
-                    and (task_data.get("type") == "PI" or plan.get("baseSlotsFree", 1) > 0)
+                    and lane_ok
                     and row["phase"] == "QUEUED"
                     and row["started"]
-                    and (urgent or normals < self.normal_workers)
                 ):
                     eligible = task_data
                 else:
