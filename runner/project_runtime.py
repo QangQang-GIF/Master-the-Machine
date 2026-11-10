@@ -294,8 +294,13 @@ class ProjectRuntime:
                         cmd_args = ["cmd.exe", "/c", resolved] + cmd_args[1:]
                     elif Path(resolved).suffix.lower() == ".exe":
                         cmd_args[0] = resolved
+            # Always watched: a hung command (no output) and its whole process tree are stopped. P2RJ4BZU: a
+            # vitest child kept the pipes open past the 300 s timeout (346 s), and a foreground server ran 526 s.
+            # Enabled by the installer (MTM_RUN_IDLE_TIMEOUT=150 in the workspace shell environment).
             idle = float(os.environ.get("MTM_RUN_IDLE_TIMEOUT", "0") or 0)
             if idle > 0:
+                idle = min(max(idle, 1.0), float(os.environ.get("MTM_RUN_IDLE_MAX", "300")))
+                timeout = min(float(timeout), float(os.environ.get("MTM_RUN_TIMEOUT_MAX", "900")))
                 code, out, err, why = _run_watched(cmd_args, workdir, env, max(0.1, timeout), idle)
                 if why:
                     err = (err + ("\n" if err and not err.endswith("\n") else "")
@@ -593,6 +598,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     serve_parser.add_argument("--server-script", default="dev")
     serve_parser.add_argument("--url")
     serve_parser.add_argument("--timeout", type=float, default=90)
+    serve_parser.add_argument("command", nargs=argparse.REMAINDER,
+                              help="Optional server command after --, when the project has no suitable package script")
     sub.add_parser("serve-stop", help="Stop this worker's persistent server")
     args = parser.parse_args(argv)
     runtime = ProjectRuntime(args.match_root, args.match_id, args.worker_id)
@@ -626,7 +633,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.action == "serve-stop":
             print(_json.dumps(stop_background_server(runtime)))
             return 0
-        res = start_background_server(runtime, server_command(args.server_script), readiness_url=args.url,
+        custom = list(getattr(args, "command", []) or [])
+        if custom[:1] == ["--"]:
+            custom = custom[1:]
+        res = start_background_server(runtime, custom or server_command(args.server_script), readiness_url=args.url,
                                       readiness_timeout=args.timeout)
         print(_json.dumps(res))
         return 0 if res.get("status") == "READY" else 1

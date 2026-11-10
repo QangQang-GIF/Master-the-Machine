@@ -321,3 +321,15 @@ def test_hung_command_is_stopped_by_the_idle_watchdog(tmp_path, monkeypatch):
     assert res.timed_out and res.returncode == 124 and "start" in res.stdout and "no output" in res.stderr
     ok = rt.run([_sys.executable, "-c", "import time\nfor i in range(4):\n print(i, flush=True); time.sleep(0.5)"], timeout=60)
     assert ok.returncode == 0 and not ok.timed_out and ok.stdout.split() == ["0", "1", "2", "3"]
+
+
+def test_watchdog_caps_worker_overrides(tmp_path, monkeypatch):
+    from runner.project_runtime import ProjectRuntime
+    import sys as _sys
+    monkeypatch.delenv("MTM_RUN_IDLE_TIMEOUT", raising=False)
+    monkeypatch.setenv("MTM_RUN_IDLE_MAX", "2")        # a worker passing --idle-timeout 1600 is still capped
+    monkeypatch.setenv("MTM_RUN_IDLE_TIMEOUT", "1600")
+    rt = ProjectRuntime(tmp_path, "M1", "w1")
+    t0 = time.monotonic()
+    res = rt.run([_sys.executable, "-c", "import time; time.sleep(30)"], timeout=60)
+    assert res.timed_out and time.monotonic() - t0 < 15
