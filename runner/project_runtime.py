@@ -39,6 +39,52 @@ class CommandResult:
         return not self.timed_out and self.returncode == 0
 
 
+def _run_watched(cmd_args: list, workdir: Path, env: dict, timeout: float, idle: float):
+    """Run a command and stop its whole process tree when it exceeds `timeout` or prints nothing for `idle`
+    seconds. A hung test or server wait otherwise holds a worker for the full timeout (300 s by default)."""
+    import threading
+    kwargs = {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP} if sys.platform == "win32" else {"start_new_session": True}
+    proc = subprocess.Popen(cmd_args, cwd=workdir, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                            text=True, encoding="utf-8", errors="replace", **kwargs)
+    chunks = {"out": [], "err": []}
+    last = [time.monotonic()]
+
+    def pump(stream, name):
+        for line in iter(stream.readline, ""):
+            chunks[name].append(line)
+            last[0] = time.monotonic()
+        stream.close()
+
+    readers = [threading.Thread(target=pump, args=(proc.stdout, "out"), daemon=True),
+               threading.Thread(target=pump, args=(proc.stderr, "err"), daemon=True)]
+    for r in readers:
+        r.start()
+    started, why = time.monotonic(), None
+    while proc.poll() is None:
+        now = time.monotonic()
+        if now - started > timeout:
+            why = f"timed out after {timeout:.0f}s"
+        elif now - last[0] > idle:
+            why = f"no output for {idle:.0f}s (looks hung)"
+        if why:
+            try:
+                sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+                from mtm_core.runtime.process import terminate_process_tree
+                terminate_process_tree(proc)
+            except Exception:
+                proc.kill()
+            break
+        time.sleep(0.2)
+    try:
+        proc.wait(timeout=10)
+    except Exception:
+        pass
+    for r in readers:
+        r.join(timeout=5)
+    code = proc.returncode if proc.returncode is not None else -1
+    return (124 if why else code), "".join(chunks["out"]), "".join(chunks["err"]), why
+
+
 class ProjectRuntime:
     def __init__(self, match_root: str | Path, match_id: str, worker_id: str | None = None):
         self.match_root = Path(match_root).resolve()
@@ -248,6 +294,14 @@ class ProjectRuntime:
                         cmd_args = ["cmd.exe", "/c", resolved] + cmd_args[1:]
                     elif Path(resolved).suffix.lower() == ".exe":
                         cmd_args[0] = resolved
+            idle = float(os.environ.get("MTM_RUN_IDLE_TIMEOUT", "0") or 0)
+            if idle > 0:
+                code, out, err, why = _run_watched(cmd_args, workdir, env, max(0.1, timeout), idle)
+                if why:
+                    err = (err + ("\n" if err and not err.endswith("\n") else "")
+                           + f"[mtm] stopped: {why}. Re-run with --timeout/--idle-timeout if this command is known to be slow and silent.\n")
+                return CommandResult(tuple(self._redact(a) for a in args), str(workdir), code, self._redact(out),
+                                     self._redact(err), bool(why))
             result = subprocess.run(cmd_args, cwd=workdir, env=env, shell=False, capture_output=True,
                                     text=True, timeout=max(0.1, timeout), check=False)
             return CommandResult(tuple(self._redact(a) for a in args), str(workdir), result.returncode, self._redact(result.stdout), self._redact(result.stderr))
@@ -524,6 +578,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     run_parser = sub.add_parser("run")
     run_parser.add_argument("--cwd")
     run_parser.add_argument("--timeout", type=float, default=300)
+    run_parser.add_argument("--idle-timeout", type=float, help="Stop the command after this many seconds without output (default MTM_RUN_IDLE_TIMEOUT)")
     run_parser.add_argument("--log", help="Also write the full output to this file (e.g. an evidence log)")
     run_parser.add_argument("--full", action="store_true", help="Print the full output instead of a summary")
     run_parser.add_argument("command", nargs=argparse.REMAINDER)
@@ -588,6 +643,8 @@ def main(argv: Sequence[str] | None = None) -> int:
               "run it only after changing prisma/ (set MTM_WORKER_PRISMA_GENERATE=1 to force)")
         return 0
     else:
+        if getattr(args, "idle_timeout", None) is not None:
+            os.environ["MTM_RUN_IDLE_TIMEOUT"] = str(args.idle_timeout)
         result = runtime.run(command, args.cwd, args.timeout)
     code = result.returncode or (124 if result.timed_out else 0)
     emit_output(result.stdout, result.stderr, code, time.monotonic() - started, label=" ".join(command)[:60],

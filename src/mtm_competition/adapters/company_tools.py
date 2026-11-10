@@ -48,7 +48,7 @@ class CompanyToolsClient:
         base_url: str,
         match_id: str,
         api_key: str,
-        timeout: float = 25.0,
+        timeout: float = 10.0,
         state_dir: Optional[Path] = None,
     ) -> None:
         self.match_id = match_id
@@ -112,7 +112,7 @@ class CompanyToolsClient:
         model turn, so bounded retries happen here. Business errors are never retried.
         """
         retries = max(0, int(os.environ.get("MTM_COMPANY_TOOL_RETRIES", "2")))
-        delay = 1.0
+        delay = 0.5
         for attempt in range(retries + 1):
             try:
                 return self._send_rpc_once(method, params)

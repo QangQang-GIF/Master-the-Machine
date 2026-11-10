@@ -237,7 +237,7 @@ class MCPHelperServer:
                     base_url=base_url,
                     match_id=str(match_id),
                     api_key=str(token),
-                    timeout=25.0,
+                    timeout=float(os.environ.get("MTM_COMPANY_TOOL_TIMEOUT", "10")),
                     state_dir=state_dir,
                 )
             self.company_tools = self.company_tools_client.discover_tools()
@@ -303,7 +303,7 @@ class MCPHelperServer:
                     threading.Thread(target=self._bridge_serve, args=(req, rid), daemon=True).start()
             except Exception as exc:
                 sys.stderr.write(f"Warning: company bridge loop: {exc}\n")
-            time.sleep(0.5)
+            time.sleep(0.2)
 
     def _bridge_serve(self, req: Path, rid: str) -> None:
         bridge = self.company_bridge_dir()
@@ -368,7 +368,7 @@ class MCPHelperServer:
                     res.unlink(missing_ok=True)       # an error is not cached: a later call retries
                     raise RuntimeError(response.get("error") or "company tool failed")
                 return response.get("result")
-            time.sleep(0.5)
+            time.sleep(0.2)
         return {"status": "PENDING", "requestId": rid,
                 "note": "Still running in the Root helper. Call again with exactly the same arguments to get the result."}
 
@@ -376,7 +376,7 @@ class MCPHelperServer:
         """List discovered tools from the official Match MCP server."""
         if not self._has_company_credentials():
             try:
-                listed = self._delegate_company("list", {}, 60)
+                listed = self._delegate_company("list", {}, 20)
             except CompanyBridgeUnavailable:
                 return []
             return listed if isinstance(listed, list) else []
@@ -393,7 +393,7 @@ class MCPHelperServer:
         """Invoke an authoritative company tool via Match MCP server."""
         if not self._has_company_credentials():
             try:
-                return self._delegate_company("call", {"name": name, "arguments": arguments or {}}, 100)
+                return self._delegate_company("call", {"name": name, "arguments": arguments or {}}, 45)
             except CompanyBridgeUnavailable:
                 pass                       # fall through to the original, explicit error
         if not self.company_tools_client:
@@ -415,7 +415,7 @@ class MCPHelperServer:
         if not self._has_company_credentials() and out_path:
             try:
                 return self._delegate_company("collect_logs", {"query": query or "", "service": service or "",
-                                                               "outPath": str(out_path), "maxCalls": int(max_calls)}, 100)
+                                                               "outPath": str(out_path), "maxCalls": int(max_calls)}, 30)
             except CompanyBridgeUnavailable:
                 pass
 
@@ -464,7 +464,7 @@ class MCPHelperServer:
         if not self._has_company_credentials():
             try:
                 return self._delegate_company("fetch_fixture", {"backlogItemKey": backlog_item_key, "toolName": tool_name,
-                                                                "arguments": arguments}, 100)
+                                                                "arguments": arguments}, 45)
             except CompanyBridgeUnavailable as exc:
                 return {"status": "UNAVAILABLE", "reason": str(exc)}
         if not self.company_tools_client:
@@ -854,6 +854,7 @@ class MCPHelperServer:
                 max_workers=int(os.environ.get("MTM_NATIVE_MAX_WORKERS", "4")),
                 normal_workers=int(os.environ.get("MTM_NATIVE_NORMAL_WORKERS", "3")),
                 pi_burst_slots=int(os.environ.get("MTM_PI_BURST_SLOTS", "2")),
+                submit_unknown_ttl_seconds=float(os.environ.get("MTM_SUBMIT_UNKNOWN_TTL", "30")),
             )
             self._reconcile_native_receipts()
             # Preflight: make the effective worker configuration visible. The env defaults here differ from
@@ -1621,6 +1622,43 @@ class MCPHelperServer:
         finally:
             self._stop_integration_heartbeat()
 
+    def _in_flight_entry(self, key: str) -> Optional[Dict[str, Any]]:
+        if not (self.journal and self.match_uuid):
+            return None
+        entry = self.journal.get_in_flight(self.match_uuid, key)
+        return entry if entry and entry.get("state") == "IN_FLIGHT" and entry.get("request_body_bytes") else None
+
+    def _replay_in_flight(self, key: str, entry: Dict[str, Any]) -> Dict[str, Any]:
+        """Resend the journaled Submit a few times with a short pause. Raises the last error if the outcome
+        is still unknown; the journal keeps the identity so a later call replays it again."""
+        attempts = max(1, int(os.environ.get("MTM_SUBMIT_FAST_REPLAYS", "2")))
+        delay = float(os.environ.get("MTM_SUBMIT_REPLAY_DELAY", "3"))
+        native = self._native_coordinator()
+        last: Optional[BaseException] = None
+        for attempt in range(attempts):
+            if attempt:
+                time.sleep(delay)
+            try:
+                self.refresh_match()
+                native.assert_can_submit(key)
+                try:
+                    native.begin_integration(key)     # idempotent for the current owner
+                except Exception:
+                    pass
+                self._start_integration_heartbeat(key)
+                try:
+                    return self._send_journaled_submission(key, entry)
+                finally:
+                    self._stop_integration_heartbeat()
+            except Exception as exc:
+                last = exc
+                current = self._in_flight_entry(key)
+                if not current:                       # resolved (accepted/rejected): stop replaying
+                    raise
+                entry = current
+        assert last is not None
+        raise last
+
     def integrate_and_submit(self, backlog_item_key: str) -> Dict[str, Any]:
         """One call for the whole SUBMIT path: integration lock -> cherry-pick the worker's commits onto
         the root checkout -> submit_work (which validates, rebases, pushes, journals and sends).
@@ -1631,6 +1669,15 @@ class MCPHelperServer:
         native = self._native_coordinator()
         key = backlog_item_key
         reconciliation = native.reconciliation_state()
+        in_flight = self._in_flight_entry(key)
+        if in_flight:
+            # An earlier Submit for this item has an unknown outcome. Replaying the journaled request (same
+            # bytes, same idempotency key) is safe at any time; waiting for the unknown-outcome TTL is not
+            # needed and held the integration lock for 2 minutes in K2EMUW3I (BUG-09).
+            self._replay_in_flight(key, in_flight)     # raises while the outcome is still unknown
+            return {"key": key, "status": "ACCEPTED", "receiptId": native.task_details(key).get("receiptId"),
+                    "gitRevision": json.loads(bytes(in_flight["request_body_bytes"]).decode("utf-8")).get("gitRevision"),
+                    "replayed": True, "note": "ACCEPTED is a receipt, not a grade."}
         replay = bool(reconciliation and reconciliation.get("key") == key)
         if not replay:
             self.refresh_match()
@@ -1665,7 +1712,13 @@ class MCPHelperServer:
             if not (Path(self.match_root) / "answers" / key / "submit.json").is_file():
                 native.end_integration(key, success=False)
                 raise FileNotFoundError(f"{key}: the worker commits do not contain answers/{key}/submit.json")
-        self.submit_work(backlog_item_key=key)        # raises unless Game Master accepted it
+        try:
+            self.submit_work(backlog_item_key=key)    # raises unless Game Master accepted it
+        except Exception:
+            entry = self._in_flight_entry(key)
+            if not entry:
+                raise                                 # validation/terminal errors: nothing to replay
+            self._replay_in_flight(key, entry)        # unknown outcome: replay now, inside this same call
         return {"key": key, "status": "ACCEPTED", "receiptId": native.task_details(key).get("receiptId"),
                 "gitRevision": self._git_rev(), "replayed": replay,
                 "note": "ACCEPTED is a receipt, not a grade."}

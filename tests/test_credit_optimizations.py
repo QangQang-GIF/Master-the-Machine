@@ -284,3 +284,40 @@ def test_short_command_output_is_printed_unchanged(tmp_path, capsys):
     runtime = type("R", (), {"match_id": "m1", "worker_id": "w1"})()
     pr.emit_output("3 passed\n", "", 0, 0.1, "vitest", runtime)
     assert capsys.readouterr().out == "3 passed\n"
+
+
+def test_unknown_submit_outcome_is_replayed_in_the_same_call(native_server, monkeypatch):
+    """A Submit timeout no longer holds the lock for the unknown-outcome TTL: the same journaled request
+    (same bytes, same idempotency key) is resent a few seconds later inside integrate_and_submit."""
+    monkeypatch.setenv("MTM_SUBMIT_REPLAY_DELAY", "0")
+    server = native_server
+    finish_worker(server)
+    server.record_worker_result("TASK-01")
+    board = server.adapter
+    real_submit, sent = board.submit_work, []
+
+    def flaky(**kwargs):
+        sent.append(kwargs)
+        if len(sent) == 1:
+            raise TimeoutError("The read operation timed out")
+        return real_submit(**kwargs)
+
+    board.submit_work = flaky
+    out = server.integrate_and_submit("TASK-01")
+    assert out["status"] == "ACCEPTED" and len(sent) == 2
+    assert sent[0]["serialized_body_bytes"] == sent[1]["serialized_body_bytes"]
+    assert sent[0]["idempotency_key"] == sent[1]["idempotency_key"]
+    assert server.native.task_details("TASK-01")["phase"] == "SUBMITTED"
+
+
+def test_hung_command_is_stopped_by_the_idle_watchdog(tmp_path, monkeypatch):
+    from runner.project_runtime import ProjectRuntime
+    import sys as _sys
+    monkeypatch.setenv("MTM_RUN_IDLE_TIMEOUT", "1.5")
+    rt = ProjectRuntime(tmp_path, "M1", "w1")
+    t0 = time.monotonic()
+    res = rt.run([_sys.executable, "-c", "import time; print('start', flush=True); time.sleep(30)"], timeout=60)
+    assert time.monotonic() - t0 < 15
+    assert res.timed_out and res.returncode == 124 and "start" in res.stdout and "no output" in res.stderr
+    ok = rt.run([_sys.executable, "-c", "import time\nfor i in range(4):\n print(i, flush=True); time.sleep(0.5)"], timeout=60)
+    assert ok.returncode == 0 and not ok.timed_out and ok.stdout.split() == ["0", "1", "2", "3"]

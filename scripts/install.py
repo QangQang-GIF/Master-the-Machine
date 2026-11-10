@@ -229,7 +229,7 @@ default_subagent_model = "{worker_model}"
 default_subagent_reasoning_effort = "{worker_effort}"
 
 [shell_environment_policy]
-set = {{ PYTHONUTF8 = "1", PYTHONIOENCODING = "utf-8" }}
+set = {{ PYTHONUTF8 = "1", PYTHONIOENCODING = "utf-8", MTM_RUN_IDLE_TIMEOUT = "150" }}
 
 [mcp_servers.mtm_minimal]
 command = "{python_exe}"
@@ -250,6 +250,9 @@ MTM_WORKER_MODEL = "{worker_model}"
 MTM_WORKER_EFFORT = "{worker_effort}"
 MTM_ENV = "production"
 PYTHONUTF8 = "1"
+MTM_COMPANY_TOOL_TIMEOUT = "10"
+MTM_SUBMIT_UNKNOWN_TTL = "30"
+MTM_RUN_IDLE_TIMEOUT = "150"
 """
     (codex_dir / "config.toml").write_text(codex_toml, encoding="utf-8")
     (target_pack_dir / ".codex").mkdir(parents=True, exist_ok=True)
