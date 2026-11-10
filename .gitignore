@@ -62,3 +62,6 @@ state/
 
 
 
+
+# Local runtime state (company bridge, run logs) when running from a checkout
+/state/

@@ -263,3 +263,24 @@ def test_claim_task_starts_work_itself(native_server):
     claim = server.claim_task("TASK-01", "worker-01", 120)
     assert (Path(claim["matchRoot"]) / "challenge/TASK-01-spec.md").read_text() == "Document the new behavior."
     assert server.native.task_details("TASK-01")["phase"] == "RUNNING"
+
+
+def test_long_command_output_is_summarised_with_full_log(tmp_path, monkeypatch, capsys):
+    from runner import project_runtime as pr
+    big = "\n".join(f"test case {i} ... ok" for i in range(5000)) + \
+        "\nFAIL test_transfer: expected 100 received 99\nTests: 1 failed, 4999 passed\n"
+    runtime = type("R", (), {"match_id": "m1", "worker_id": "w1"})()
+    log = tmp_path / "evidence" / "test.log"
+    pr.emit_output(big, "", 1, 2.5, "vitest run", runtime, log_path=str(log))
+    out = capsys.readouterr().out
+    assert log.read_text(encoding="utf-8") == big                      # full log kept (usable as evidence)
+    assert len(out) < 2500 and "exit=1" in out and str(log) in out
+    assert "5001: FAIL test_transfer: expected 100 received 99" in out  # failure with its log line number
+    assert "Tests: 1 failed, 4999 passed" in out                       # tail keeps the verdict
+
+
+def test_short_command_output_is_printed_unchanged(tmp_path, capsys):
+    from runner import project_runtime as pr
+    runtime = type("R", (), {"match_id": "m1", "worker_id": "w1"})()
+    pr.emit_output("3 passed\n", "", 0, 0.1, "vitest", runtime)
+    assert capsys.readouterr().out == "3 passed\n"

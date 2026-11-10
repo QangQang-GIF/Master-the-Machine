@@ -524,11 +524,15 @@ def main(argv: Sequence[str] | None = None) -> int:
     run_parser = sub.add_parser("run")
     run_parser.add_argument("--cwd")
     run_parser.add_argument("--timeout", type=float, default=300)
+    run_parser.add_argument("--log", help="Also write the full output to this file (e.g. an evidence log)")
+    run_parser.add_argument("--full", action="store_true", help="Print the full output instead of a summary")
     run_parser.add_argument("command", nargs=argparse.REMAINDER)
     session_parser = sub.add_parser("session", help="Run one local server and evidence/check command with shared ephemeral config")
     session_parser.add_argument("--server-script", default="dev")
     session_parser.add_argument("--url")
     session_parser.add_argument("--timeout", type=float, default=300)
+    session_parser.add_argument("--log", help="Also write the full output to this file")
+    session_parser.add_argument("--full", action="store_true", help="Print the full output instead of a summary")
     session_parser.add_argument("command", nargs=argparse.REMAINDER)
     serve_parser = sub.add_parser("serve-start", help="Start (or reuse) one local server for this worker and leave it running")
     serve_parser.add_argument("--server-script", default="dev")
@@ -545,8 +549,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         results = runtime.prepare()
         for result in results:
             print(f"$ {shlex.join(result.argv)} [{result.returncode}{', timeout' if result.timed_out else ''}]")
-            if result.stdout: print(result.stdout, end="" if result.stdout.endswith("\n") else "\n")
-            if result.stderr: print(result.stderr, file=sys.stderr, end="" if result.stderr.endswith("\n") else "\n")
+            emit_output(result.stdout, result.stderr, result.returncode, None, label="prepare", runtime=runtime)
             if not result.ok: return result.returncode or 1
         return 0
     def server_command(script: str) -> list[str]:
@@ -574,6 +577,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 0 if res.get("status") == "READY" else 1
     command = list(args.command)
     if command[:1] == ["--"]: command = command[1:]
+    started = time.monotonic()
     if args.action == "session":
         server = server_command(args.server_script)
         sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -585,9 +589,74 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 0
     else:
         result = runtime.run(command, args.cwd, args.timeout)
-    print(result.stdout, end="")
-    print(result.stderr, file=sys.stderr, end="")
-    return result.returncode or (124 if result.timed_out else 0)
+    code = result.returncode or (124 if result.timed_out else 0)
+    emit_output(result.stdout, result.stderr, code, time.monotonic() - started, label=" ".join(command)[:60],
+                runtime=runtime, log_path=args.log, full=args.full, timed_out=result.timed_out)
+    return code
+
+
+# ---- Compact command output --------------------------------------------------------------------
+# Everything a worker prints stays in its model context and is re-read on every later turn. A test or
+# build run can print thousands of lines; the worker needs the verdict, the failures and where the full
+# log is. Short output is printed unchanged. MTM_RUN_FULL_OUTPUT=1 or --full restores the old behaviour.
+
+_SIGNAL = re.compile(r"(error|fail|✗|×|exception|traceback|assert|panic|err!|cannot find|not found|"
+                     r"expected|received|timed? ?out|\bTS\d{4}\b)", re.IGNORECASE)
+
+
+def summarize_output(text: str, max_signal: int = 40, tail: int = 15, width: int = 300) -> str:
+    lines = text.splitlines()
+    signal, seen = [], set()
+    for i, line in enumerate(lines):
+        if _SIGNAL.search(line) and not re.search(r"\b0 (failed|errors?)\b", line, re.IGNORECASE):
+            key = line.strip()[:width]
+            if key and key not in seen:
+                seen.add(key)
+                signal.append(f"{i + 1}: {key}")
+                if len(signal) >= max_signal:
+                    break
+    out = []
+    if signal:
+        out.append(f"[mtm] lines with errors/failures (first {len(signal)}, numbered as in the log):")
+        out.extend(signal)
+    out.append(f"[mtm] last {min(tail, len(lines))} lines:")
+    out.extend(line[:width] for line in lines[-tail:])
+    return "\n".join(out)
+
+
+def _run_log_dir(runtime: "ProjectRuntime") -> Path:
+    # Outside the repository so a worker's `git add` can never pick it up.
+    base = Path(__file__).resolve().parents[1] / "state" / (runtime.match_id or "match") / "run-logs"
+    return base / (runtime.worker_id or "root")
+
+
+def emit_output(stdout: str, stderr: str, code: int, seconds: float | None, label: str, runtime: "ProjectRuntime",
+                log_path: str | None = None, full: bool = False, timed_out: bool = False) -> None:
+    stdout, stderr = stdout or "", stderr or ""
+    combined = stdout + (("\n" if stdout and not stdout.endswith("\n") else "") + stderr if stderr else "")
+    limit = int(os.environ.get("MTM_RUN_OUTPUT_LIMIT", "6000"))
+    written = None
+    if log_path or len(combined) > limit:
+        target = Path(log_path) if log_path else _run_log_dir(runtime) / (
+            time.strftime("%H%M%S") + f"-{os.getpid()}-" + (re.sub(r"[^a-zA-Z0-9]+", "_", label).strip("_")[:40] or "cmd") + ".log")
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(combined, encoding="utf-8")
+            written = target
+        except OSError as exc:
+            print(f"[mtm] could not write log {target}: {exc}", file=sys.stderr)
+    if full or os.environ.get("MTM_RUN_FULL_OUTPUT") == "1" or len(combined) <= limit or written is None:
+        print(stdout, end="")
+        print(stderr, file=sys.stderr, end="")
+        if written is not None:
+            print(f"[mtm] full log also saved: {written}")
+        return
+    took = f" in {seconds:.1f}s" if seconds is not None else ""
+    status = "TIMED OUT" if timed_out else f"exit={code}"
+    print(f"[mtm] {status}{took} · {len(combined.splitlines())} lines ({len(combined) // 1024} KB) · full log: {written}")
+    print(summarize_output(combined))
+    print("[mtm] Output summarised to save context. Read a range of the log only if you need more "
+          "(e.g. lines around a numbered failure); --full prints everything.")
 
 
 if __name__ == "__main__":
