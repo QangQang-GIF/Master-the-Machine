@@ -181,14 +181,22 @@ def _deadline_server(native_server, seconds_left):
     return server
 
 
-def test_budget_runs_to_the_deadline_without_a_default_cap(native_server):
-    """5FW1TZ38: the 420 s fallback cut CR-07 (15-min deadline) and TASK-08 (no deadline) off at ~7 minutes."""
+def test_budget_is_the_10_minute_limit_or_the_deadline_whichever_comes_first(native_server):
+    """User decision 2026-11-11: every item gets at most 10 minutes (was: until the deadline, no cap)."""
     server = _deadline_server(native_server, 1000)
     server.start_work("TASK-01")
     claim = server.claim_task("TASK-01", "worker-01")
-    budget = claim["taskEnvelope"]["time_budget_seconds"]
-    assert 1000 - 90 - 10 <= budget <= 1000 - 90 + 5
+    assert claim["taskEnvelope"]["time_budget_seconds"] == 600
+    assert "10 min" in claim["taskEnvelope"]["time_limit_rule"]
     assert "finish_by_epoch" not in claim["taskEnvelope"]
+
+
+def test_a_closer_deadline_keeps_the_deadline_budget(native_server):
+    server = _deadline_server(native_server, 500)
+    server.start_work("TASK-01")
+    env = server.claim_task("TASK-01", "worker-01")["taskEnvelope"]
+    assert 500 - 90 - 10 <= env["time_budget_seconds"] <= 500 - 90 + 5
+    assert "time_limit_rule" not in env
 
 
 def test_root_estimate_only_shortens_the_budget(native_server):
