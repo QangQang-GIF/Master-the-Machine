@@ -572,7 +572,7 @@ class NativeTaskCoordinator:
             raise NativeCoordinationError(f"git {args[0]} failed: {res.stderr.strip()[:300]}")
         return res.stdout.strip()
 
-    def claim_task(self, key: str, worker_id: str, estimated_seconds: int = 420) -> dict[str, Any]:
+    def claim_task(self, key: str, worker_id: str, estimated_seconds: int | None = None) -> dict[str, Any]:
         key = self._key(key)
         if not isinstance(worker_id, str) or not re.fullmatch(r"[A-Za-z0-9_.:/-]{1,160}", worker_id):
             raise NativeCoordinationError("Invalid worker ID")
@@ -644,8 +644,13 @@ class NativeTaskCoordinator:
             slack = eligible.get("slackSeconds")
             if slack is None:
                 slack = min(remaining, float(deadline) - now if deadline is not None else remaining) if (now is not None and remaining is not None) else (remaining or 2400)
-            # The budget ends finish_margin before the deadline/match end (record + integrate + submit need it).
-            budget = min(max(10, int(estimated_seconds)), max(60, int(slack - self.finish_margin)))
+            # Restored to the pre-2026-11-10 rule: the worker may use the time up to its deadline / the match end
+            # minus the integration reserve. There is no default cap: the 420 s fallback that 2e86a5c made apply to
+            # every dispatch_tasks call cut CR-07/TASK-07/TASK-08 off after ~7 minutes (39PSWT5C, 5FW1TZ38).
+            # An explicit estimate from the Root can only shorten it.
+            budget = max(60, int(slack - self.reserve))
+            if estimated_seconds:
+                budget = min(budget, max(10, int(estimated_seconds)))
             worker_model = os.environ.get("MTM_WORKER_MODEL", "gpt-6.1-sol" if os.environ.get("MTM_ENV") == "production" else "gpt-6-luna")
             worker_effort = os.environ.get("MTM_WORKER_EFFORT", "medium" if os.environ.get("MTM_ENV") == "production" else "low")
             envelope = {"task_id": key, "task_type": task_type, "title": eligible.get("title", key),
@@ -658,10 +663,6 @@ class NativeTaskCoordinator:
                                             *([f"mtm-{task_type.lower()}-worker"] if task_type in ("BUG", "CR", "TASK", "PI") else []),
                                             "mtm-verification", "mtm-evidence"],
                         "time_budget_seconds": budget,
-                        "finish_by_epoch": round(time.time() + budget),
-                        "finish_rule": ("Stop by finish_by_epoch (compare with python -c \"import time;print(int(time.time()))\"): "
-                                        "commit what works, set submit.json status PARTIAL for anything unverified, write "
-                                        "worker_result.json. At the item deadline the helper flushes your last commit."),
                         "model": worker_model, "reasoning_effort": worker_effort, "backend": "codex",
                         "evidence_required": details.get("evidence_required", eligible.get("evidence_required", [])),
                         "mvs": self._mvs_list(details.get("minimumVerificationScenarios", details.get("mvs"))),
