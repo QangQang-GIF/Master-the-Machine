@@ -83,3 +83,34 @@ def test_mcp_tool_writes_file_inside_allowed_folder(tmp_path):
     assert Path(default["path"]).is_relative_to(tmp_path / "team-sdlc-pack" / "state" / "M1" / "logs")
     with pytest.raises(ValueError):
         server.collect_logs("x", "", "/etc/passwd")
+
+
+def _bank_log(n=4752):
+    """39PSWT5C PI-02 shape: thousands of entries over two months, 20 newest per search."""
+    import datetime as dt
+    start = dt.datetime(2025, 9, 20, 0, 0, 0)
+    out = []
+    for i in range(n):
+        t = start + dt.timedelta(seconds=i * 1237)          # ~68 days
+        out.append({"ts": t.strftime("%Y-%m-%dT%H:%M:%S.") + f"{i % 1000:03d}Z", "service": "rule-engine",
+                    "message": "rule.applied", "context": {"seq": 5_000_000 + i}})
+    return out
+
+
+def test_thousands_of_entries_across_months_complete_without_impossible_prefixes():
+    search, calls = fake_search(_bank_log())
+    out = collect_all(search, "rule.applied", "rule-engine")
+    assert out["complete"] and out["unique"] == out["total"] == 4752
+    assert out["calls"] < 1000          # the newest page prunes children it already covers
+    import re
+    for q, _ in calls[1:]:
+        prefix = q.split()[-1]
+        assert re.fullmatch(r"\d{4}(-([01](\d(-([0-3](\d(T([0-2](\d(:([0-5](\d(:([0-5](\d(\.\d*Z?|Z)?)?)?)?)?)?)?)?)?)?)?)?)?)?)?)?", prefix), prefix
+        if len(prefix) >= 7:
+            assert 1 <= int(prefix[5:7]) <= 12, prefix
+
+
+def test_incomplete_result_carries_advice():
+    search, _ = fake_search(_bank_log(300))
+    out = collect_all(search, "rule.applied", "rule-engine", max_calls=3)
+    assert out["complete"] is False and "do not compute" in out["advice"]

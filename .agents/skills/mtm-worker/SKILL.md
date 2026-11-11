@@ -21,6 +21,7 @@ Follow `mtm-init` boundaries, TaskEnvelope constraints, and returned submit temp
 - Python runs with UTF-8 (`PYTHONUTF8=1`); read/write files with `encoding="utf-8"`.
 - **Time**: stop by `finish_by_epoch` (check `python -c "import time;print(int(time.time()))"` between steps). Commit early and often (`answers/<key>/` with each step): at the item deadline the helper submits your LAST COMMIT, and for a deadline item the Game Master refuses anything later. Out of time: set unverified scenarios `NOT_RUN`, `status: "PARTIAL"`, commit, write the result.
 - `worker_result.json` goes to `metadata.worker_result_path` (`<match_root>/worker_result.json`), written LAST and NEVER committed (it is git-ignored; never `git add -f` it). Paths in `changed_files`/`evidence_paths` are relative to `match_root` with forward slashes (`answers/<key>/evidence/x.log`, `src/...`), never absolute and never prefixed with the repository folder; `elapsed_seconds` is a number.
+- **Submit schema (a schema-invalid submit.json scores 0 for the WHOLE item)**: fill every field `challenge/<key>-submit.schema.json` requires with real values (never `{}`, `[]`, `""` or a placeholder where the schema needs content). Before finishing run the command in `metadata.submit_schema_check` and fix every error it lists (`"valid": true` or no schema = done). `input_warnings` in your envelope only name inputs that were skipped or absent: work from the brief.
 - Before writing `worker_result.json`: every `test_results` row is a real command with `passed: true` and integer `exit_code: 0`; evidence files exist, are nonempty and under `answers/<key>/evidence/`; everything is committed. Diagnostic logs go under `answers/<key>/evidence/` only, never elsewhere in the repository. The Root reads the file itself; your final message is one line.
 
 ## Core Sandbox & Anti-Over-Engineering Rules
@@ -36,7 +37,7 @@ Follow `mtm-init` boundaries, TaskEnvelope constraints, and returned submit temp
      python3 "<metadata.project_runtime_path>" --match-root "<match_root>" --match-id "<metadata.match_id>" --worker-id "<worker_id>" session -- <command>
      ```
      Inside your capture script, always read `const baseUrl = \`http://127.0.0.1:\${process.env.PORT || 3000}\`;`.
-     If the project has no `dev` script, pass the real one: `session --server-script <script from package.json> --url <its local URL> -- <command>` (read `package.json` scripts first).
+     Without a `dev` script `session` falls back to `start`/`serve`/`preview`. When `env-require/README.md` gives the serve command (e.g. a sync server with its own data folders), pass it as is: `session --server-cmd "<that command>" [--server-cwd <folder>] [--server-env KEY=VALUE ...] --url http://127.0.0.1:$PORT/<path> -- <check command>`; data folders go inside your worktree. Write `yarn`/`pnpm` as the README does: bundled Yarn, corepack and `node_modules/.bin` tools are resolved for you (never replace them with absolute paths or edit configs). Exit 2 with a script list means the command was wrong; fix it instead of marking the scenario NOT_RUN.
 
 2. **Pre-Fetched Official Fixtures & MVS Tests (Zero Fixture Missing)**:
    - Root automatically pre-fetches official QA fixtures (`answers/<key>/evidence/<key.lower()>-test-data.json` + `.source.json`) and company KB/Logs (`metadata.company_context`) during `start_work` / `claim_task`.
