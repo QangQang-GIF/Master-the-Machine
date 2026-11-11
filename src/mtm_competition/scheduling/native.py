@@ -590,7 +590,8 @@ class NativeTaskCoordinator:
             if not target.resolve().is_relative_to(self.checkout_root.parent) or target.exists() or target.is_symlink():
                 raise NativeCoordinationError("Worktree path escaped or already exists; reconcile before retry")
             details = eligible.get("start_details", {})
-            self._materialize_start_files(key, details, target / self.repository_folder, validate_only=True)
+            input_warnings = self._materialize_start_files(key, details, target / self.repository_folder,
+                                                           validate_only=True)
             self.workers_root.mkdir(parents=True, exist_ok=True)
             base = self._git("rev-parse", "HEAD")
             if self._git("cat-file", "-t", f"{base}:{self.repository_folder}") != "tree":
@@ -604,7 +605,7 @@ class NativeTaskCoordinator:
                 worker_match = target / self.repository_folder
                 if not worker_match.resolve().is_relative_to(target) or not worker_match.is_dir():
                     raise NativeCoordinationError("Assigned repository folder missing in worker worktree")
-                self._materialize_start_files(key, details, worker_match)
+                input_warnings = self._materialize_start_files(key, details, worker_match)
                 self._provision_worker_sandbox(worker_match)
             except Exception as exc:
                 # Preserve a worktree created before a filesystem/materialization failure.
@@ -639,9 +640,13 @@ class NativeTaskCoordinator:
                         "evidence_required": details.get("evidence_required", eligible.get("evidence_required", [])),
                         "mvs": self._mvs_list(details.get("minimumVerificationScenarios", details.get("mvs"))),
                         "submit_template": details.get("submitTemplate"), "allowed_paths": [str(worker_match)],
+                        **({"input_warnings": (input_warnings + list(details.get("announcedInputWarnings") or []))[:20]}
+                           if input_warnings or details.get("announcedInputWarnings") else {}),
                         "worker_id": worker_id,
                         "metadata": {"match_root": str(worker_match), "start_details": details,
                                      "project_runtime_path": str(Path(__file__).resolve().parents[3] / "runner" / "project_runtime.py"),
+                                     "submit_schema_check": (f'python "{Path(__file__).resolve().parents[1] / "integration" / "submit_schema.py"}" '
+                                                             f'"{worker_match}" {key}'),
                                      "match_id": self.match_id, "worker_id": worker_id,
                                      "submit_template": details.get("submitTemplate"),
                                      "worker_result_path": str(worker_match / "worker_result.json"),
@@ -661,46 +666,75 @@ class NativeTaskCoordinator:
             return value
         return None
 
-    def _materialize_start_files(self, key: str, details: dict, worker_match: Path, validate_only: bool = False) -> None:
-        """Copy only the current announced item's inputs, never another item's suites."""
-        def destination(relative: str) -> Path:
-            if not isinstance(relative, str):
-                raise NativeCoordinationError("Delivered file path must be a string")
+    def _materialize_start_files(self, key: str, details: dict, worker_match: Path,
+                                 validate_only: bool = False) -> list[dict]:
+        """Copy the item's inputs into the worker match root. Fail-open: the item is already started at the
+        Game Master, so an odd input (another item's prefix, binary, protected or escaping path) is skipped
+        with a warning instead of blocking the claim (39PSWT5C CR-08). Returns the warnings."""
+        warnings: list[dict] = []
+
+        def destination(relative: str) -> Path | None:
+            if not isinstance(relative, str) or not relative:
+                warnings.append({"path": str(relative)[:200], "reason": "path is not a string"})
+                return None
             path = PurePosixPath(relative)
             if path.is_absolute() or ".." in path.parts or "\\" in relative or re.match(r"^[A-Za-z]:", relative) or not path.parts:
-                raise NativeCoordinationError("Delivered file path escapes worker match root")
+                warnings.append({"path": relative, "reason": "path escapes the worker match root; skipped"})
+                return None
             # Inputs may contain seed/check scripts, but never control/secret/immutable files.
             if any(part.startswith('.') or part == 'exam-info.json' for part in path.parts):
-                raise NativeCoordinationError("Delivered file targets a protected path")
+                warnings.append({"path": relative, "reason": "protected path; skipped"})
+                return None
             target = worker_match / relative
             if not target.resolve().is_relative_to(worker_match.resolve()):
-                raise NativeCoordinationError("Delivered file follows an escaping symlink")
+                warnings.append({"path": relative, "reason": "follows an escaping symlink; skipped"})
+                return None
             return target
 
         files = details.get("files", {})
         if files is not None and not isinstance(files, dict):
-            raise NativeCoordinationError("Start Work files must be a mapping")
+            warnings.append({"path": "<files>", "reason": "Start Work files were not a mapping; ignored"})
+            files = {}
         for relative, content in (files or {}).items():
             target = destination(relative)
+            if target is None:
+                continue
             if not isinstance(content, str) or len(content.encode('utf-8')) > 10_000_000:
-                raise NativeCoordinationError("Delivered file content must be bounded UTF-8 text")
+                # Not inline text: copy the root's copy (written by start_work) if there is one.
+                source = self.match_root / relative
+                if not validate_only and source.is_file() and not source.is_symlink() \
+                        and source.resolve().is_relative_to(self.match_root.resolve()):
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copyfile(source, target)
+                elif not source.is_file():
+                    warnings.append({"path": relative, "reason": "content is not text and no root copy exists"})
+                continue
             if not validate_only:
                 target.parent.mkdir(parents=True, exist_ok=True)
                 target.write_text(content, encoding='utf-8')
         if validate_only:
-            return
+            return warnings
+        for relative in details.get("binaryFiles") or []:
+            target = destination(relative)
+            source = self.match_root / str(relative)
+            if target is None or not source.is_file() or source.is_symlink() \
+                    or not source.resolve().is_relative_to(self.match_root.resolve()):
+                continue
+            if not target.exists():
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(source, target)
         source_challenge = self.match_root / "challenge"
         if source_challenge.is_dir() and source_challenge.resolve().is_relative_to(self.match_root):
             for source in [source_challenge / f"{key}.md", *source_challenge.glob(key + "-*")]:
                 if not source.is_file() or source.is_symlink() or source.stat().st_size > 10_000_000:
                     continue
                 target = destination("challenge/" + source.name)
-                if not target.exists():
+                if target is not None and not target.exists():
                     target.parent.mkdir(parents=True, exist_ok=True)
                     shutil.copyfile(source, target)
         # Synthesize challenge/{key}.md if missing so worker always has challenge specification
         challenge_md = destination(f"challenge/{key}.md")
-        if not challenge_md.exists():
+        if challenge_md is not None and not challenge_md.exists():
             title = details.get("title") or details.get("backlogTitle") or key
             desc = details.get("descriptionMd") or details.get("description") or f"# {key}: {title}\n\nTask details from Game Master."
             mvs = details.get("minimumVerificationScenarios") or ""
@@ -726,16 +760,17 @@ class NativeTaskCoordinator:
                 if not ev_file.is_file() or ev_file.is_symlink() or ev_file.stat().st_size > 10_000_000:
                     continue
                 target_ev = destination(f"answers/{key}/evidence/{ev_file.name}")
-                if not target_ev.exists():
+                if target_ev is not None and not target_ev.exists():
                     target_ev.parent.mkdir(parents=True, exist_ok=True)
                     shutil.copyfile(ev_file, target_ev)
         # Auto-stage official challenge/<KEY>-mvs.test.ts to src/tests/<key.lower()>-mvs.test.ts when src/ exists
         mvs_challenge_test = worker_match / "challenge" / f"{key}-mvs.test.ts"
         if mvs_challenge_test.is_file() and (worker_match / "src").is_dir():
             mvs_dst = destination(f"src/tests/{key.lower()}-mvs.test.ts")
-            if not mvs_dst.exists():
+            if mvs_dst is not None and not mvs_dst.exists():
                 mvs_dst.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copyfile(mvs_challenge_test, mvs_dst)
+        return warnings
 
     @staticmethod
     def _link_dir(target: Path, link: Path) -> bool:
@@ -839,6 +874,17 @@ class NativeTaskCoordinator:
                 pass
             if not dst_nm.exists():
                 self._link_dir(src_nm, dst_nm)
+
+    def slack_seconds(self, key: str) -> float | None:
+        """Seconds until the item deadline or the match end, whichever comes first (None if the clock is unknown)."""
+        with self._db() as db:
+            row = self._task(db, self._key(key))
+            task = json.loads(row["data"])
+            _status, now, remaining = self._clock(db)
+            if now is None or remaining is None:
+                return None
+            deadline = task.get("deadline_epoch")
+            return min(remaining, float(deadline) - now if deadline is not None else remaining)
 
     def task_details(self, key: str) -> dict[str, Any]:
         with self._db() as db:

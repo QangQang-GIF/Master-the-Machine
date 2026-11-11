@@ -116,14 +116,59 @@ def test_missing_file_remains_strict_by_default(tmp_path: Path) -> None:
 
 
 @pytest.mark.parametrize("path", [
-    "challenge/TASK-8.md", "../challenge/TASK-7.md", "/challenge/TASK-7.md",
-    "answers/TASK-7/answer.md", "challenge/TASK-7/secret.md", "challenge/.env",
-    "challenge/TASK-7-binary.exe", "challenge/TASK-7-.pem",
+    "../challenge/TASK-7.md", "/challenge/TASK-7.md",
+    "answers/TASK-7/answer.md", "challenge/.env",
+    "challenge/TASK-7-binary.exe", "challenge/TASK-7-.pem", "challenge/.git/config", "exam-info.json",
 ])
-def test_rejects_unannounced_or_out_of_scope_paths(tmp_path: Path, path: str) -> None:
+def test_rejects_unsafe_paths(tmp_path: Path, path: str) -> None:
     checkout, match, _seed = repository(tmp_path)
     with pytest.raises(AnnouncedInputError):
         resolve_announced_files(checkout, match, "main", "TASK-7", [path], {})
+
+
+def test_cross_item_input_is_accepted(tmp_path: Path) -> None:
+    """39PSWT5C CR-08: the GM announced challenge/CR-05-seed.js for CR-08; the item must still start."""
+    checkout, match, _seed = repository(tmp_path)
+    result = resolve_announced_files(checkout, match, "main", "TASK-7",
+                                     ["challenge/TASK-7.md", "challenge/TASK-8.md"], {})
+    assert result["challenge/TASK-8.md"] == "another task, must not be returned\n"
+
+
+def test_fail_open_reports_problems_instead_of_raising(tmp_path: Path) -> None:
+    checkout, match, seed = repository(tmp_path)
+    (seed / "assigned-folder" / "challenge" / "data").mkdir()
+    (seed / "assigned-folder" / "challenge" / "data" / "TASK-7.parquet").write_bytes(b"PAR1\x00\xff\xfe" * 10)
+    (seed / "assigned-folder" / "challenge" / "TASK-7-notes.weird").write_text("odd extension\n")
+    git(seed, "add", "assigned-folder")
+    git(seed, "commit", "-m", "odd inputs")
+    git(seed, "push", "origin", "main")
+    problems: list[dict] = []
+    missing: list[str] = []
+    binary: dict[str, bytes] = {}
+    result = resolve_announced_files(
+        checkout, match, "main", "TASK-7",
+        ["challenge/TASK-7.md", "challenge/TASK-7-notes.weird", "challenge/data/TASK-7.parquet",
+         "challenge/.env", "../x.md", "challenge/TASK-7-absent.md"],
+        {"challenge/CR-05-seed.js": "export default []\n", "challenge/TASK-7-blob.bin": 12},
+        missing_paths=missing, problems=problems, binary_files=binary,
+    )
+    assert result["challenge/TASK-7.md"] == "public task document\n"
+    assert result["challenge/TASK-7-notes.weird"] == "odd extension\n"
+    assert result["challenge/CR-05-seed.js"] == "export default []\n"      # unannounced delivery: GM wins
+    assert binary["challenge/data/TASK-7.parquet"].startswith(b"PAR1")
+    assert missing == ["challenge/TASK-7-absent.md", "challenge/TASK-7-blob.bin"]
+    reasons = {p["path"] for p in problems}
+    assert {"challenge/.env", "../x.md", "challenge/TASK-7-blob.bin"} <= reasons
+
+
+def test_fail_open_survives_unreachable_remote(tmp_path: Path) -> None:
+    checkout, match, _seed = repository(tmp_path)
+    git(checkout, "remote", "set-url", "origin", str(tmp_path / "gone.git"))
+    problems: list[dict] = []
+    result = resolve_announced_files(checkout, match, "main", "TASK-7", ["challenge/TASK-7.md"],
+                                     {"challenge/TASK-7-x.md": "delivered"}, problems=problems)
+    assert result == {"challenge/TASK-7-x.md": "delivered"}
+    assert problems and problems[0]["path"] == "challenge/TASK-7.md"
 
 
 def test_rejects_symlink_blob(tmp_path: Path) -> None:
@@ -138,7 +183,7 @@ def test_rejects_symlink_blob(tmp_path: Path) -> None:
         resolve_announced_files(checkout, match, "main", "TASK-7", ["challenge/TASK-7.md"], {})
 
 
-def test_rejects_delivered_unannounced_file(tmp_path: Path) -> None:
+def test_strict_mode_rejects_delivered_unannounced_file(tmp_path: Path) -> None:
     checkout, match, _seed = repository(tmp_path)
     with pytest.raises(AnnouncedInputError, match="unannounced"):
         resolve_announced_files(

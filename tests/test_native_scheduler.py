@@ -217,13 +217,18 @@ def test_start_inputs_materialized_in_new_worktree(coordinator):
 
 
 @pytest.mark.parametrize('path', ['../escape', '/tmp/escape', '.env', '.git/config', 'exam-info.json'])
-def test_unsafe_start_inputs_rejected_before_worktree_creation(coordinator, path):
+def test_unsafe_start_inputs_are_skipped_not_fatal(coordinator, path, tmp_path):
+    """39PSWT5C CR-08: one odd input must not block a started item; it is skipped and reported."""
     c = coordinator
     projection(c, item())
-    start(c, 'BUG-01', {'files': {path: 'forbidden'}})
-    with pytest.raises(NativeCoordinationError):
-        c.claim_task('BUG-01', 'worker')
-    assert not (c.workers_root / 'BUG-01').exists()
+    start(c, 'BUG-01', {'files': {path: 'forbidden', 'challenge/CR-05-seed.js': 'export default 1'}})
+    claim = c.claim_task('BUG-01', 'worker')
+    root = Path(claim['matchRoot'])
+    assert (root / 'challenge/CR-05-seed.js').read_text() == 'export default 1'
+    assert any(w['path'] == path for w in claim['taskEnvelope']['input_warnings'])
+    if not path.startswith(('..', '/')):
+        assert not (root / path).exists() or (root / path).read_text() != 'forbidden'
+    assert not (tmp_path / 'escape').exists() and not Path('/tmp/escape').exists()
 
 
 def test_reconcile_retains_old_worktree_and_requires_stopped_worker(coordinator):
