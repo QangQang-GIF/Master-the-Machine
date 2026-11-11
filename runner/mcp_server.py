@@ -1415,7 +1415,7 @@ class MCPHelperServer:
             if not key:
                 continue
             wid = str(it.get("workerId") or re.sub(r"[^a-z0-9]", "", key.lower()))
-            est = int(it.get("estimatedSeconds") or 420)
+            est = int(it["estimatedSeconds"]) if it.get("estimatedSeconds") else None
             if key not in selected:
                 skipped.append({"backlogItemKey": key, "reason": "not selected by plan_tasks now (capacity/deadline)"})
                 continue
@@ -2311,7 +2311,7 @@ class MCPHelperServer:
         self.refresh_match()
         return self._native_coordinator().plan_tasks()
 
-    def claim_task(self, backlog_item_key: str, worker_id: str, estimated_seconds: int = 420) -> Dict[str, Any]:
+    def claim_task(self, backlog_item_key: str, worker_id: str, estimated_seconds: Optional[int] = None) -> Dict[str, Any]:
         try:
             res = self._native_coordinator().claim_task(backlog_item_key, worker_id, estimated_seconds)
         except Exception as e:
@@ -2542,11 +2542,11 @@ def get_tool_definitions() -> List[Dict[str, Any]]:
     native_tools = [
         ("plan_tasks", "Refresh server board and return eligible native tasks, reserved urgent capacity, and ready integrations.", {}, []),
         ("claim_task", "Reserve an eligible task after Start Work; return isolated worktree and sanitized TaskEnvelope for native spawn.",
-         {"backlogItemKey": {"type": "string"}, "workerId": {"type": "string"}, "estimatedSeconds": {"type": "integer", "minimum": 10, "default": 420}}, ["backlogItemKey", "workerId"]),
+         {"backlogItemKey": {"type": "string"}, "workerId": {"type": "string"}, "estimatedSeconds": {"type": "integer", "minimum": 10, "description": "Optional; omit it. Only shortens the worker time (default: until the deadline or match end)"}}, ["backlogItemKey", "workerId"]),
         ("record_worker_result", "Validate a finished worker's result and artifacts before integration. Omit workerResult: the helper reads the worker's worker_result.json itself. Returns phase and a short verdict.",
          {"backlogItemKey": {"type": "string"}, "workerResult": {"type": "object", "description": "Optional; only when no worker_result.json exists"}}, ["backlogItemKey"]),
         ("dispatch_tasks", "Start Work + claim for several items that plan_tasks selected, in one call (Start Work requests run in parallel). Returns one compact claim summary per item to spawn a worker from.",
-         {"items": {"type": "array", "items": {"type": "object", "properties": {"backlogItemKey": {"type": "string"}, "workerId": {"type": "string"}, "estimatedSeconds": {"type": "integer", "minimum": 10, "default": 420}}, "required": ["backlogItemKey"]}}}, ["items"]),
+         {"items": {"type": "array", "items": {"type": "object", "properties": {"backlogItemKey": {"type": "string"}, "workerId": {"type": "string"}, "estimatedSeconds": {"type": "integer", "minimum": 10, "description": "Optional; omit it. Only shortens the worker time (default: until the deadline or match end)"}}, "required": ["backlogItemKey"]}}}, ["items"]),
         ("integrate_and_submit", "The whole submit path in one call: integration lock, cherry-pick the worker commits onto the root checkout (skips commits already there), then submit_work from answers/<key>/submit.json. Returns ACCEPTED+receiptId, or CONFLICT with files. An unknown-outcome submit is resent with the same journaled body. submit.json is checked against challenge/<key>-submit.schema.json first: SUBMIT_SCHEMA_INVALID lists the fields to fix (near the deadline they are filled automatically).",
          {"backlogItemKey": {"type": "string"},
           "schemaAutofill": {"type": "boolean", "default": False, "description": "Fill the minimum to satisfy the submit schema instead of failing (use when there is no time to fix the fields with real values)"}},
@@ -2704,7 +2704,7 @@ _BULKY_FIELDS = ("descriptionMd", "description", "start_details", "startInstruct
                  "company_context", "submitTemplate", "minimumVerificationScenarios", "mvs", "onStartFiles",
                  "releaseFiles", "prior_attempts")
 _ENVELOPE_SUMMARY_FIELDS = ("task_id", "task_type", "title", "worker_id", "repository_path", "match_root", "base_revision",
-                            "points", "deadline_epoch", "time_budget_seconds", "finish_by_epoch", "finish_rule", "model", "reasoning_effort", "backend",
+                            "points", "deadline_epoch", "time_budget_seconds", "model", "reasoning_effort", "backend",
                             "lane", "agent_profile", "selected_skills", "allowed_paths",
                             "evidence_required", "attempt_id", "result_contract")
 
@@ -2970,7 +2970,7 @@ def run_mcp_stdio_server():
                 elif tool_name == "plan_tasks":
                     val = server.plan_tasks()
                 elif tool_name == "claim_task":
-                    val = server.claim_task(tool_args["backlogItemKey"], tool_args["workerId"], tool_args.get("estimatedSeconds", 420))
+                    val = server.claim_task(tool_args["backlogItemKey"], tool_args["workerId"], tool_args.get("estimatedSeconds"))
                 elif tool_name == "record_worker_result":
                     val = server.record_worker_result(tool_args["backlogItemKey"], tool_args.get("workerResult"))
                 elif tool_name == "integration_gate":

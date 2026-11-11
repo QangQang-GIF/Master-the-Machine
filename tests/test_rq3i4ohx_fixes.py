@@ -181,12 +181,20 @@ def _deadline_server(native_server, seconds_left):
     return server
 
 
-def test_budget_ends_well_before_the_deadline(native_server):
+def test_budget_runs_to_the_deadline_without_a_default_cap(native_server):
+    """5FW1TZ38: the 420 s fallback cut CR-07 (15-min deadline) and TASK-08 (no deadline) off at ~7 minutes."""
     server = _deadline_server(native_server, 1000)
     server.start_work("TASK-01")
-    claim = server.claim_task("TASK-01", "worker-01", 900)
+    claim = server.claim_task("TASK-01", "worker-01")
     budget = claim["taskEnvelope"]["time_budget_seconds"]
-    assert budget <= 1000 - 300 + 5 and claim["taskEnvelope"]["finish_by_epoch"] > time.time()
+    assert 1000 - 90 - 10 <= budget <= 1000 - 90 + 5
+    assert "finish_by_epoch" not in claim["taskEnvelope"]
+
+
+def test_root_estimate_only_shortens_the_budget(native_server):
+    server = _deadline_server(native_server, 1000)
+    server.start_work("TASK-01")
+    assert server.claim_task("TASK-01", "worker-01", 300)["taskEnvelope"]["time_budget_seconds"] == 300
 
 
 def test_deadline_flush_commits_answers_and_reports_it(native_server, monkeypatch):
