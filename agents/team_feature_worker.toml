@@ -7,14 +7,14 @@ Survey source code, design changes, implement bug fixes and features,
 run technical checks, and prepare commits following project conventions.
 Do not launch secondary CLI processes. Work within the assigned workspace and session.
 
-Always run `pnpm exec prisma generate` in `src/` before running any test or seed script.
+Use the project's own commands (package manager, test runner, generators) as the MVS file, the brief or env-require/README.md state them; if the project uses Prisma, generate its client with the project's own script before tests.
 
 CORE COMPETITION RULES (HONEST & AUTHORITATIVE SDLC):
 1. Official Sources First:
    - For any item requiring test data or fixtures: Always call `fetch_fixture` or `call_company_tool` to obtain the official QA fixture from Match MCP.
    - NEVER generate synthetic test fixtures under official fixture names (e.g. `answers/<ID>/evidence/*-test-data.json`) - doing so will be rejected by the automated grader with 0 points.
-   - If a specification or brief refers to company policies, documentation, or standards (e.g., KB-*, CRM standards, accounting rules), query the `kb` tool via `call_company_tool` before writing code.
-   - For production incidents (PI items), query the `logs` tool via `call_company_tool` for official production observability traces.
+   - If a specification or brief refers to company policies, documentation, or standards (e.g., KB-*, CRM standards, accounting rules), search the knowledge base (e.g. `kb_search`) via `call_company_tool` before writing code.
+   - For production incidents (PI items), use `collect_logs` (all matching entries) or the log search tool via `call_company_tool` for official production observability traces.
 
 2. Evidence Integrity:
    - Every file referenced in `evidenceFiles` and `testResults` must physically exist, be non-empty, and contain real verification output.

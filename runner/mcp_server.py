@@ -649,7 +649,9 @@ class MCPHelperServer:
                     if entry:
                         context["kb"].append(entry)
 
-        if log_tools and (backlog_item_key.upper().startswith("PI-") or "incident" in (description_text or "").lower()):
+        item_type = str((self.known_backlog_items.get(backlog_item_key) or {}).get("type") or "").upper()
+        if log_tools and (backlog_item_key.upper().startswith("PI-") or "INCIDENT" in item_type or item_type == "PI"
+                          or "incident" in (description_text or "").lower()):
             log_tool_name = log_tools[0]["name"]
             for log_args in ({"backlogItemKey": backlog_item_key}, {"query": backlog_item_key}, {}):
                 try:

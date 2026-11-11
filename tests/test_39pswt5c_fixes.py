@@ -261,3 +261,32 @@ def test_prefix_items_schema_on_a_draft7_only_jsonschema(monkeypatch):
             monkeypatch.setattr(jsonschema, "Draft201909Validator", None)
         assert submit_schema.schema_errors(good, schema) == []
         assert submit_schema.schema_errors(extra, schema)
+
+
+# Unknown item keys and types -------------------------------------------------------------------------------
+def test_board_with_unknown_prefixes_and_types_is_workable(native_server):
+    """A key outside TASK/CR/BUG/PI used to raise inside register_projection and hide the WHOLE board."""
+    server = native_server
+    server.adapter.items = [
+        {"key": "SEC-01", "type": "SECURITY", "status": "OPEN", "points": 50},
+        {"key": "INC-02", "type": "Product Incident", "status": "OPEN", "points": 80},
+        {"key": "../evil", "type": "TASK", "status": "OPEN", "points": 1},
+        {"key": "TASK-01", "type": "TASK", "status": "OPEN", "points": 10},
+    ]
+    server.refresh_match()
+    keys = {t["key"] for t in server.native.plan_tasks()["selected"]}
+    assert {"SEC-01", "INC-02"} <= keys and "../evil" not in keys
+    assert server.native.task_details("TASK-01")["phase"] == "QUEUED"        # registered, waits for a slot
+    assert server.native.task_details("INC-02")["data"]["type"] == "PI"
+    server.start_work("SEC-01")
+    claim = server.claim_task("SEC-01", "w-sec", 120)
+    skills = claim["taskEnvelope"]["selected_skills"]
+    assert "mtm-worker" in skills and "mtm-security-worker" not in skills
+    assert Path(claim["matchRoot"]).is_dir()
+
+
+def test_known_type_keeps_its_specialist_skill(native_server):
+    server = native_server
+    server.start_work("TASK-01")
+    skills = server.claim_task("TASK-01", "w1", 120)["taskEnvelope"]["selected_skills"]
+    assert skills == ["mtm-init", "mtm-worker", "mtm-task-worker", "mtm-verification", "mtm-evidence"]

@@ -3,33 +3,14 @@ name: mtm-bug-worker
 description: Reproduce, minimally fix, and verify an announced MTM BUG item inside the ProjectRuntime sandbox.
 ---
 
-# BUG (Defect Fix — Sandbox Fast Path)
+# BUG (reproduce, minimal fix, MVS evidence)
 
 Follow `mtm-init` and `mtm-worker`. Root owns Start Work, integration, push, and Submit.
 
-1. **Mandatory Sandbox Commands**:
-   - Run all CLI/test/seed commands via:
-     `python3 "<metadata.project_runtime_path>" --match-root "<match_root>" --match-id "<metadata.match_id>" --worker-id "<worker_id>" run -- <cmd>`
-   - Run all browser/UI checks via:
-     `python3 "<metadata.project_runtime_path>" --match-root "<match_root>" --match-id "<metadata.match_id>" --worker-id "<worker_id>" session -- <cmd>`
-   - NEVER manually spawn `pnpm dev`, `pnpm build`, or `pnpm start`.
-
-2. **Fast Paths by BUG Archetype**:
-   - **`BUG-01` (Responsive Shell / Layout)**:
-     - Fix layout CSS in `src/components/layout/`.
-     - Inside a single `project_runtime.py ... session` wrapper script, run `node ../challenge/BUG-01-layout-check.mjs http://127.0.0.1:$PORT development ../answers/BUG-01/evidence/layout-report-dev.json`, `node ../challenge/BUG-01-layout-check.mjs http://127.0.0.1:$PORT production ../answers/BUG-01/evidence/layout-report-prod.json`, and capture `desktop-1440x900.png` & `mobile-390x844.png`! (Do NOT run `pnpm build` — `BUG-01-layout-check.mjs` only tags the mode argument in JSON).
-   - **`BUG-02` (Client Currency Propagation)**:
-     - Verify `answers/BUG-02/evidence/bug-02-test-data.json` exists (pre-fetched by Root; NEVER overwrite with synthetic data).
-     - Copy `challenge/BUG-02-seed.ts` -> `src/prisma/seed-bug02.ts` and `challenge/BUG-02-report.ts` -> `src/prisma/report-bug02.ts`.
-     - Fix currency propagation in `src/` and add unit tests.
-     - Run `node ../challenge/BUG-02-run-checks.mjs` via `project_runtime.py ... run` to write `answers/BUG-02/evidence/test.log`.
-     - Run `pnpm tsx prisma/seed-bug02.ts ../answers/BUG-02/evidence/bug-02-test-data.json` via `project_runtime.py ... run`, then execute a small `pnpm tsx` script using `~/server/db` and `postInvoiceIssued` / `postPaymentReceived` / `refreshInvoiceStatus` to create & issue the VND invoice (lines `25000000`, `18500000`, `6500000` = `50000000`), record the VND payment (`20000000` -> `PARTIAL`), and create & issue the USD invoice (`150000`, `85000` = `235000` -> `SENT`).
-     - Run `pnpm tsx prisma/report-bug02.ts ../answers/BUG-02/evidence/bug-02-test-data.json ../answers/BUG-02/evidence/currency-report.txt` via `project_runtime.py ... run`.
-     - Capture `tc-01-vnd-invoice.png`, `tc-02-vnd-partial-paid.png`, `tc-03-usd-invoice.png` in ONE `project_runtime.py ... session` pass. Remove temporary `src/prisma/*-bug02.ts` helper files before committing.
-   - **`BUG-03` (Invoice Status Precedence — Pure Logic)**:
-     - **NO browser, NO web server!**
-     - Ensure `challenge/BUG-03-mvs.test.ts` is copied to `src/tests/bug-03-mvs.test.ts` and committed.
-     - Fix `src/src/lib/invoice-status.ts`, run `pnpm test` and `pnpm typecheck` via `project_runtime.py ... run`, save required logs, fill `submit.json` (`status: "DONE"`), commit, and finish in < 90s.
-   - **`BUG-04` (Kanban Card Reorder Position)**:
-     - Ensure `challenge/BUG-04-mvs.test.ts` is copied to `src/tests/bug-04-mvs.test.ts` and committed!
-     - Fix `src/src/lib/position.ts`, write `mvs-tests.log` (`command: pnpm vitest run tests/bug-04-mvs.test.ts` ... `exit_code: 0`) and `typecheck.log` (`command: pnpm typecheck` ... `exit_code: 0`) via `project_runtime.py ... run`, and capture `tc-02-top-order.png` via `project_runtime.py ... session`.
+1. **Commands**: run every test/check/seed command through `project_runtime.py ... run` and every browser/HTTP capture through `project_runtime.py ... session` (exact syntax in `mtm-worker`). Use the commands the MVS file, the brief or `env-require/README.md` state (their package manager, `node .../vitest.mjs`, check scripts); never assume pnpm/npm/yarn and never start a dev or build server by hand.
+2. **Reproduce first**: run the failing MVS scenario (or a focused test) on the unchanged source; keep that output when the MVS or template asks for before-fix evidence.
+3. **Minimal fix**: change only the code the brief and MVS point to. Keep public handler names, arguments, database schema and migrations; never edit, skip or weaken existing tests. Add a focused regression test next to the changed module.
+4. **MVS run**: copy a provided `challenge/<KEY>-mvs.test.ts` unchanged to the location the MVS states and run it with the MVS command, writing the log under the exact required name (e.g. `answers/<key>/evidence/mvs-tests.log`). Also run the tests next to your change and the type check the brief names.
+5. **Official data**: when the item ships a QA fixture, seed or report script (`challenge/<KEY>-seed.*`, `<KEY>-report.*`, `answers/<key>/evidence/<key>-test-data.json`), run it the way its header or the MVS says, on the official fixture only. Remove temporary copies the brief says not to commit.
+6. **UI scenarios**: only when a required evidence file is a screenshot or HTTP capture: one `session` pass that follows `env-require/README.md`, at the viewport the MVS states.
+7. **Hand-off**: each PASS row cites its required evidence; `status: "DONE"` only when every row is PASS, otherwise `PARTIAL` with honest `NOT_RUN`/`FAIL`. Run `metadata.submit_schema_check`, commit, then write `worker_result.json`.
