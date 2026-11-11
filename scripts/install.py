@@ -249,6 +249,8 @@ MTM_RUN_IDLE_TIMEOUT = "90"
 MTM_GM_SUBMIT_TIMEOUT = "30"
 MTM_GM_START_TIMEOUT = "30"
 MTM_DEADLINE_FLUSH_SECONDS = "150"
+MTM_WORKER_MAX_SECONDS = "600"
+MTM_TIME_LIMIT_GRACE_SECONDS = "300"
 MTM_LANE_BORROW = "0"
 """
     (codex_dir / "config.toml").write_text(codex_toml, encoding="utf-8")

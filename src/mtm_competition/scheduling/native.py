@@ -92,6 +92,13 @@ class NativeTaskCoordinator:
         self.flush_seconds = max(30, int(os.environ.get("MTM_DEADLINE_FLUSH_SECONDS", "150") or 150))
         self.match_end_flush_seconds = max(self.flush_seconds,
                                            int(os.environ.get("MTM_MATCH_END_FLUSH_SECONDS", "240") or 240))
+        # Per-item time limit (user decision 2026-11-11: 10 minutes). When a worker has used it (official match
+        # time, pauses excluded) the helper submits its last commit (time-limit flush) so long items stop holding
+        # a lane. A submit the local gates reject (MVS evidence, submit schema, no submit.json) is not sent: the
+        # item goes back to the same worker with the exact errors and `time_limit_grace_seconds` more; at the end
+        # of the grace it is flushed like a deadline (gates relaxed). 0 disables the limit.
+        self.worker_max_seconds = max(0, int(os.environ.get("MTM_WORKER_MAX_SECONDS", "600") or 0))
+        self.time_limit_grace_seconds = max(60, int(os.environ.get("MTM_TIME_LIMIT_GRACE_SECONDS", "300") or 300))
         self.finish_margin = max(self.reserve, self.flush_seconds + 60,
                                  int(os.environ.get("MTM_FINISH_MARGIN_SECONDS", "0") or 0))
         # Idle deadline/PI slots may take ordinary items, always keeping `lane_keep_free` slots open in each
@@ -292,7 +299,14 @@ class NativeTaskCoordinator:
         pi_active = sum(json.loads(r["data"]).get("type") == "PI" for r in active)
         base_free = max(0, self.max_workers - (len(active) - min(pi_active, self.pi_burst_slots)))
         burst_free = max(0, self.pi_burst_slots - pi_active)
-        lanes = self._lane_free([json.loads(r["data"]) for r in active]) if self.lane_mode else None
+        # A time-limit-flushed item whose submit is pending keeps its lane: a gate rejection gives it back to the
+        # same, still-running worker.
+        def _held(r):
+            lease = json.loads(r["data"]).get("lease", {})
+            return (r["phase"] in ("READY_TO_INTEGRATE", "INTEGRATING") and lease.get("time_limit_flushed_at") is not None
+                    and not lease.get("time_limit_final"))
+        lanes = (self._lane_free([json.loads(r["data"]) for r in active + [r for r in ready if _held(r)]])
+                 if self.lane_mode else None)
         response = {"matchStatus": status,
                     "availableSlots": sum(lanes.values()) if lanes else base_free + burst_free,
                     "baseSlotsFree": base_free, "piBurstSlotsFree": burst_free,
@@ -304,6 +318,7 @@ class NativeTaskCoordinator:
         # off. Its committed work becomes READY_TO_INTEGRATE so the Root submits now; answers/<key> files it has
         # not committed yet are committed for it (source edits are not: they may be half-written).
         response["deadlineFlushed"] = []
+        response["timeLimitFlushed"] = []
         for row in list(active):
             task = json.loads(row["data"])
             deadline = task.get("deadline_epoch")
@@ -313,51 +328,51 @@ class NativeTaskCoordinator:
                                    or (remaining is not None and 0 < remaining <= self.match_end_flush_seconds))
             if due:
                 key = row["key"]
-                wt = Path(row["worktree"]) / self.repository_folder
-                ans_file = wt / "answers" / key / "submit.json"
-                if not (ans_file.is_file() or self._worker_has_work(wt, task)):
+                if not self._flush_to_ready(db, row, task, "deadline flush", {
+                        "deadline_flush": True,
+                        "note": f"Hard cutoff triggered at {int(slack)}s before the item deadline or match end (deadline flush)"}):
                     continue                  # nothing to submit yet; an empty template would earn nothing
-                try:
-                    if not ans_file.is_file():
-                        ans_file.parent.mkdir(parents=True, exist_ok=True)
-                        tpl = dict(task.get("start_details", {}).get("submitTemplate") or {
-                            "schemaVersion": 1, "backlogId": key, "evidenceFiles": []})
-                        tpl["status"] = "PARTIAL"
-                        ans_file.write_text(json.dumps(tpl, indent=2), encoding="utf-8")
-                    subprocess.run(["git", "-C", str(wt), "add", "-A", "--", f"answers/{key}"],
-                                   capture_output=True, text=True, timeout=15, check=False)
-                    staged = subprocess.run(["git", "-C", str(wt), "diff", "--cached", "--quiet"],
-                                            capture_output=True, timeout=15, check=False)
-                    if staged.returncode == 1:
-                        subprocess.run(["git", "-C", str(wt), "commit", "-q", "-m",
-                                        f"{key}: deadline flush of answers/{key}"],
-                                       capture_output=True, text=True, timeout=20, check=False)
-                except Exception:
-                    pass
-                stored = {}
-                try:
-                    stored = json.loads(row["result"]) if row.get("result") else {}
-                except Exception:
-                    stored = {}
-                emergency_result = {
-                    "task_id": key, "worker_id": row["worker_id"], "status": "PARTIAL",
-                    "skill_ids": ["mtm-emergency-flush"], "changed_files": [f"answers/{key}/submit.json"],
-                    "test_results": [], "evidence_paths": [], "elapsed_seconds": 0, "deadline_flush": True,
-                    "note": f"Hard cutoff triggered at {int(slack)}s before the item deadline or match end (deadline flush)"}
-                if isinstance(stored, dict) and stored.get("status"):
-                    emergency_result = {**stored, "deadline_flush": True}
-                db.execute("UPDATE tasks SET phase='READY_TO_INTEGRATE',result=? WHERE key=?",
-                           (json.dumps(emergency_result), key))
                 active.remove(row)
-                row_copy = dict(row)
-                row_copy["phase"] = "READY_TO_INTEGRATE"
-                row_copy["result"] = json.dumps(emergency_result)
-                ready.append(row_copy)
+                ready.append({**row, "phase": "READY_TO_INTEGRATE"})
                 response["deadlineFlushed"].append({"key": key, "workerId": row["worker_id"],
                                                     "slackSeconds": int(slack),
                                                     "requiredAction": "integrate_and_submit now; then stop this worker"})
-        if not response["deadlineFlushed"]:
-            response.pop("deadlineFlushed")
+                continue
+            # Time-limit flush (MTM_WORKER_MAX_SECONDS): stage 1 submits with the normal gates; a gate rejection
+            # returns the item to the same worker (return_to_worker). Stage 2 (end of the grace) is final.
+            lease = task.get("lease", {})
+            if not (lease.get("time_limited") and clock_ready and lease.get("start_remaining_seconds") is not None):
+                continue
+            elapsed = max(0.0, float(lease["start_remaining_seconds"]) - remaining)
+            if elapsed < float(lease.get("budget_seconds", float("inf"))):
+                continue
+            key = row["key"]
+            final = int(lease.get("time_limit_stage", 1)) >= 2
+            extra = ({"deadline_flush": True, "time_limit_flush": True,
+                      "note": f"Time limit + grace used ({int(elapsed)} s): final submit of the last commit"}
+                     if final else
+                     {"time_limit_flush": True,
+                      "note": f"Time limit used ({int(elapsed)} s): the last commit is submitted"})
+            if not (self._time_limit_ready(Path(row["worktree"]) / self.repository_folder, task, key)
+                    and self._flush_to_ready(db, row, task, "time-limit flush", extra)):
+                continue                      # no committed work yet: it keeps working (deadline flush still applies)
+            lease["time_limit_flushed_at"] = int(elapsed)
+            if final:
+                lease["time_limit_final"] = True
+            task["lease"] = lease
+            db.execute("UPDATE tasks SET data=? WHERE key=?", (json.dumps(task), key))
+            active.remove(row)
+            ready.append({**row, "phase": "READY_TO_INTEGRATE", "data": json.dumps(task)})
+            response["timeLimitFlushed"].append({
+                "key": key, "workerId": row["worker_id"], "elapsedSeconds": int(elapsed), "final": final,
+                "requiredAction": (
+                    "integrate_and_submit(key, schemaAutofill=true) now; then stop this worker" if final else
+                    "integrate_and_submit(key) now. ACCEPTED: stop this worker. Rejected by a gate "
+                    "(RETURNED_TO_WORKER in the error): do NOT stop it; send the worker that exact error so it fixes "
+                    "it, commits and writes worker_result.json again")})
+        for name in ("deadlineFlushed", "timeLimitFlushed"):
+            if not response[name]:
+                response.pop(name)
 
         for row in active:
             task = json.loads(row["data"])
@@ -367,7 +382,7 @@ class NativeTaskCoordinator:
             if clock_ready and lease.get("start_remaining_seconds") is not None:
                 # Official match remaining excludes paused time, unlike raw wall-clock epoch.
                 elapsed = max(0, float(lease["start_remaining_seconds"]) - remaining)
-                if elapsed >= float(lease.get("budget_seconds", float('inf'))):
+                if elapsed >= float(lease.get("budget_seconds", float('inf'))) and not lease.get("time_limited"):
                     reasons.append("worker execution budget exhausted")
             if task.get("status") == "CLOSED":
                 reasons.append("official item CLOSED")
@@ -494,6 +509,112 @@ class NativeTaskCoordinator:
             busy_paths.update(task.get("claimed_paths", []))
             normals += not urgent
         return response
+
+    def _time_limit_ready(self, wt: Path, task: dict, key: str) -> bool:
+        """At the time limit only real worker output is submitted: its own answers/<key>/submit.json plus either a
+        commit of its own, or no uncommitted source edits (an answers-only item). Delivered challenge files and
+        prefetched evidence alone are not work; a worker with uncommitted source edits keeps going (it is told to
+        commit), still bounded by the deadline/match-end flush."""
+        if not (wt / "answers" / key / "submit.json").is_file():
+            return False
+        try:
+            head = subprocess.run(["git", "-C", str(wt), "rev-parse", "HEAD"], capture_output=True, text=True,
+                                  timeout=10, check=False).stdout.strip()
+            base = str(task.get("base_revision") or self._meta_base_revision(task) or "")
+            if head and base and head != base:
+                return True
+            status = subprocess.run(["git", "-C", str(wt), "status", "--porcelain", "--untracked-files=all", "--", "."],
+                                    capture_output=True, text=True, timeout=10, check=False)
+            if status.returncode != 0:
+                return False
+            template = (task.get("start_details") or {}).get("submitTemplate")
+            try:
+                if template is not None and json.loads((wt / "answers" / key / "submit.json").read_text(
+                        encoding="utf-8")) == template:
+                    return False              # still the delivered template: nothing of the worker's yet
+            except ValueError:
+                pass
+            prefix = self.repository_folder.strip("/") + "/"
+            for line in status.stdout.splitlines():
+                path = line[3:].strip().strip('"').split(" -> ")[-1]
+                rel = path[len(prefix):] if path.startswith(prefix) else path
+                if not (rel.startswith("answers/") or rel.startswith("challenge/") or rel == "worker_result.json"):
+                    return False
+            return True
+        except Exception:
+            return False
+
+    def _flush_to_ready(self, db, row: dict, task: dict, label: str, extra: dict) -> bool:
+        """Commit the worker's answers/<key> (not half-written source edits) and mark its last commit
+        READY_TO_INTEGRATE. False when there is nothing to submit yet (no submit.json and no work)."""
+        key = row["key"]
+        wt = Path(row["worktree"]) / self.repository_folder
+        ans_file = wt / "answers" / key / "submit.json"
+        if not (ans_file.is_file() or self._worker_has_work(wt, task)):
+            return False
+        try:
+            if not ans_file.is_file():
+                ans_file.parent.mkdir(parents=True, exist_ok=True)
+                tpl = dict(task.get("start_details", {}).get("submitTemplate") or {
+                    "schemaVersion": 1, "backlogId": key, "evidenceFiles": []})
+                tpl["status"] = "PARTIAL"
+                ans_file.write_text(json.dumps(tpl, indent=2), encoding="utf-8")
+            subprocess.run(["git", "-C", str(wt), "add", "-A", "--", f"answers/{key}"],
+                           capture_output=True, text=True, timeout=15, check=False)
+            staged = subprocess.run(["git", "-C", str(wt), "diff", "--cached", "--quiet"],
+                                    capture_output=True, timeout=15, check=False)
+            if staged.returncode == 1:
+                subprocess.run(["git", "-C", str(wt), "commit", "-q", "-m", f"{key}: {label} of answers/{key}"],
+                               capture_output=True, text=True, timeout=20, check=False)
+        except Exception:
+            pass
+        stored = {}
+        try:
+            stored = json.loads(row["result"]) if row.get("result") else {}
+        except Exception:
+            stored = {}
+        result = {"task_id": key, "worker_id": row["worker_id"], "status": "PARTIAL",
+                  "skill_ids": ["mtm-emergency-flush"], "changed_files": [f"answers/{key}/submit.json"],
+                  "test_results": [], "evidence_paths": [], "elapsed_seconds": 0, **extra}
+        if isinstance(stored, dict) and stored.get("status"):
+            result = {**stored, **{k: v for k, v in extra.items() if k != "note"}}
+        db.execute("UPDATE tasks SET phase='READY_TO_INTEGRATE',result=? WHERE key=?", (json.dumps(result), key))
+        row["result"] = json.dumps(result)
+        return True
+
+    def return_to_worker(self, key: str, error: str) -> dict[str, Any] | None:
+        """A time-limit-flushed submit that the local gates refused was not sent: give the item back to its
+        still-running worker (RUNNING again). Stage 1 also starts the grace period; at its end the next flush is
+        final. None when the item was not time-limit flushed (the normal rules apply)."""
+        key = self._key(key)
+        with self._db() as db:
+            row = self._task(db, key)
+            if row["phase"] not in ("READY_TO_INTEGRATE", "INTEGRATING", "INTEGRATED") or not row["worktree"]:
+                return None
+            task = json.loads(row["data"])
+            lease = task.get("lease", {})
+            stored = json.loads(row["result"]) if row["result"] else {}
+            if not (lease.get("time_limited") and lease.get("time_limit_flushed_at") is not None
+                    and not lease.get("time_limit_final")
+                    and not (isinstance(stored, dict) and stored.get("deadline_flush"))):
+                return None
+            _, now, remaining = self._clock(db)
+            if int(lease.get("time_limit_stage", 1)) < 2:
+                at = float(lease.get("time_limit_flushed_at") or lease.get("budget_seconds") or 0)
+                if remaining is not None and lease.get("start_remaining_seconds") is not None:
+                    at = max(at, float(lease["start_remaining_seconds"]) - remaining)
+                lease["budget_seconds"] = int(at + self.time_limit_grace_seconds)
+                lease["time_limit_stage"] = 2
+            lease["returned"] = [*lease.get("returned", []), str(error)[:300]][-5:]
+            task["lease"] = lease
+            db.execute("UPDATE tasks SET phase='RUNNING',data=?,result=NULL WHERE key=?", (json.dumps(task), key))
+            if self._meta(db, "integration_owner") == key:
+                self._set_meta(db, "integration_owner", None)
+                self._set_meta(db, "integration_acquired_at", None)
+            left = None
+            if remaining is not None and lease.get("start_remaining_seconds") is not None:
+                left = int(lease["budget_seconds"] - (float(lease["start_remaining_seconds"]) - remaining))
+            return {"key": key, "phase": "RUNNING", "workerId": row["worker_id"], "secondsLeft": left}
 
     @staticmethod
     def _task_class(task: dict) -> str:
@@ -657,8 +778,14 @@ class NativeTaskCoordinator:
             # every dispatch_tasks call cut CR-07/TASK-07/TASK-08 off after ~7 minutes (39PSWT5C, 5FW1TZ38).
             # An explicit estimate from the Root can only shorten it.
             budget = max(60, int(slack - self.reserve))
+            # The per-item time limit binds only when it ends before the deadline/match-end budget; otherwise
+            # the deadline flush handles the item as before.
+            time_limited = bool(self.worker_max_seconds) and self.worker_max_seconds < budget
+            if time_limited:
+                budget = self.worker_max_seconds
             if estimated_seconds:
                 budget = min(budget, max(10, int(estimated_seconds)))
+                time_limited = time_limited and budget == self.worker_max_seconds
             worker_model = os.environ.get("MTM_WORKER_MODEL", "gpt-6.1-sol" if os.environ.get("MTM_ENV") == "production" else "gpt-6-luna")
             worker_effort = os.environ.get("MTM_WORKER_EFFORT", "medium" if os.environ.get("MTM_ENV") == "production" else "low")
             envelope = {"task_id": key, "task_type": task_type, "title": eligible.get("title", key),
@@ -671,6 +798,12 @@ class NativeTaskCoordinator:
                                             *([f"mtm-{task_type.lower()}-worker"] if task_type in ("BUG", "CR", "TASK", "PI") else []),
                                             "mtm-verification", "mtm-evidence"],
                         "time_budget_seconds": budget,
+                        **({"time_limit_rule": (
+                            f"Time limit: after about {budget // 60} min of match time the helper submits your LAST "
+                            f"COMMIT (code + answers/{key}). Commit working code, a complete answers/{key}/submit.json "
+                            f"and its evidence early (by ~{max(1, budget // 60 - 2)} min). If the submit gates reject it "
+                            f"you get the exact errors and about {self.time_limit_grace_seconds // 60} more minutes to "
+                            f"fix them; then whatever is committed is submitted.")} if time_limited else {}),
                         "model": worker_model, "reasoning_effort": worker_effort, "backend": "codex",
                         "evidence_required": details.get("evidence_required", eligible.get("evidence_required", [])),
                         "mvs": self._mvs_list(details.get("minimumVerificationScenarios", details.get("mvs"))),
@@ -690,7 +823,8 @@ class NativeTaskCoordinator:
             stored = json.loads(row["data"])
             _, server_now, server_remaining = self._clock(db)
             stored["lease"] = {"start_server_epoch": server_now, "start_remaining_seconds": server_remaining,
-                               "budget_seconds": budget, "claimed_local_epoch": time.time(), "base_revision": base}
+                               "budget_seconds": budget, "claimed_local_epoch": time.time(), "base_revision": base,
+                               **({"time_limited": True, "time_limit_stage": 1} if time_limited else {})}
             db.execute("UPDATE tasks SET phase='RUNNING',worker_id=?,worktree=?,data=? WHERE key=?",
                        (worker_id, str(target), json.dumps(stored), key))
             return {"taskEnvelope": envelope, "worktreeRoot": str(target), "matchRoot": str(worker_match), "match_root": str(worker_match), "workerId": worker_id}
@@ -1002,7 +1136,8 @@ class NativeTaskCoordinator:
             if row["phase"] in ("READY_TO_INTEGRATE", "INTEGRATING", "INTEGRATED", "SUBMITTED", "CLOSED"):
                 stored = json.loads(row["result"]) if row["result"] else {}
                 if row["phase"] == "READY_TO_INTEGRATE" and isinstance(stored, dict) and (
-                        stored.get("deadline_flush") or "mtm-emergency-flush" in (stored.get("skill_ids") or [])):
+                        stored.get("deadline_flush") or stored.get("time_limit_flush")
+                        or "mtm-emergency-flush" in (stored.get("skill_ids") or [])):
                     # The worker finished after a deadline flush: its own result replaces the flush placeholder
                     # when it is valid; otherwise the flushed state stands. Never an error for the Root.
                     db.execute("UPDATE tasks SET phase='RUNNING' WHERE key=?", (key,))

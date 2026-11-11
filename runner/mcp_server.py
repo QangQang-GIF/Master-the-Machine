@@ -1717,7 +1717,28 @@ class MCPHelperServer:
         entry = self.journal.get_in_flight(self.match_uuid, key)
         return entry if entry and entry.get("state") == "IN_FLIGHT" and entry.get("request_body_bytes") else None
 
+    _RETURNABLE_ERRORS = ("MVS_EVIDENCE_MISSING", "SUBMIT_SCHEMA_INVALID", "do not contain answers/")
+
     def integrate_and_submit(self, backlog_item_key: str, schema_autofill: bool = False) -> Dict[str, Any]:
+        try:
+            return self._integrate_and_submit(backlog_item_key, schema_autofill)
+        except (ValueError, FileNotFoundError) as exc:
+            if not any(tag in str(exc) for tag in self._RETURNABLE_ERRORS) or not self.native:
+                raise
+            try:
+                back = self.native.return_to_worker(backlog_item_key, str(exc))
+            except Exception:
+                back = None
+            if not back:
+                raise
+            self._timing("time_limit_returned", backlog_item_key, seconds_left=back.get("secondsLeft"))
+            raise type(exc)(
+                f"{exc} || RETURNED_TO_WORKER {backlog_item_key}: nothing was submitted; the item is RUNNING again "
+                f"for worker {back.get('workerId')} with about {back.get('secondsLeft')} s left. Do not stop that "
+                f"worker: send it this exact error so it fixes it, commits and writes worker_result.json again. "
+                f"When that time is used, the helper flushes it once more and the last commit is submitted.") from exc
+
+    def _integrate_and_submit(self, backlog_item_key: str, schema_autofill: bool = False) -> Dict[str, Any]:
         """The whole SUBMIT path in one call: integration lock -> cherry-pick the worker's commits onto the
         root checkout (skipping commits already there) -> submit_work from answers/<key>/submit.json.
         A conflict aborts the cherry-pick, releases the lock and is returned with the files. A Submit whose
@@ -1907,8 +1928,11 @@ class MCPHelperServer:
             return False
         try:
             slack = self.native.slack_seconds(key)
-            if bool((self.native.task_details(key).get("workerResult") or {}).get("deadline_flush")):
+            details = self.native.task_details(key)
+            if bool((details.get("workerResult") or {}).get("deadline_flush")):
                 return True
+            if ((details.get("data") or {}).get("lease") or {}).get("time_limit_final"):
+                return True               # final time-limit flush: submit what is committed, gates relaxed
         except Exception:
             return False
         return slack is not None and slack <= float(getattr(self.native, "flush_seconds", 150) or 150) + 120
@@ -2542,6 +2566,9 @@ class MCPHelperServer:
             return True
         if plan.get("deadlineFlushed"):
             events["deadlineFlushed"] = [r.get("key") for r in plan["deadlineFlushed"]]
+        if plan.get("timeLimitFlushed"):
+            events["timeLimitFlushed"] = [{"key": r.get("key"), "final": r.get("final"),
+                                           "requiredAction": r.get("requiredAction")} for r in plan["timeLimitFlushed"]]
         ready = [r.get("key") for r in plan.get("readyToIntegrate") or [] if fresh(("ready", r.get("key")))]
         if ready:
             events["readyToIntegrate"] = ready
@@ -2634,11 +2661,11 @@ def get_tool_definitions() -> List[Dict[str, Any]]:
     native_tools = [
         ("plan_tasks", "Refresh server board and return eligible native tasks, reserved urgent capacity, and ready integrations.", {}, []),
         ("claim_task", "Reserve an eligible task after Start Work; return isolated worktree and sanitized TaskEnvelope for native spawn.",
-         {"backlogItemKey": {"type": "string"}, "workerId": {"type": "string"}, "estimatedSeconds": {"type": "integer", "minimum": 10, "description": "Optional; omit it. Only shortens the worker time (default: until the deadline or match end)"}}, ["backlogItemKey", "workerId"]),
+         {"backlogItemKey": {"type": "string"}, "workerId": {"type": "string"}, "estimatedSeconds": {"type": "integer", "minimum": 10, "description": "Optional; omit it. Only shortens the worker time (default: the 10-minute time limit, or less when the deadline/match end is closer)"}}, ["backlogItemKey", "workerId"]),
         ("record_worker_result", "Validate a finished worker's result and artifacts before integration. Omit workerResult: the helper reads the worker's worker_result.json itself. Returns phase and a short verdict.",
          {"backlogItemKey": {"type": "string"}, "workerResult": {"type": "object", "description": "Optional; only when no worker_result.json exists"}}, ["backlogItemKey"]),
         ("dispatch_tasks", "Start Work + claim for several items that plan_tasks selected, in one call (Start Work requests run in parallel). Returns one compact claim summary per item to spawn a worker from.",
-         {"items": {"type": "array", "items": {"type": "object", "properties": {"backlogItemKey": {"type": "string"}, "workerId": {"type": "string"}, "estimatedSeconds": {"type": "integer", "minimum": 10, "description": "Optional; omit it. Only shortens the worker time (default: until the deadline or match end)"}}, "required": ["backlogItemKey"]}}}, ["items"]),
+         {"items": {"type": "array", "items": {"type": "object", "properties": {"backlogItemKey": {"type": "string"}, "workerId": {"type": "string"}, "estimatedSeconds": {"type": "integer", "minimum": 10, "description": "Optional; omit it. Only shortens the worker time (default: the 10-minute time limit, or less when the deadline/match end is closer)"}}, "required": ["backlogItemKey"]}}}, ["items"]),
         ("integrate_and_submit", "The whole submit path in one call: integration lock, cherry-pick the worker commits onto the root checkout (skips commits already there), then submit_work from answers/<key>/submit.json. Returns ACCEPTED+receiptId, or CONFLICT with files. An unknown-outcome submit is resent with the same journaled body. submit.json is checked against challenge/<key>-submit.schema.json first: SUBMIT_SCHEMA_INVALID lists the fields to fix (near the deadline they are filled automatically).",
          {"backlogItemKey": {"type": "string"},
           "schemaAutofill": {"type": "boolean", "default": False, "description": "Fill the minimum to satisfy the submit schema instead of failing (use when there is no time to fix the fields with real values)"}},
@@ -2796,7 +2823,7 @@ _BULKY_FIELDS = ("descriptionMd", "description", "start_details", "startInstruct
                  "company_context", "submitTemplate", "minimumVerificationScenarios", "mvs", "onStartFiles",
                  "releaseFiles", "prior_attempts")
 _ENVELOPE_SUMMARY_FIELDS = ("task_id", "task_type", "title", "worker_id", "repository_path", "match_root", "base_revision",
-                            "points", "deadline_epoch", "time_budget_seconds", "model", "reasoning_effort", "backend",
+                            "points", "deadline_epoch", "time_budget_seconds", "time_limit_rule", "model", "reasoning_effort", "backend",
                             "lane", "agent_profile", "selected_skills", "allowed_paths",
                             "evidence_required", "attempt_id", "result_contract")
 
