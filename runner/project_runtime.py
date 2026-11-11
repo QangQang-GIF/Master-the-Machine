@@ -278,27 +278,7 @@ class ProjectRuntime:
                 path_value = env.get("PATH", "")
                 if str(bin_dir) not in path_value.split(os.pathsep):
                     env["PATH"] = str(bin_dir) + (os.pathsep + path_value if path_value else "")
-            cmd_args = list(args)
-            bundled = self._bundled_yarn() if cmd_args and Path(cmd_args[0]).name.lower() in {"yarn", "yarn.cmd"} else None
-            if bundled and not shutil.which("yarn"):
-                # RQ3I4OHX: the project ships Yarn 4 (.yarn/releases/yarn-4.x.cjs) and no global yarn exists;
-                # Popen("yarn") raised FileNotFoundError and preparation crashed.
-                cmd_args = [shutil.which("node") or "node", str(bundled), *cmd_args[1:]]
-            if sys.platform == "win32" and cmd_args:
-                base_name = cmd_args[0]
-                resolved = None
-                for ext in (".cmd", ".exe", ".bat"):
-                    cand = shutil.which(base_name + ext if not base_name.lower().endswith(ext) else base_name)
-                    if cand and Path(cand).suffix.lower() in {".cmd", ".exe", ".bat"}:
-                        resolved = cand
-                        break
-                if not resolved:
-                    resolved = shutil.which(base_name)
-                if resolved:
-                    if Path(resolved).suffix.lower() in {".cmd", ".bat"}:
-                        cmd_args = ["cmd.exe", "/c", resolved] + cmd_args[1:]
-                    elif Path(resolved).suffix.lower() == ".exe":
-                        cmd_args[0] = resolved
+            cmd_args = self.resolve_command(args)
             # Enabled by the installer (MTM_RUN_IDLE_TIMEOUT=90 in the workspace shell environment).
             idle = float(os.environ.get("MTM_RUN_IDLE_TIMEOUT", "0") or 0)
             if idle > 0 and _setup:
@@ -327,6 +307,79 @@ class ProjectRuntime:
             if isinstance(out, bytes): out = out.decode(errors="replace")
             if isinstance(err, bytes): err = err.decode(errors="replace")
             return CommandResult(tuple(self._redact(a) for a in args), str(workdir), -1, self._redact(out), self._redact(err), True)
+
+    def resolve_command(self, argv: Sequence[str]) -> list[str]:
+        """One resolver for run, session servers and prepare (39PSWT5C/RQ3I4OHX: `session` built `yarn run ...`
+        itself, bypassing the bundled-Yarn fix in run(), and CR-07 failed with WinError 2).
+
+        - yarn without a global yarn: the project's bundled release via node (.yarnrc.yml yarnPath or
+          .yarn/releases/yarn-*.cjs); otherwise corepack.
+        - pnpm/npm/npx/yarn missing on PATH: corepack (pnpm/yarn) when available.
+        - a tool from the project's node_modules/.bin (vite, next, tsx, vitest, ...) that is not on PATH.
+        - Windows: .cmd/.bat go through cmd.exe /c, .exe by full path (CreateProcess finds neither by bare name).
+        """
+        cmd = [str(a) for a in argv]
+        if not cmd:
+            return cmd
+        name = Path(cmd[0]).name.lower()
+        stem = name[:-4] if name.endswith((".cmd", ".exe", ".bat")) else name
+        node = shutil.which("node") or "node"
+        if stem == "yarn" and not shutil.which("yarn"):
+            bundled = self._bundled_yarn()
+            if bundled:
+                return [node, str(bundled), *cmd[1:]]
+        if stem in ("yarn", "pnpm") and not shutil.which(stem) and shutil.which("corepack"):
+            cmd = ["corepack", stem, *cmd[1:]]
+        elif not shutil.which(cmd[0]) and not Path(cmd[0]).is_absolute() and "/" not in cmd[0] and "\\" not in cmd[0]:
+            for base in (self.app_root, self.match_root, self.match_root / "src"):
+                for ext in ((".cmd", ".exe", "") if sys.platform == "win32" else ("",)):
+                    local = base / "node_modules" / ".bin" / (stem + ext)
+                    if local.is_file():
+                        cmd = [str(local), *cmd[1:]]
+                        break
+                else:
+                    continue
+                break
+        if sys.platform == "win32":
+            base_name = cmd[0]
+            resolved = None
+            for ext in (".cmd", ".exe", ".bat"):
+                cand = shutil.which(base_name + ext if not base_name.lower().endswith(ext) else base_name)
+                if cand and Path(cand).suffix.lower() in {".cmd", ".exe", ".bat"}:
+                    resolved = cand
+                    break
+            if not resolved:
+                resolved = shutil.which(base_name)
+            if resolved:
+                if Path(resolved).suffix.lower() in {".cmd", ".bat"}:
+                    cmd = ["cmd.exe", "/c", resolved] + cmd[1:]
+                elif Path(resolved).suffix.lower() == ".exe":
+                    cmd[0] = resolved
+        return cmd
+
+    def server_command(self, script: str | None = None, command_line: str | None = None) -> tuple[list[str], str]:
+        """The server argv for `session`, plus a note. --server-cmd wins; else the named script, else the first of
+        dev/start/serve/preview that package.json declares. Never raises for a missing script: the error names the
+        scripts that exist so the worker can choose."""
+        if command_line:
+            # Windows paths keep their backslashes (posix=False), then the surrounding quotes are dropped.
+            parts = shlex.split(command_line, posix=(sys.platform != "win32"))
+            return ([t[1:-1] if len(t) >= 2 and t[0] == t[-1] and t[0] in "\"'" else t for t in parts], "")
+        scripts = self._manifest().get("scripts", {}) or {}
+        chosen = script if script in scripts else next((s for s in ("dev", "start", "serve", "preview") if s in scripts), None)
+        if chosen is None:
+            raise ValueError(f"No server script {script!r} in {self.app_root / 'package.json'}; scripts: "
+                             f"{sorted(scripts)[:30]}. Pass the serve command from env-require/README.md with "
+                             f"--server-cmd \"<command>\" (and --server-env KEY=VALUE for its data folders).")
+        note = "" if chosen == script else f"[mtm] server script {script!r} not declared; using {chosen!r}.\n"
+        server = self._package_cmd("run", chosen)
+        manifest = self._manifest()
+        body = str(scripts.get(chosen, ""))
+        if "next" in {**manifest.get("dependencies", {}), **manifest.get("devDependencies", {})} and "next" in body:
+            if self._package_manager() == "npm":
+                server.append("--")
+            server.extend(["--hostname", "127.0.0.1", "--port", self.env["PORT"]])
+        return server, note
 
     def _manifest(self) -> dict:
         path = self.app_root / "package.json"
@@ -493,7 +546,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     run_parser.add_argument("--full", action="store_true", help="Print the full output instead of a summary")
     run_parser.add_argument("command", nargs=argparse.REMAINDER)
     session_parser = sub.add_parser("session", help="Run one local server and evidence/check command with shared ephemeral config")
-    session_parser.add_argument("--server-script", default="dev")
+    session_parser.add_argument("--server-script", default="dev", help="package.json script (falls back to start/serve/preview)")
+    session_parser.add_argument("--server-cmd", help="Full server command line, e.g. from env-require/README.md (bundled yarn/pnpm resolved)")
+    session_parser.add_argument("--server-cwd", help="Server working directory inside match_root (default: app root)")
+    session_parser.add_argument("--server-env", action="append", help="KEY=VALUE for the server and the check (repeatable)")
     session_parser.add_argument("--url")
     session_parser.add_argument("--timeout", type=float, default=180)
     session_parser.add_argument("--log", help="Also write the full output to this file")
@@ -512,18 +568,25 @@ def main(argv: Sequence[str] | None = None) -> int:
     if command[:1] == ["--"]: command = command[1:]
     started = time.monotonic()
     if args.action == "session":
-        scripts = runtime._manifest().get("scripts", {})
-        if args.server_script not in scripts:
-            raise ValueError("Server script must be declared by the current project")
-        server = runtime._package_cmd("run", args.server_script)
-        manifest = runtime._manifest()
-        if "next" in {**manifest.get("dependencies", {}), **manifest.get("devDependencies", {})}:
-            if runtime._package_manager() == "npm":
-                server.append("--")
-            server.extend(["--hostname", "127.0.0.1", "--port", runtime.env["PORT"]])
+        try:
+            server, note = runtime.server_command(args.server_script, args.server_cmd)
+        except ValueError as exc:
+            print(f"[mtm] {exc}", file=sys.stderr)
+            return 2
+        if note:
+            print(note, end="", file=sys.stderr)
+        for pair in args.server_env or []:
+            key, sep, value = pair.partition("=")
+            if not sep or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", key):
+                print(f"[mtm] --server-env expects KEY=VALUE, got {pair!r}", file=sys.stderr)
+                return 2
+            if key in ("PORT", "DATABASE_URL", "TEST_DATABASE_URL"):
+                continue                     # runtime-owned, worker-isolated values
+            runtime.env[key] = value
         sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
         from runner.web_session import run_web_session
-        result = run_web_session(runtime, server, command, readiness_url=args.url, timeout=args.timeout)
+        result = run_web_session(runtime, server, command, readiness_url=args.url, timeout=args.timeout,
+                                 server_cwd=args.server_cwd)
     else:
         if getattr(args, "idle_timeout", None) is not None:
             os.environ["MTM_RUN_IDLE_TIMEOUT"] = str(args.idle_timeout)

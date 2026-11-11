@@ -6,6 +6,7 @@ description: Capture, validate, and reference official MTM evidence artifacts an
 # MTM Evidence (Ephemeral Web Session Sandbox)
 
 - **Storage Location**: Save artifacts under `matchRoot/answers/<key>/evidence/<filename>`. Reference them in `answers/<key>/submit.json` as `evidence/<filename>`.
+- **Required evidence per scenario**: when the MVS document says `Required evidence: \`<file>\`` under a scenario, that exact file (produced by the MVS command, e.g. `mvs-tests.log`) must be in that row's `evidence` list; extra per-case logs may follow it but never replace it (39PSWT5C BUG-11 cited `tc-01.log` instead of `mvs-tests.log`). `metadata.submit_schema_check` reports rows that miss it.
 - **Official Data First (Zero Fixture Missing)**:
   - Root automatically pre-fetches official QA fixtures to `answers/<key>/evidence/<key.lower()>-test-data.json` (with `.source.json` sidecar) before worker launch.
   - Check `answers/<key>/evidence/<key.lower()>-test-data.json` FIRST. **NEVER overwrite an existing official fixture or fabricate synthetic `*-test-data.json` files!**

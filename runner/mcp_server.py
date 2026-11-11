@@ -1807,6 +1807,66 @@ class MCPHelperServer:
             pick = cont
         return pick
 
+    def _deadline_mode(self, key: str) -> bool:
+        """True near the item deadline / match end (slack <= flush + 120 s) or after a deadline flush."""
+        if not self.native:
+            return False
+        try:
+            slack = self.native.slack_seconds(key)
+            if bool((self.native.task_details(key).get("workerResult") or {}).get("deadline_flush")):
+                return True
+        except Exception:
+            return False
+        return slack is not None and slack <= float(getattr(self.native, "flush_seconds", 240) or 240) + 120
+
+    def _write_root_answer(self, key: str, answer: Any) -> None:
+        try:
+            path = Path(self.match_root) / "answers" / key / "submit.json"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps(answer, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+        except OSError as exc:
+            sys.stderr.write(f"Warning: could not rewrite submit.json for {key}: {exc}\n")
+
+    def _mvs_evidence_gate(self, key: str, answer: Any, relaxed: bool = False) -> Any:
+        """Each PASS row must cite the evidence its MVS scenario requires ("Required evidence: `x`").
+
+        39PSWT5C BUG-11: rows cited evidence/tc-0N.log while the MVS required mvs-tests.log (which existed),
+        so no PASS row carried its graded evidence. A required file that exists is added to the row
+        (written to answers/<key>/submit.json and committed by the auto-capture). A required file that does
+        not exist refuses the submit with MVS_EVIDENCE_MISSING while there is time; near the deadline the
+        answer goes as it is."""
+        from mtm_competition.integration.mvs_evidence import mvs_documents, reconcile, required_evidence
+
+        if not isinstance(answer, dict):
+            return answer
+        try:
+            requirements: Dict[str, List[str]] = {}
+            for doc in mvs_documents(Path(self.match_root), key):
+                requirements.update(required_evidence(doc.read_text(encoding="utf-8", errors="replace")))
+            if not requirements:
+                return answer
+            answer, fixes, missing = reconcile(answer, requirements,
+                                               Path(self.match_root) / "answers" / key / "evidence", key)
+        except Exception as exc:
+            sys.stderr.write(f"Warning: MVS evidence check skipped for {key}: {exc}\n")
+            return answer
+        if fixes:
+            self._write_root_answer(key, answer)
+            self._timing("mvs_evidence_fixed", key, rows=len(fixes))
+            sys.stderr.write(f"Notice: {key} PASS rows now cite their required MVS evidence: {fixes[:8]}\n")
+        if missing and not (relaxed or self._deadline_mode(key)):
+            if self.native:
+                try:
+                    self.native.end_integration(key, success=False)
+                except Exception:
+                    pass
+            raise ValueError(
+                f"MVS_EVIDENCE_MISSING {key}: PASS rows lack the evidence their scenario requires "
+                f"{json.dumps(missing[:12])} (a case scores only with its required evidence). Produce exactly "
+                f"these files under answers/{key}/evidence/ with the MVS command, or report those rows NOT_RUN, "
+                f"commit, and call integrate_and_submit again.")
+        return answer
+
     def _schema_gate(self, key: str, answer: Any, autofill_requested: bool = False) -> Any:
         """Validate the answer against challenge/<key>-submit.schema.json before SUBMIT (39PSWT5C: the grader
         scores a schema-invalid submit.json 0 for the whole item; CR-0x sent "auditSummary": {}).
@@ -1831,16 +1891,8 @@ class MCPHelperServer:
             return answer
         if not errors:
             return answer
-        slack = None
-        flushed = False
-        if self.native:
-            try:
-                slack = self.native.slack_seconds(key)
-                flushed = bool((self.native.task_details(key).get("workerResult") or {}).get("deadline_flush"))
-            except Exception:
-                pass
-        near = slack is not None and slack <= float(getattr(self.native, "flush_seconds", 240) or 240) + 120
-        if not (autofill_requested or near or flushed):
+        near = self._deadline_mode(key)
+        if not (autofill_requested or near):
             if self.native:
                 try:
                     self.native.end_integration(key, success=False)
@@ -1858,12 +1910,7 @@ class MCPHelperServer:
             if fixed["status"] == "DONE" and "PARTIAL" in (status_schema.get("enum") or ["PARTIAL"]):
                 fixed["status"] = "PARTIAL"
         remaining = schema_errors(fixed, schema)
-        try:
-            path = Path(self.match_root) / "answers" / key / "submit.json"
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(json.dumps(fixed, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
-        except OSError as exc:
-            sys.stderr.write(f"Warning: could not write autofilled submit.json for {key}: {exc}\n")
+        self._write_root_answer(key, fixed)
         self._timing("schema_autofill", key, changes=len(changes), remaining_errors=len(remaining))
         sys.stderr.write(f"Notice: {key} submit.json autofilled to satisfy the schema: {changes[:10]}; "
                          f"remaining errors: {remaining[:5]}\n")
@@ -1907,6 +1954,7 @@ class MCPHelperServer:
             required_test_ids = announced_test_ids(details)
 
         if not replay:
+            answer = self._mvs_evidence_gate(backlog_item_key, answer, schema_autofill)
             answer = self._schema_gate(backlog_item_key, answer, schema_autofill)
 
         # Ensure local commits are pushed to remote origin before pre-submission verification

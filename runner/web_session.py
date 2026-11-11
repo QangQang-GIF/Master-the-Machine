@@ -95,7 +95,8 @@ def _terminate_tree(proc: subprocess.Popen[str], grace: float = 2.0) -> None:
 
 def run_web_session(runtime: ProjectRuntime, server_argv: list[str],
                     check_argv: list[str], readiness_url: str | None = None,
-                    timeout: float = 180, readiness_timeout: float = 45) -> CommandResult:
+                    timeout: float = 180, readiness_timeout: float = 45,
+                    server_cwd: str | None = None) -> CommandResult:
     """Start a local server, wait for HTTP readiness, run a check, then reap it.
 
     Only loopback URLs on the exact match/worker runtime port are accepted.
@@ -130,24 +131,10 @@ def run_web_session(runtime: ProjectRuntime, server_argv: list[str],
     if port:
         _kill_port_listeners(port)
     try:
-        server_cmd = list(map(str, server_argv))
-        if os.name == "nt" and server_cmd:
-            base_name = server_cmd[0]
-            resolved = None
-            for ext in (".cmd", ".exe", ".bat"):
-                cand = shutil.which(base_name + ext if not base_name.lower().endswith(ext) else base_name)
-                if cand and Path(cand).suffix.lower() in {".cmd", ".exe", ".bat"}:
-                    resolved = cand
-                    break
-            if not resolved:
-                resolved = shutil.which(base_name)
-            if resolved:
-                if Path(resolved).suffix.lower() in {".cmd", ".bat"}:
-                    server_cmd = ["cmd.exe", "/c", resolved] + server_cmd[1:]
-                elif Path(resolved).suffix.lower() == ".exe":
-                    server_cmd[0] = resolved
+        server_cmd = runtime.resolve_command(list(map(str, server_argv)))
+        server_dir = runtime._resolve_cwd(server_cwd) if server_cwd else runtime.app_root
         proc = subprocess.Popen(
-            server_cmd, cwd=runtime.app_root,
+            server_cmd, cwd=server_dir,
             env=runtime.env.copy(), shell=False, stdout=subprocess.PIPE,
             stderr=subprocess.PIPE, text=True, errors="replace", bufsize=1,
             start_new_session=(os.name != "nt"),

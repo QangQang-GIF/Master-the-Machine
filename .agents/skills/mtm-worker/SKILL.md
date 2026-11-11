@@ -37,7 +37,7 @@ Follow `mtm-init` boundaries, TaskEnvelope constraints, and returned submit temp
      python3 "<metadata.project_runtime_path>" --match-root "<match_root>" --match-id "<metadata.match_id>" --worker-id "<worker_id>" session -- <command>
      ```
      Inside your capture script, always read `const baseUrl = \`http://127.0.0.1:\${process.env.PORT || 3000}\`;`.
-     If the project has no `dev` script, pass the real one: `session --server-script <script from package.json> --url <its local URL> -- <command>` (read `package.json` scripts first).
+     Without a `dev` script `session` falls back to `start`/`serve`/`preview`. When `env-require/README.md` gives the serve command (e.g. a sync server with its own data folders), pass it as is: `session --server-cmd "<that command>" [--server-cwd <folder>] [--server-env KEY=VALUE ...] --url http://127.0.0.1:$PORT/<path> -- <check command>`; data folders go inside your worktree. Write `yarn`/`pnpm` as the README does: bundled Yarn, corepack and `node_modules/.bin` tools are resolved for you (never replace them with absolute paths or edit configs). Exit 2 with a script list means the command was wrong; fix it instead of marking the scenario NOT_RUN.
 
 2. **Pre-Fetched Official Fixtures & MVS Tests (Zero Fixture Missing)**:
    - Root automatically pre-fetches official QA fixtures (`answers/<key>/evidence/<key.lower()>-test-data.json` + `.source.json`) and company KB/Logs (`metadata.company_context`) during `start_work` / `claim_task`.

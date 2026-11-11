@@ -325,12 +325,24 @@ def main(argv: List[str]) -> int:
     except (OSError, ValueError) as exc:
         print(json.dumps({"valid": False, "errors": [{"path": "/", "keyword": "json", "message": str(exc)}]}))
         return 1
-    if schema is None:
-        print(json.dumps({"valid": None, "note": f"no schema found for {key}"}))
-        return 0
-    errors = schema_errors(answer, schema)
-    print(json.dumps({"valid": not errors, "schema": str(where), "errors": errors}, indent=1))
-    return 0 if not errors else 1
+    mvs_missing: List[Dict[str, str]] = []
+    mvs_fixable: List[Dict[str, str]] = []
+    try:                                   # same check the submit path runs: each PASS row cites its MVS evidence
+        sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+        from mtm_competition.integration.mvs_evidence import mvs_documents, reconcile, required_evidence
+        req: Dict[str, List[str]] = {}
+        for doc in mvs_documents(root, key):
+            req.update(required_evidence(doc.read_text(encoding="utf-8", errors="replace")))
+        _, mvs_fixable, mvs_missing = reconcile(copy.deepcopy(answer), req, root / "answers" / key / "evidence", key)
+    except Exception:
+        pass
+    errors = schema_errors(answer, schema) if schema is not None else []
+    report: Dict[str, Any] = {"valid": not errors and not mvs_missing and not mvs_fixable,
+                              "schema": str(where) if where else None, "errors": errors}
+    if mvs_missing or mvs_fixable:
+        report["mvsEvidence"] = {"rowsMissingRequiredFile": mvs_missing, "rowsNotCitingExistingRequiredFile": mvs_fixable}
+    print(json.dumps(report, indent=1, ensure_ascii=False))
+    return 0 if report["valid"] else 1
 
 
 if __name__ == "__main__":
