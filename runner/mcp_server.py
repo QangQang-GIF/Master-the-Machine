@@ -444,7 +444,7 @@ class MCPHelperServer:
         first, last = (entries[0], entries[-1]) if entries else ({}, {})
         return {"path": str(target), "sha256": hashlib.sha256(payload.encode("utf-8")).hexdigest(),
                 "total": result["total"], "unique": result["unique"], "complete": result["complete"],
-                "calls": result["calls"], "elapsedSeconds": result["elapsedSeconds"],
+                "calls": result["calls"], "elapsedSeconds": result["elapsedSeconds"], "strategy": result.get("strategy"),
                 "incompletePartitions": result["incompletePartitions"][:10],
                 "advice": result.get("advice"),
                 "firstEntry": {k: first.get(k) for k in ("ts", "service", "message", "context")} if first else None,
