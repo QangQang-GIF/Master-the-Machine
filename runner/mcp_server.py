@@ -1757,6 +1757,7 @@ class MCPHelperServer:
             if todo:
                 pick = git("cherry-pick", "--allow-empty", *todo, t=120)
                 pick = self._resolve_bookkeeping_conflicts(git, pick)
+                pick = self._resolve_equivalent_conflicts(git, pick, key)
                 if pick.returncode != 0:
                     conflicts = git("diff", "--name-only", "--diff-filter=U").stdout.splitlines()
                     git("cherry-pick", "--abort")
@@ -1807,6 +1808,97 @@ class MCPHelperServer:
                                          or "nothing to commit" in (cont.stderr + cont.stdout).lower()):
                 cont = git("cherry-pick", "--skip", t=120)
             pick = cont
+        return pick
+
+    _CODE_SUFFIXES = {".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".py", ".java", ".kt", ".go", ".cs", ".rs", ".php", ".rb"}
+    _HASH_COMMENT_SUFFIXES = {".py", ".rb"}
+    _TOKEN_RE = re.compile(r"""//[^\n]*|/\*.*?\*/|#[^\n]*|"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|`(?:\\.|[^`\\])*`|[A-Za-z_$][\w$]*|\d[\w.]*|\S""", re.S)
+    _DECL_RE = re.compile(r"^(?:const|let|var|val|final)$")
+
+    @classmethod
+    def _code_tokens(cls, text: str, hash_comments: bool = False) -> List[str]:
+        comment = ("//", "/*", "#") if hash_comments else ("//", "/*")
+        out = []
+        for t in cls._TOKEN_RE.findall(text):
+            if t.startswith(comment):
+                continue
+            if t.startswith("#") and not hash_comments:
+                out.append("#")                       # JS private field, CSS colour...: code, not a comment
+                out.extend(cls._code_tokens(t[1:]))
+                continue
+            out.append(t)
+        return out
+
+    @classmethod
+    def _equivalent_code(cls, ours: str, theirs: str, hash_comments: bool = False) -> bool:
+        """Same code apart from comments, whitespace and the names of locals the hunk itself declares.
+
+        5FW1TZ38 / 39PSWT5C: CR-07 and PI-03 both changed getScheduledAmount to the midpoint rule, one with
+        `const bound`, the other with `const midpoint` and a different comment; git reported a conflict and the
+        Root merged it by hand while PI-03 (ranked by submission order) waited 37 s."""
+        a, b = cls._code_tokens(ours, hash_comments), cls._code_tokens(theirs, hash_comments)
+        if a == b:
+            return True
+        if len(a) != len(b) or not a:
+            return False
+        decl_a = [a[i + 1] for i in range(len(a) - 1) if cls._DECL_RE.match(a[i])]
+        decl_b = [b[i + 1] for i in range(len(b) - 1) if cls._DECL_RE.match(b[i])]
+        if len(decl_a) != len(decl_b):
+            return False
+        rename = dict(zip(decl_a, decl_b))
+        if len(set(rename.values())) != len(rename):
+            return False
+        return [rename.get(t, t) for t in a] == b
+
+    def _resolve_equivalent_conflicts(self, git: Any, pick: Any, key: str) -> Any:
+        """Resolve a cherry-pick conflict automatically when every conflicted hunk is the same code on both
+        sides (see _equivalent_code). The root side (already integrated, possibly already graded) is kept.
+        Any other conflict is left to the Root exactly as before."""
+        for _ in range(50):
+            if pick.returncode == 0:
+                return pick
+            conflicts = [c for c in git("diff", "--name-only", "--diff-filter=U").stdout.splitlines() if c]
+            if not conflicts:
+                return pick
+            resolved: Dict[str, str] = {}
+            for rel in conflicts:
+                if Path(rel).suffix.lower() not in self._CODE_SUFFIXES:
+                    return pick                       # data, docs, answers: always the Root's decision
+                hash_comments = Path(rel).suffix.lower() in self._HASH_COMMENT_SUFFIXES
+                path = Path(self.checkout_root) / rel
+                try:
+                    text = path.read_text(encoding="utf-8")
+                except (OSError, UnicodeDecodeError):
+                    return pick
+                out, pos, ok = [], 0, True
+                pattern = re.compile(r"^<<<<<<< [^\n]*\n(.*?)^(?:\|\|\|\|\|\|\|[^\n]*\n.*?)?^=======\n(.*?)^>>>>>>> [^\n]*(?:\n|$)",
+                                     re.S | re.M)
+                found = False
+                for m in pattern.finditer(text):
+                    found = True
+                    if not self._equivalent_code(m.group(1), m.group(2), hash_comments):
+                        ok = False
+                        break
+                    out.append(text[pos:m.start()])
+                    out.append(m.group(1))
+                    pos = m.end()
+                if not ok or not found:
+                    return pick
+                out.append(text[pos:])
+                merged = "".join(out)
+                if "<<<<<<< " in merged or "\n>>>>>>> " in merged:
+                    return pick
+                resolved[rel] = merged
+            for rel, merged in resolved.items():
+                (Path(self.checkout_root) / rel).write_text(merged, encoding="utf-8", newline="")
+                git("add", "--", rel)
+            self._timing("conflict_auto_resolved", key, files=len(resolved))
+            sys.stderr.write(f"Notice: {key} conflict in {sorted(resolved)} was the same code on both sides; kept the root version\n")
+            cont = git("-c", "core.editor=true", "cherry-pick", "--continue", t=120)
+            if cont.returncode != 0 and ("empty" in (cont.stderr + cont.stdout).lower()
+                                         or "nothing to commit" in (cont.stderr + cont.stdout).lower()):
+                cont = git("cherry-pick", "--skip", t=120)
+            pick = self._resolve_bookkeeping_conflicts(git, cont)
         return pick
 
     def _deadline_mode(self, key: str) -> bool:

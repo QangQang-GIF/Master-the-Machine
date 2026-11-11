@@ -49,6 +49,11 @@ Follow `mtm-init` boundaries, TaskEnvelope constraints, and returned submit temp
    - **A screenshot, export or HTTP capture is required**: do the logic and logs first, then capture everything in ONE `project_runtime.py ... session` pass that follows `env-require/README.md`, at the viewport the MVS states.
    - **The item ships seed/report/check scripts** (`challenge/<KEY>-seed.*`, `-report.*`, `-run-checks.*`): run them as their header or the MVS says (where to copy them, which runner, which arguments) BEFORE any capture, on the official fixture only; remove temporary copies the brief says not to commit.
 
-4. **Deadline Protection & Output Contract**:
+4. **Official data and the grader's own path (every item type)** — 5FW1TZ38: CR-07 lost 42/70 because the official data was only going to be loaded through the UI (never done; the source also crashed on that data, unseen), TASK-07 lost 14/45 because its harness called an inner function instead of the path the grader uses:
+   - When the brief gives official test data or says the grader loads data / replays a flow with your source, FIRST write a server-side test (in the project's test runner, via `project_runtime.py ... run`) that loads that data exactly as its description says, through the application's public handlers, and produces every figure, file and summary the answer needs (e.g. `auditSummary`, the CSV, counts, balances). Fill `submit.json` and the evidence from that output, and fix any crash it shows before anything else. Keep the test file (or the same steps) as evidence.
+   - Call the entry point the brief or grader names (the handler or flow behind it, such as the import dialog's `transactions-import` handler and its preview/selection steps, with every setting the brief lists), never a lower-level function it happens to call; when unsure, run both and investigate any difference.
+   - UI screenshots and browser downloads come LAST, from the same data, in one `session` pass; if they cannot be finished, the server-side figures and files are still submitted.
+
+5. **Deadline Protection & Output Contract**:
    - If a UI scenario fails or the item deadline is near, mark only the uncaptured scenario `NOT_RUN` in `submit.json` (`status: "PARTIAL"`), NEVER fabricate fake/placeholder PNGs, and commit immediately.
    - Always `git add` and `git commit` all modified source files, the MVS test copy, `answers/<key>/submit.json`, and `answers/<key>/evidence/*` inside your worktree before writing `worker_result.json`.

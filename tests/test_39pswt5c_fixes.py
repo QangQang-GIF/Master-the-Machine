@@ -290,3 +290,56 @@ def test_known_type_keeps_its_specialist_skill(native_server):
     server.start_work("TASK-01")
     skills = server.claim_task("TASK-01", "w1", 120)["taskEnvelope"]["selected_skills"]
     assert skills == ["mtm-init", "mtm-worker", "mtm-task-worker", "mtm-verification", "mtm-evidence"]
+
+
+# Conflicts that are the same code on both sides ---------------------------------------------------------------
+BASE_TS = ("export function scheduled(amount, inverse) {\n"
+           "  // A range posts its larger bound\n"
+           "  const bound = Math.max(amount.num1, amount.num2);\n"
+           "  return inverse ? -bound : bound;\n}\n")
+ROOT_TS = ("export function scheduled(amount, inverse) {\n"
+           "  // A range posts its midpoint, with halves toward positive infinity\n"
+           "  const bound = Math.round((amount.num1 + amount.num2) / 2);\n"
+           "  return inverse ? -bound : bound;\n}\n")
+WORKER_TS = ("export function scheduled(amount, inverse) {\n"
+             "  // Range schedules post the midpoint, with halves toward positive infinity.\n"
+             "  const midpoint = Math.round((amount.num1 + amount.num2) / 2);\n"
+             "  return inverse ? -midpoint : midpoint;\n}\n")
+
+
+def _conflicting_worker(server, worker_version):
+    publish(server, {"src/schedules.ts": BASE_TS})
+    worker, match, _, _ = finish_worker(server)
+    (match / "src/schedules.ts").write_text(worker_version)
+    git(worker, "add", "project/src/schedules.ts")
+    git(worker, "commit", "-m", "fix: midpoint (worker)")
+    (server.match_root / "src/schedules.ts").write_text(ROOT_TS)       # another item already integrated this
+    git(server.checkout_root, "add", "project/src/schedules.ts")
+    git(server.checkout_root, "commit", "-m", "fix: midpoint (other item)")
+    server.record_worker_result("TASK-01")
+
+
+def test_conflict_with_the_same_code_on_both_sides_is_resolved_automatically(native_server):
+    """5FW1TZ38: PI-03 and CR-07 both fixed getScheduledAmount (bound vs midpoint); the Root merged by hand, 37 s."""
+    server = native_server
+    _conflicting_worker(server, WORKER_TS)
+    out = server.integrate_and_submit("TASK-01")
+    assert out["status"] == "ACCEPTED"
+    assert (server.match_root / "src/schedules.ts").read_text() == ROOT_TS
+    assert git(server.checkout_root, "status", "--porcelain", "--", "project/src").strip() == ""
+
+
+def test_conflict_with_different_code_still_goes_to_the_root(native_server):
+    server = native_server
+    _conflicting_worker(server, WORKER_TS.replace("Math.round", "Math.floor"))
+    out = server.integrate_and_submit("TASK-01")
+    assert out["status"] == "CONFLICT" and any(c.endswith("schedules.ts") for c in out["conflicts"])
+    assert not server.adapter.calls
+
+
+def test_equivalence_rules():
+    from runner.mcp_server import MCPHelperServer as M
+    assert M._equivalent_code(ROOT_TS, WORKER_TS)
+    assert not M._equivalent_code("x = a + b;", "x = c + d;")                 # only declared locals may differ
+    assert not M._equivalent_code("const s = 'a // b';", "const s = 'a // c';")  # strings are compared
+    assert not M._equivalent_code("this.#a = 1;", "this.#b = 1;")              # '#' is code in JS
