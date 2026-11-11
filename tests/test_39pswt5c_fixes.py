@@ -241,3 +241,23 @@ def test_exam_schema_with_relative_id_and_defs_refs():
     assert {e["keyword"] for e in schema_errors(bad, schema)} >= {"enum", "required"}
     fixed, _ = autofill(bad, schema)
     assert schema_errors(fixed, schema) == []
+
+
+def test_prefix_items_schema_on_a_draft7_only_jsonschema(monkeypatch):
+    """jsonschema 3.2 (no Draft202012Validator) must not reject every row of a prefixItems/items:false schema."""
+    import jsonschema
+    from mtm_competition.integration import submit_schema
+    schema = {"$schema": "https://json-schema.org/draft/2020-12/schema", "$id": "MTM-26-X/BUG-12-submit.schema.json",
+              "type": "object", "required": ["testResults"],
+              "properties": {"testResults": {"type": "array", "items": False, "prefixItems": [
+                  {"type": "object", "additionalProperties": False, "required": ["id", "result", "evidence"],
+                   "properties": {"id": {"const": "BUG-12-TC-01"}, "result": {"enum": ["PASS", "FAIL"]},
+                                  "evidence": {"type": "array"}, "note": {"type": "string"}}}]}}}
+    good = {"testResults": [{"id": "BUG-12-TC-01", "result": "PASS", "evidence": ["evidence/a.log"], "note": "ok"}]}
+    extra = {"testResults": [*good["testResults"], {"id": "X"}]}
+    for hide in (False, True):
+        if hide:
+            monkeypatch.setattr(jsonschema, "Draft202012Validator", None)
+            monkeypatch.setattr(jsonschema, "Draft201909Validator", None)
+        assert submit_schema.schema_errors(good, schema) == []
+        assert submit_schema.schema_errors(extra, schema)

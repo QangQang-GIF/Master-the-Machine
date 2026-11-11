@@ -69,6 +69,27 @@ def _local_ids_removed(node: Any) -> Any:
     return node
 
 
+def _as_draft7(node: Any) -> Any:
+    """Rewrite 2020-12 array keywords for a validator that only knows Draft 7: prefixItems -> items (tuple form),
+    items -> additionalItems. Without this the exam schemas' "prefixItems": [...], "items": false rejected every
+    row ("False schema does not allow ...") under jsonschema 3.2."""
+    if isinstance(node, list):
+        return [_as_draft7(v) for v in node]
+    if not isinstance(node, dict):
+        return node
+    out = {k: _as_draft7(v) for k, v in node.items()}
+    if "prefixItems" in out:
+        tail = out.pop("items", None)
+        out["items"] = out.pop("prefixItems")
+        if tail is not None:
+            out["additionalItems"] = tail
+    if "dependentRequired" in out and "dependencies" not in out:
+        out["dependencies"] = out.pop("dependentRequired")
+    if "$schema" in out:
+        out["$schema"] = "http://json-schema.org/draft-07/schema#"
+    return out
+
+
 def _validator(schema: dict):
     """(validator instance, prepared schema) for the installed jsonschema, or (None, schema)."""
     import warnings
@@ -84,6 +105,9 @@ def _validator(schema: dict):
         cls = getattr(jsonschema, "Draft202012Validator", None)
     elif "2019-09" in declared:
         cls = getattr(jsonschema, "Draft201909Validator", None)
+    if cls is None and ("2020-12" in declared or "2019-09" in declared or "prefixItems" in json.dumps(prepared)):
+        prepared = _as_draft7(prepared)               # this jsonschema predates the declared draft
+        cls = getattr(jsonschema, "Draft7Validator", None)
     if cls is None:
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
