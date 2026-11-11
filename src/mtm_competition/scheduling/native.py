@@ -144,9 +144,21 @@ class NativeTaskCoordinator:
 
     @staticmethod
     def _key(key: str) -> str:
-        if not isinstance(key, str) or not re.fullmatch(r"(?:TASK|CR|BUG|PI)-[A-Za-z0-9_-]+", key):
+        # Any business key the Game Master announces (TASK-07, SEC-01, OPS_2, HEAVY-01...), as long as it is a
+        # safe single path component: it names the worker folder. Prefixes are not limited to TASK/CR/BUG/PI.
+        if not isinstance(key, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}", key) or ".." in key:
             raise NativeCoordinationError("Invalid announced backlog key")
         return key
+
+    _PI_TYPES = {"PI", "INCIDENT", "PRODUCT_INCIDENT", "PRODUCT INCIDENT", "PRODUCTINCIDENT"}
+
+    @classmethod
+    def _type_of(cls, task: dict, key: str) -> str:
+        raw = task.get("type") or task.get("task_type") or task.get("backlogType") or key.split("-")[0]
+        kind = str(raw).strip().upper().replace("-", "_")
+        if kind in cls._PI_TYPES:
+            return "PI"
+        return {"CHANGE_REQUEST": "CR", "CHANGE REQUEST": "CR", "BUGFIX": "BUG"}.get(kind, kind or "TASK")
 
     def register_projection(self, projection: dict[str, Any]) -> None:
         status = str(projection.get("status", "UNKNOWN")).upper()
@@ -160,11 +172,19 @@ class NativeTaskCoordinator:
             if projection.get("remaining_seconds") is not None:
                 self._set_meta(db, "remaining", [max(0, float(projection["remaining_seconds"])), time.monotonic()])
             items = projection.get("items", projection.get("backlogItems", projection.get("backlogs", [])))
+            skipped = []
             for raw in items:
+                if not isinstance(raw, dict):
+                    continue
                 task = dict(raw)
-                key = self._key(task.get("key", task.get("backlogItemKey")))
+                try:
+                    key = self._key(task.get("key") or task.get("backlogItemKey") or task.get("backlogId"))
+                except NativeCoordinationError:
+                    # One unusable key must never hide the other items of the board.
+                    skipped.append(str(task.get("key") or task.get("backlogItemKey") or task.get("backlogId"))[:80])
+                    continue
                 task["key"] = key
-                task["type"] = str(task.get("type", task.get("task_type", key.split("-")[0]))).upper()
+                task["type"] = self._type_of(task, key)
                 task["status"] = str(task.get("status", "UNKNOWN")).upper()
                 if "deadline_epoch" not in task and "deadlineEpoch" in task:
                     task["deadline_epoch"] = task["deadlineEpoch"]
@@ -173,6 +193,8 @@ class NativeTaskCoordinator:
                     merged = json.loads(old[0]); merged.update(task); task = merged
                 db.execute("INSERT INTO tasks(key,data,discovered) VALUES(?,?,?) ON CONFLICT(key) DO UPDATE SET data=excluded.data",
                            (key, json.dumps(task), time.monotonic()))
+            if skipped:
+                self._set_meta(db, "skipped_keys", skipped[:20])
 
     def register_started(self, key: str, details: dict[str, Any]) -> None:
         key = self._key(key)
@@ -630,7 +652,11 @@ class NativeTaskCoordinator:
                         "description": specification or eligible.get("description") or eligible.get("descriptionMd", ""), "repository_path": str(target),
                         "match_root": str(worker_match), "base_revision": base, "points": int(eligible.get("points", 0)),
                         "deadline_epoch": eligible.get("deadline_epoch"),
-                        "selected_skills": ["mtm-init", f"mtm-{task_type.lower()}-worker", "mtm-verification", "mtm-evidence"],
+                        # Specialist skill only for the known types; any other type (SEC, OPS, ...) works from the
+                        # generic mtm-worker skill, which every specialist skill builds on anyway.
+                        "selected_skills": ["mtm-init", "mtm-worker",
+                                            *([f"mtm-{task_type.lower()}-worker"] if task_type in ("BUG", "CR", "TASK", "PI") else []),
+                                            "mtm-verification", "mtm-evidence"],
                         "time_budget_seconds": budget,
                         "finish_by_epoch": round(time.time() + budget),
                         "finish_rule": ("Stop by finish_by_epoch (compare with python -c \"import time;print(int(time.time()))\"): "

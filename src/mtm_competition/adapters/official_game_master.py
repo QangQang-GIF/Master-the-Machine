@@ -378,7 +378,7 @@ class OfficialGameMasterAdapter(GameMasterAdapter):
             match_code = m_code.group(1) if m_code else (self.match_code or "")
             backlog_items = []
             seen_keys = set()
-            for item_match in re.finditer(r'<span class="font-mono text-zinc-300">(BUG-\d+|TASK-\d+|CR-\d+|PI-\d+)</span>', resp_body):
+            for item_match in re.finditer(r'<span class="font-mono text-zinc-300">([A-Z][A-Z0-9_]{0,15}-[A-Za-z0-9_]+)</span>', resp_body):
                 key = item_match.group(1)
                 if key in seen_keys:
                     continue

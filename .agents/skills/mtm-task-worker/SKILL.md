@@ -12,18 +12,10 @@ Follow `mtm-init` and `mtm-worker`. Root owns Start Work, integration, push, and
      `python3 "<metadata.project_runtime_path>" --match-root "<match_root>" --match-id "<metadata.match_id>" --worker-id "<worker_id>" run -- <cmd>`
    - Only use `project_runtime.py ... session` if `submit.json` explicitly requires `.png` screenshot evidence!
 
-2. **Fast Paths by TASK Archetype**:
-   - **`TASK-01` / `TASK-04` (Code Trace / Reorder Position / Overdue Reminder Dry-Run)**:
-     - **NO browser, NO web server!**
-     - Trace or implement the requested pure logic, run the targeted vitest test via `project_runtime.py ... run`, write the exact answer fields into `answers/<key>/submit.json` and log into `answers/<key>/evidence/`, commit, and finish in < 90s.
-     - For Kanban card reorder midpoint (`Cards A=65536, B=131072, C=196608`, moving C between A and B): midpoint is `"98304"`.
-   - **`TASK-02` (Dependency Audit / Workload Heatmap)**:
-     - If `challenge/TASK-02-run-checks.mjs` exists, run `node ../challenge/TASK-02-run-checks.mjs ../answers/TASK-02/evidence` via `project_runtime.py ... run`.
-     - Map `testResults` in `answers/TASK-02/submit.json` 1-to-1 to the exact evidence files required by the template, and capture any required screenshots in a single `project_runtime.py ... session` pass.
-   - **`TASK-03` (Data Consistency / Heatmap Calculation with Official Fixture)**:
-     - **NO browser, NO web server!**
-     - Check `answers/TASK-03/evidence/task-03-test-data.json` (pre-fetched by Root from the QA store). Never overwrite an official fixture with synthetic data.
-     - Compute the exact metrics required by `challenge/TASK-03.md` and `challenge/TASK-03-submit.schema.json`, write the calculation log to `answers/TASK-03/evidence/`, populate `answers/TASK-03/submit.json` (`status: "DONE"`), commit, and finish in < 90s.
+2. **Fast paths by TASK nature** (decide from the brief and the required evidence, never from the item number):
+   - **Trace / compute / answer fields** (no screenshot required): **no browser, no web server.** Trace or implement the logic, run the targeted test via `project_runtime.py ... run`, write the exact answer fields into `answers/<key>/submit.json` and the calculation log into `answers/<key>/evidence/`, commit.
+   - **Data computation with an official fixture**: use `answers/<key>/evidence/<key.lower()>-test-data.json` (pre-fetched from the QA store; never overwrite it with synthetic data) and compute every field the brief and `challenge/<KEY>-submit.schema.json` require with a script; save the script output as evidence.
+   - **Check runners**: if `challenge/<KEY>-run-checks.*` exists, run it as its header says via `project_runtime.py ... run`, and map `testResults` 1-to-1 to the evidence files the template requires; capture required screenshots in a single `session` pass.
 
 3. **Specification items (write tests / implement a spec)**:
    - Every normative sentence is a rule, including the general statements in the introduction (e.g. "every rule holds for any number of lines in one import and any number of transactions in one change"); hidden checks are named after them. List them before writing cases.
