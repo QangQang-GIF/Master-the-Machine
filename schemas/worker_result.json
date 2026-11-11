@@ -17,7 +17,7 @@
     },
     "status": {
       "type": "string",
-      "enum": ["READY_FOR_REVIEW", "PARTIAL", "DONE", "BLOCKED", "TIMED_OUT", "FAILED", "ESCALATE"]
+      "enum": ["READY_FOR_REVIEW", "BLOCKED", "TIMED_OUT", "FAILED", "ESCALATE"]
     },
     "skill_ids": {
       "type": "array",
@@ -35,8 +35,7 @@
         "properties": {
           "command": { "type": "string" },
           "passed": { "type": "boolean" },
-          "output": { "type": "string" },
-          "exit_code": { "type": ["integer", "null"] }
+          "output": { "type": "string" }
         }
       }
     },
@@ -87,40 +86,8 @@
     "effort": {
       "type": ["string", "null"]
     },
-    "verification_status": {
-      "type": "string",
-      "enum": ["VERIFIED", "EVIDENCE_ONLY", "RECORDED", "UNVERIFIED"],
-      "description": "RECORDED: stored, MVS not passed. VERIFIED: MVS passed with executed commands. EVIDENCE_ONLY: MVS PASS in the answer, no command executed. UNVERIFIED: failed/blocked result or explicit flush."
-    },
-    "cutoff_triggered": {
-      "type": "boolean"
-    },
     "notes": {
       "type": "string"
-    },
-    "worker_id": { "type": "string" },
-    "attempt_id": {
-      "type": ["string", "null"],
-      "description": "Attempt identity from the TaskEnvelope; a result of another attempt is kept for audit only."
-    },
-    "mvs_passed": {
-      "type": "boolean",
-      "description": "Computed by the coordinator: every required scenario PASS in the answer and every executed command passed."
-    },
-    "diagnostic_test_results": {
-      "type": "array",
-      "description": "A failing row blocks VERIFIED unless it has unrelated=true and baseline_log.",
-      "items": {
-        "type": "object",
-        "properties": {
-          "id": { "type": "string" },
-          "command": { "type": "string" },
-          "passed": { "type": "boolean" },
-          "exit_code": { "type": ["integer", "null"] },
-          "unrelated": { "type": "boolean" },
-          "baseline_log": { "type": "string" }
-        }
-      }
     }
   }
 }

@@ -24,7 +24,7 @@ def test_p1_scheduler_priority_tiers(tmp_path):
         {"key": "CR-01", "type": "CR", "points": 140, "status": "OPEN"},      # High score CR
         {"key": "BUG-02", "type": "BUG", "points": 20, "status": "OPEN"},      # Low score BUG
         {"key": "PI-01", "type": "PI", "points": 100, "status": "OPEN"},       # Urgent PI (Tier 1)
-        {"key": "TASK-03", "type": "TASK", "points": 50, "deadline_epoch": now + 120, "status": "OPEN"}, # Emergency (Tier 0)
+        {"key": "TASK-03", "type": "TASK", "points": 50, "deadline_epoch": now + 400, "status": "OPEN"}, # Imminent deadline (Tier 0)
     ]
 
     c.register_projection({
@@ -38,9 +38,9 @@ def test_p1_scheduler_priority_tiers(tmp_path):
     selected_keys = [t["key"] for t in plan["selected"]]
 
     # Selected order must be:
-    # 1. PI-01 (Tier 0: Product Incident, a speed race timed from reveal)
-    # 2. TASK-03 (Tier 1: emergency deadline <= 180s)
-    # 3. BUG-02 (ordinary items are treated alike: same time left -> key order; points are ignored)
-    assert selected_keys[0] == "PI-01"
-    assert selected_keys[1] == "TASK-03"
-    assert selected_keys[2] == "BUG-02"
+    # 1. TASK-03 (Tier 0: emergency deadline <= 180s)
+    # 2. PI-01 (Tier 1: Product Incident fast-track)
+    # 3. CR-01 (Tier 3: Higher ROI than BUG-02: 140/2.5=56 vs 20/1.5=13.3)
+    assert selected_keys[0] == "TASK-03"
+    assert selected_keys[1] == "PI-01"
+    assert selected_keys[2] == "CR-01"

@@ -17,15 +17,14 @@ def test_emergency_cutoff_at_120s(tmp_path):
     subprocess.run(["git", "-C", str(repo), "add", "."], check=True, capture_output=True)
     subprocess.run(["git", "-C", str(repo), "commit", "-m", "init"], check=True, capture_output=True)
 
-    c = NativeTaskCoordinator(tmp_path / "state", repo, repo / "source", "source", "MATCH",
-                              max_workers=3, normal_workers=2)   # two ordinary workers (deadline items are ordinary)
-
+    c = NativeTaskCoordinator(tmp_path / "state", repo, repo / "source", "source", "MATCH")
+    
     # Task 1: deadline slack = 150s (> 120s) -> Should NOT emergency flush
     # Task 2: deadline slack = 90s (<= 120s) -> Should emergency flush
     server_now = 1000
     items = [
-        {"key": "BUG-01", "type": "BUG", "status": "OPEN", "points": 80, "deadline_epoch": 1150},
-        {"key": "BUG-02", "type": "BUG", "status": "OPEN", "points": 100, "deadline_epoch": 1090},
+        {"key": "BUG-01", "type": "BUG", "status": "OPEN", "points": 80, "deadline_epoch": 1300},
+        {"key": "BUG-02", "type": "BUG", "status": "OPEN", "points": 100, "deadline_epoch": 1200},
     ]
     c.register_projection({
         "status": "RUNNING",
@@ -46,13 +45,14 @@ def test_emergency_cutoff_at_120s(tmp_path):
 
     # Run plan_tasks
     plan = c.plan_tasks()
-
-    # Solution v3 S0: no worker is converted into a result by the scheduler; it only requests a flush.
+    
+    # BUG-01 has 300s slack (> 240 s flush) -> stays RUNNING
     assert c.task_details("BUG-01")["phase"] == "RUNNING"
-    assert c.task_details("BUG-02")["phase"] == "RUNNING"
-    assert c.task_details("BUG-02")["workerResult"] is None
-    assert not (wt_2 / "answers" / "BUG-02" / "submit.json").exists()
-    assert "BUG-02" in [r["key"] for r in plan["deadlineFlushRequests"]]
+    # BUG-02 has 200s slack <= 240s -> auto-promoted to READY_TO_INTEGRATE with the deadline flush
+    assert c.task_details("BUG-02")["phase"] == "READY_TO_INTEGRATE"
+    res = c.task_details("BUG-02")["workerResult"]
+    assert res["status"] == "PARTIAL"
+    assert "Hard cutoff triggered at " in res["note"]
 
 
 def test_endgame_lock_release_after_8s(tmp_path):
@@ -164,7 +164,7 @@ def test_global_8s_lock_and_ready_sorting(tmp_path):
     plan = c.plan_tasks()
     assert plan["integrationOwner"] is None
 
-    # 2. Ordinary items are treated alike: same time left -> key order (points are ignored)
+    # 2. readyToIntegrate sorts BUG before CR (fast-track logic)
     ready_keys = [r["key"] for r in plan["readyToIntegrate"]]
     assert ready_keys == ["BUG-01", "CR-01"]
 

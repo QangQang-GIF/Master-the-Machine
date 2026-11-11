@@ -1,55 +1,34 @@
 ---
 name: mtm-cr-worker
-description: CR worker - extract the exact contract (paths, signatures, test ids, UI labels) and the current company standard first, implement the pure logic to the standard with boundary tests, then UI, official data and every evidence item.
+description: Implement and verify an announced MTM change request against specification and MVS inside the ProjectRuntime sandbox.
 ---
 
-# CR — contract first, standard exactly, evidence for every row
+# CR (Change Request — Sandbox Fast Path)
 
-Follow `mtm-init`, `mtm-worker`, `mtm-verification`, `mtm-evidence`. Root owns Start Work, push and Submit.
-Lessons from graded matches: a CR loses all scenario points when its fixture is not the official QA store file
-(CR-01: 0/120); hidden tests (about half the points) check every rule of the KB standard, including formats and edge
-cases (CR-03: 0/55 on three missed normalisation cases); a missing screenshot row is `NOT_RUN` = 0.
+Follow `mtm-init` and `mtm-worker`. Root owns Start Work, integration, push, and Submit.
 
-## 1. Read and extract the contract (first 3–5 minutes)
-From `challenge/<key>.md`, the MVS file, the submit template/schema and provided scripts, write a short checklist:
-- **Fixed API**: module paths, exported function names, signatures and field names, handler names, routes,
-  `data-testid`s, button labels, file names (e.g. `reconciliation-YYYY-MM.csv`). Use them verbatim.
-- **Standard**: which company standard defines the behaviour ("current revision", "maintained by the team in the
-  internal systems"). `kb_search` it, read the CURRENT revision fully and save it as evidence. Every rule in it
-  (eligibility, amounts, rounding, date counting, ordering, encoding/BOM, header, quoting, status values, number
-  formats, null cases) becomes a test case. Never assume a format; never reuse a standard from an earlier match.
-- **Grading map**: which TC is replayed by a test file, which is checked from evidence content, which from a
-  screenshot only, what the hidden tests call, and whether test count / type check are graded.
-- **Data**: the official test data for this item and how it must be loaded (seed script, loader, "fresh budget").
-- **Dependencies**: notes such as "only right on source that also contains BUG-xx fixes"; tell Root early.
-- **Access**: data restricted to signed-in staff etc. is a requirement with its own scenario.
+1. **Mandatory Sandbox Commands**:
+   - Run all CLI/test/seed/check-runner commands via:
+     `python3 "<metadata.project_runtime_path>" --match-root "<match_root>" --match-id "<metadata.match_id>" --worker-id "<worker_id>" run -- <cmd>`
+   - Run all browser/HTTP checks via:
+     `python3 "<metadata.project_runtime_path>" --match-root "<match_root>" --match-id "<metadata.match_id>" --worker-id "<worker_id>" session -- <cmd>`
+   - NEVER manually spawn `pnpm dev`, `pnpm build`, or `pnpm start`.
 
-## 2. Logic first (it carries most points)
-- Implement the calculation as the named pure function, exactly to the standard. Keep it free of UI/DB so hidden
-  tests can call it directly.
-- Copy the official `*-mvs.test.ts` unchanged to the stated path and make it pass.
-- Write NEW tests from the standard, one per rule and boundary (e.g. 0/1/30/31/60/61/90/91 days, month/leap-year
-  crossing, every currency, empty input, special characters and Unicode round-trip, invalid input → null).
-  The grader requires the whole suite passing and more tests than the original suite.
+2. **Fast Paths by CR Archetype**:
+   - **`CR-01` (Invoices CSV Export / Client CSV Import)**:
+     - Verify `answers/CR-01/evidence/cr-01-test-data.json` exists (pre-fetched by Root; NEVER overwrite with synthetic data).
+     - Copy `challenge/CR-01-seed.ts` to `src/prisma/seed-cr01.ts` and run `pnpm tsx prisma/seed-cr01.ts ../answers/CR-01/evidence/cr-01-test-data.json` via `project_runtime.py ... run` to load the official fixture companies and invoices into the database. (Remove `src/prisma/seed-cr01.ts` before `git commit`).
+     - Implement the required feature and unit tests in `src/`.
+     - Run `node ../challenge/CR-01-run-checks.mjs` via `project_runtime.py ... run` to generate `answers/CR-01/evidence/test.log` and `answers/CR-01/evidence/typecheck.log`.
+     - In ONE `project_runtime.py ... session` pass:
+       1. Execute `node ../challenge/CR-01-signed-out-check.mjs http://127.0.0.1:$PORT/api/trpc/accounting.invoices ../answers/CR-01/evidence/tc-04-signed-out-request.txt`.
+       2. Export `tc-01-all-invoices.csv` (all 6 fixture invoices) and `tc-02-filtered-invoices.csv` (filtered to `OVERDUE`).
+       3. Capture `tc-01-accounting-page.png` and `tc-02-filtered-export.png` at `{ width: 1440, height: 900 }`.
+   - **`CR-02` (Accounts Receivable Aging Report) & `CR-03` (Quick-Action Contact Links)**:
+     - **CRITICAL**: Always copy `challenge/CR-02-mvs.test.ts` -> `src/tests/cr-02-mvs.test.ts` (or `challenge/CR-03-mvs.test.ts` -> `src/tests/cr-03-mvs.test.ts`) and include it in your `git commit`! The Grader checks that `src/tests/cr-02-mvs.test.ts` / `src/tests/cr-03-mvs.test.ts` is committed.
+     - Implement the pure calculation/component logic in `src/`.
+     - Run `node ../challenge/CR-02-run-checks.mjs` (or `CR-03-run-checks.mjs`) via `project_runtime.py ... run` so `test.log` and `typecheck.log` are generated with exact headers.
+     - Run ONE 15-second `project_runtime.py ... session` script at `{ width: 1440, height: 900 }` to capture `tc-01-aging-report.png` (or `tc-01-contact-links.png`).
 
-## 3. Then UI / server wiring
-- Add the screen/route/handler with the exact labels, test ids and placement from the brief; keep existing
-  controls working. Respect authentication requirements on every new path.
-- Build and serve the app with the project's own commands (`env-require/README.md` or the provided run-checks),
-  rebuild after every source change.
-
-## 4. Official data and evidence
-- Fetch the official fixture with `fetch_fixture` / the QA store and save it unchanged under the evidence name.
-  Load it exactly as described (seed script, fresh budget, import settings).
-- Produce each evidence file with the provided scripts/commands (logs, CSV downloads, signed-out checks) and the
-  required screenshots at the stated viewport. Generated outputs (CSV, summaries) must come from your submitted
-  source on the official data, not be written by hand.
-- Report summary fields (e.g. `auditSummary`) from that same run.
-
-## 5. Hand off
-- Keep the template rows and fields; `PASS` only with existing evidence and a passing check; honest
-  `FAIL`/`NOT_RUN`; `status` DONE only when all rows pass. Engineering record: design, standard revision applied,
-  edge cases handled.
-- Commit source, new tests, the MVS test copy, evidence and `submit.json`; remove temporary seed copies the brief says
-  not to commit. Run the whole suite and the type check before writing `worker_result.json`.
-- Deadline items: logic + MVS log + submit.json first, then UI evidence, then extra tests.
+3. **Submission**:
+   - Fill `answers/<key>/submit.json` (`status: "DONE"` when all MVS pass, or `"PARTIAL"` if any scenario is `NOT_RUN`), commit all changes in your worktree, and write `worker_result.json` with `status: "READY_FOR_REVIEW"`.

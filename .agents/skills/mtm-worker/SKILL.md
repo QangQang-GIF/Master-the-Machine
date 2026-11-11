@@ -7,13 +7,27 @@ description: Unified autonomous engineering worker for MTM BUG, CR, TASK, and PI
 
 Follow `mtm-init` boundaries, TaskEnvelope constraints, and returned submit template. The root coordinator owns Start Work, integration, push, and Submit.
 
-**First step:** the Root hands you a compact TaskEnvelope. If it has `full_envelope_path`, read that JSON file before anything else: it holds the description, `metadata.start_details` (submit template, MVS, and `delivered_files`: the paths of the delivered files, already written into your worktree under `challenge/` and `answers/<key>/evidence/`), and `metadata.company_context_files` (one file per prefetched KB/log result). Open a delivered or context file only when you need it, and read large data files (fixtures, logs) with a script, never into your context. Everything below that mentions TaskEnvelope fields refers to that file.
+**First step:** if the TaskEnvelope has `full_envelope_path`, read that JSON file first: it holds the description, `metadata.start_details` (submit template, MVS, `delivered_files` already written into your worktree) and `metadata.company_context_files` (one file per prefetched KB/log result). Open a delivered or context file only when needed; read large data (fixtures, logs, archives) with a script, never into your context.
+
+**Running the app (UI scenarios, screenshots, browser exports):** if `metadata.environment_readme` exists, read its browser/serve sections FIRST and follow them exactly (build/serve commands, environment variables, which browser channel). Serve your own instance on your own port with data folders inside your worktree (never another worker's or the root's). On a fresh instance do the first-run steps it names (e.g. set a local test password, confirm it, sign in with it, open/start the budget) inside your capture script; if a sign-in page appears, sign in with the password you set instead of waiting for another button. Never mark a UI scenario NOT_RUN before trying this recipe; if it still fails, put the exact failing step in the evidence.
+
+**Your item only:** do not message other workers. Never edit build/bundler configuration (vite/webpack/tsconfig paths) to change how workspace packages resolve: your `src/node_modules` already resolves workspace packages to YOUR worktree's source. If your brief says your item needs another item's fix (e.g. "right only on source that also contains the BUG-11 fixes"), take it from the root branch once that item is submitted (`git rebase <assigned branch, e.g. main>` in your worktree, never a merge commit; the branch is shared), otherwise cherry-pick that worker's latest commits once, right before your final commit, and say so in your final line. Send the Root one final line when done, no progress messages.
+
+**Credit and time discipline (everything you print stays in your context for every later turn):**
+- Company tools are yours: call `call_company_tool`, `call_company_tools` (many lookups in ONE call, e.g. all KB articles or log queries you need, with `outPath` to keep results out of your context), `collect_logs` (EVERY matching log entry to a file: use it for any count, sum or first/last entry, since `search_logs` returns only ~20 entries per call; absolute `outPath` in your worktree; `PENDING` means call again with the same arguments later) and `fetch_fixture` directly through the `mtm_minimal` MCP tools. Never page `search_logs` day by day or query KB articles one per turn. Your helper forwards them to the Root helper, which holds the credentials and retries timeouts. Never ask the Root to fetch for you.
+- ProjectRuntime `run`/`session` summarise long output (exit code, failing lines with log line numbers, tail, full log path); add `--log answers/<key>/evidence/<name>.log` to keep the full output as evidence. Read only line ranges of a log; never `cat` whole logs.
+- A command silent for 90 s is stopped as hung (exit 124); `run` defaults to 180 s and is capped at 600 s (pass `--timeout` for a known long build). Never start a server through `run` or in the foreground; use `session` for captures.
+- Run the MVS tests and the tests next to your change, with default parallelism. Run a full suite only when the brief requires it, once, at the end.
+- Python runs with UTF-8 (`PYTHONUTF8=1`); read/write files with `encoding="utf-8"`.
+- **Time**: stop by `finish_by_epoch` (check `python -c "import time;print(int(time.time()))"` between steps). Commit early and often (`answers/<key>/` with each step): at the item deadline the helper submits your LAST COMMIT, and for a deadline item the Game Master refuses anything later. Out of time: set unverified scenarios `NOT_RUN`, `status: "PARTIAL"`, commit, write the result.
+- `worker_result.json` goes to `metadata.worker_result_path` (`<match_root>/worker_result.json`), written LAST and NEVER committed (it is git-ignored; never `git add -f` it). Paths in `changed_files`/`evidence_paths` are relative to `match_root` with forward slashes (`answers/<key>/evidence/x.log`, `src/...`), never absolute and never prefixed with the repository folder; `elapsed_seconds` is a number.
+- Before writing `worker_result.json`: every `test_results` row is a real command with `passed: true` and integer `exit_code: 0`; evidence files exist, are nonempty and under `answers/<key>/evidence/`; everything is committed. Diagnostic logs go under `answers/<key>/evidence/` only, never elsewhere in the repository. The Root reads the file itself; your final message is one line.
 
 ## Core Sandbox & Anti-Over-Engineering Rules
 
 1. **Mandatory ProjectRuntime Sandbox Execution (`run` & `session`)**:
-   - Your worktree `src/node_modules` is already pre-linked by `claim_task`. **Never install dependencies or start dev/prod servers by hand; use ProjectRuntime (`run`, `session`, `serve-start`) or the README commands the item names.**
-   - Run ALL test, typecheck, seed, and check-runner commands inside the isolated `ProjectRuntime` sandbox (which injects in-memory secrets, a worker-private `DATABASE_URL` copy of the seeded database, and worker-isolated `TEST_DATABASE_URL`; seeds you load are visible only to your own server and screenshots):
+   - Your worktree `src/node_modules` is already pre-linked by `claim_task`. **NEVER run `pnpm install`, `pnpm build`, `pnpm dev`, or `pnpm start` manually!**
+   - Run ALL test, typecheck, seed, and check-runner commands inside the isolated `ProjectRuntime` sandbox (which injects in-memory secrets, `DATABASE_URL`, and worker-isolated `TEST_DATABASE_URL`):
      ```bash
      python3 "<metadata.project_runtime_path>" --match-root "<match_root>" --match-id "<metadata.match_id>" --worker-id "<worker_id>" run -- <command>
      ```
@@ -22,51 +36,25 @@ Follow `mtm-init` boundaries, TaskEnvelope constraints, and returned submit temp
      python3 "<metadata.project_runtime_path>" --match-root "<match_root>" --match-id "<metadata.match_id>" --worker-id "<worker_id>" session -- <command>
      ```
      Inside your capture script, always read `const baseUrl = \`http://127.0.0.1:\${process.env.PORT || 3000}\`;`.
-   - **Several captures or checks against the app (BUG-01, BUG-02, CR-01, CR-03 …): keep one server for the whole item** instead of one `session` per capture:
-     ```bash
-     python3 "<metadata.project_runtime_path>" --match-root "<match_root>" --match-id "<metadata.match_id>" --worker-id "<worker_id>" serve-start            # dev server, reused if already up
-     python3 "<metadata.project_runtime_path>" ... run -- node capture-all.mjs          # every screenshot / HTTP check in one script, against $PORT
-     python3 "<metadata.project_runtime_path>" ... serve-stop                           # ALWAYS before writing worker_result.json
-     ```
-     `serve-start --server-script start` runs the production server after `pnpm build` (BUG-01 production check). If `serve-start` does not print `"status": "READY"`, or a capture gets "connection refused", fall back to `session`. A `session` call stops the persistent server on the same port, so do not mix them mid-capture.
+     If the project has no `dev` script, pass the real one: `session --server-script <script from package.json> --url <its local URL> -- <command>` (read `package.json` scripts first).
 
 2. **Pre-Fetched Official Fixtures & MVS Tests (Zero Fixture Missing)**:
-   - Root automatically pre-fetches official QA fixtures (`answers/<key>/evidence/<key.lower()>-test-data.json` + `.source.json`) and the KB articles named in the brief (`metadata.company_context_files`) during `start_work` / `claim_task`.
+   - Root automatically pre-fetches official QA fixtures (`answers/<key>/evidence/<key.lower()>-test-data.json` + `.source.json`) and company KB/Logs (`metadata.company_context`) during `start_work` / `claim_task`.
    - Always check `answers/<key>/evidence/<key.lower()>-test-data.json` FIRST. If it exists, **use it directly and NEVER overwrite it with synthetic data!**
-   - If `challenge/<KEY>-mvs.test.ts` exists, copy it unchanged to the path the MVS file names (older projects: `src/tests/<key.lower()>-mvs.test.ts`) and always commit it; the grader replays it.
+   - If `challenge/<KEY>-mvs.test.ts` exists, it is automatically staged at `src/tests/<key.lower()>-mvs.test.ts`. Always keep and commit `src/tests/<key.lower()>-mvs.test.ts` in your `git add` and `changed_files`!
 
-3. **Triage by what the item needs (Zero Over-Engineering)**:
-   - Follow your type skill (`mtm-bug-worker`, `mtm-cr-worker`, `mtm-task-worker`, `mtm-pi-worker`): it says what to
-     read first and in which order to earn points. Use the commands the item's own files give (MVS file, run-checks
-     scripts, `env-require/README.md`); the project may use `yarn`/`node .../vitest.mjs` or `pnpm`.
-   - **No UI evidence required** (pure logic, trace, data, report-only): never start a web server or browser.
-   - **Logs + a few screenshots**: produce logs with the official commands, then ONE server/session pass for all PNGs.
-   - **Official seed/loader + UI**: load the official data with the provided script first, then capture everything in
-     one pass.
+3. **Task-Tier Triage (Zero Over-Engineering)**:
+   - **Tier 1 — Pure Logic / Unit-Test / Trace Tasks (`BUG-03`, `TASK-01`, `TASK-03`, `TASK-04`, `PI-01`)**:
+     - **DO NOT launch any web server or Playwright browser** unless `submit.json` explicitly requires `.png` files in `evidenceFiles`.
+     - Edit source file(s) -> run official check runner or `pnpm test` + `pnpm typecheck` via `project_runtime.py ... run` -> write required text/log evidence -> fill `answers/<key>/submit.json` (`status: "DONE"`) -> commit and finish in under 2 minutes.
+   - **Tier 2 — Logic + Official Check Runner + Single UI Pass (`BUG-04`, `CR-02`, `CR-03`, `TASK-02`)**:
+     - Ensure `src/tests/<key.lower()>-mvs.test.ts` is present and committed.
+     - Run `node ../challenge/<KEY>-run-checks.mjs` via `project_runtime.py ... run` to produce exact `test.log` and `typecheck.log` files (`command: pnpm ...` and `exit_code: 0`).
+     - Run ONE single `project_runtime.py ... session -- node capture.mjs` pass (capped at 45s) to capture required desktop PNG(s).
+   - **Tier 3 — Official Seed + Check Runner + UI Session (`BUG-01`, `BUG-02`, `CR-01`)**:
+     - Copy `challenge/<KEY>-seed.ts` (and `challenge/<KEY>-report.ts` if present) into `src/prisma/` so `~/server/db` resolves cleanly when running `pnpm tsx prisma/seed-*.ts` via `project_runtime.py ... run`.
+     - Seed data directly into DB via Prisma/service scripts BEFORE opening the browser, then capture all required screenshots and HTTP checks in ONE `project_runtime.py ... session` invocation.
 
 4. **Deadline Protection & Output Contract**:
-   - If a UI scenario fails or deadline is within 2 minutes, mark only the uncaptured scenario `NOT_RUN` in `submit.json` (`status: "PARTIAL"`), NEVER fabricate fake/placeholder PNGs, and commit immediately.
+   - If a UI scenario fails or `finish_by_epoch` is reached, mark only the uncaptured scenario `NOT_RUN` in `submit.json` (`status: "PARTIAL"`), NEVER fabricate fake/placeholder PNGs, and commit immediately.
    - Always `git add` and `git commit` all modified source files, `src/tests/<key.lower()>-mvs.test.ts`, `answers/<key>/submit.json`, and `answers/<key>/evidence/*` inside your worktree before writing `worker_result.json`.
-   - **Checkpoint and final result (attempt-scoped)**: while working, atomically rewrite `worker_checkpoint.json` (`version`, `timestamp`, `worker_id`, `attempt_id`, progress) after each passing part; it never ends your task. Write `worker_result.json` atomically (write a temp file, then rename) only when finished, with the envelope's `worker_id` and `attempt_id`. A result from another attempt is rejected.
-   - **Honest test rows**: every executed check stays in `test_results` with `passed=true/false` and its real `exit_code`; never move a failing row elsewhere to obtain DONE. A failure unrelated to your change may go to `diagnostic_test_results` only with `unrelated: true` and `baseline_log` pointing to a log of the same failure on the base commit.
-   - **Deadline flush**: when the Root relays `DEADLINE_FLUSH_REQUESTED`, stop starting new work, commit what passes, set unfinished scenarios honestly (`FAIL`/`NOT_RUN`, status `PARTIAL`), and write the final `worker_result.json` immediately.
-
-5. **Incremental delivery (every item)**:
-   - Plan the acceptance criteria / test cases first, then deliver them in priority order. After each part that genuinely passes, commit it and update `answers/<key>/submit.json` (real PASS/FAIL/NOT_RUN rows, `status: "PARTIAL"` until everything passes).
-   - Do not wait for the whole item to be finished before committing: an uncommitted half-done item scores nothing.
-   - When the budget ends or Root asks you to stop, stop coding, make sure the last committed `submit.json` matches what is really verified, and write `worker_result.json`.
-   - **Production logs**: for any count, first/last entry or sum over logs, use the MCP tool `collect_logs(query, service, outPath)` (it returns every entry, not just the newest 20) and compute with a script over the saved file.
-
-6. **Company tools are yours to call (do not ask the Root)**:
-   - Call `call_company_tool` (`kb_search`, `search_logs`, QA data), `collect_logs` and `fetch_fixture` directly through the `mtm_minimal` MCP tools, or `python -m runner.control company call <name> '<json>'` run from `<team workspace>/team-sdlc-pack`. Your helper forwards them to the Root's helper, which holds the credentials and retries timeouts. KB articles named in the brief are already in `metadata.company_context_files`; query only what is missing.
-   - `collect_logs` needs an absolute `outPath` inside your worktree. A `{"status": "PENDING"}` answer means it is still collecting: do other work, then call again with exactly the same arguments.
-   - If a company tool still fails, record the exact error in `worker_result.json` `notes` and continue with what you have.
-
-7. **Hand-off gate (one Root call per result)**:
-   - Before writing `worker_result.json`, re-run the MVS/test commands you report and check: every `test_results` row has `command` (string), `passed` (true/false) and the real integer `exit_code` (0 when passed); every `evidence_paths` file exists, is nonempty and is under `answers/<key>/evidence/`; `answers/<key>/submit.json` matches what really passed; everything is committed. Status `READY_FOR_REVIEW`/`DONE` only when every announced MVS passes; otherwise `PARTIAL`.
-   - Python checks run with UTF-8 (`PYTHONUTF8=1` is set by ProjectRuntime and the workspace shell); read and write files with `encoding="utf-8"`.
-   - Long output from ProjectRuntime `run`/`session` (and `prepare`) is summarised: exit code, failing lines with their log line numbers, the last lines and the full log path. Add `--log answers/<key>/evidence/<name>.log` (before `--`) to save the full output as evidence in the same call. Read only a line range of a log when the summary is not enough; never `cat` a whole log or test output into your context. Pipe other long commands to a file the same way.
-   - A ProjectRuntime command that prints nothing for 150 s is treated as hung and stopped (exit 124, "no output"); `run` is capped at 900 s and idle at 300 s. Fix the cause (a test waiting on a server, an interactive prompt, a missing `--run`/watch-mode flag) instead of re-running it unchanged.
-   - **Never run a server through `run`** or in the foreground. Start it in the background with `serve-start` (it returns when the URL answers), passing your own command when the project has no suitable script: `... serve-start --url http://127.0.0.1:<port>/ -- node <path-to-server-entry>` (set the server's port/data env vars in the same shell call), then `serve-stop` before hand-off.
-   - **Run targeted tests, not the whole suite.** Run the MVS test files and the test files next to the code you changed (`vitest --run <files>`), with the runner's default parallelism (never `--maxWorkers=1` unless a test needs it). Run the full suite only when the brief explicitly asks for it, once, at the end. In P2RJ4BZU a full single-threaded loot-core run took 5–6 minutes per worker and was killed at the timeout.
-   - The Root reads `worker_result.json` itself; your final message is one line (`<key> <status>`).

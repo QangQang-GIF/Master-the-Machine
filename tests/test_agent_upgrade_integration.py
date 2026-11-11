@@ -309,7 +309,7 @@ def test_sv07_paired_contest_simulator(tmp_path):
                 task_id=tid,
                 status=WorkerStatus.READY_FOR_REVIEW,
                 changed_files=[file_name, test_file_name],
-                test_results=[{"command": test_cmd, "passed": True, "mvs_id": "MVS-1" if tid.startswith("BUG") else "MVS-2"}],
+                test_results=[{"command": test_cmd, "passed": True}],
                 elapsed_seconds=1.2,
                 usage={"normalized_credits": trace.normalized_credits},
             )

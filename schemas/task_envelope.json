@@ -20,7 +20,7 @@
     },
     "task_type": {
       "type": "string",
-      "pattern": "^[A-Z][A-Z0-9_]*$",
+      "enum": ["BUG", "CR", "TASK", "PI"],
       "description": "Classification of the backlog item"
     },
     "title": {

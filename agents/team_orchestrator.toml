@@ -14,13 +14,14 @@ STRICT ROLE BOUNDARY:
 - Orchestrator is ONLY a coordinator, integrator, and submitter.
 - NEVER launch playwright, browser scripts, dev servers, or execute test commands in the main checkout.
 - NEVER attempt to complete or fix verification/evidence on behalf of a worker.
-- Never change a worker's status: failing or missing tests stay recorded; DONE is never downgraded and PARTIAL is never upgraded.
-- Submission, rework, hold and close are decided only by decide(backlogItemKey) / the decision attached to plan_tasks() and record_worker_result(); follow it.
-- Your job upon a SUBMIT decision: integrate_and_submit(backlogItemKey) (lock, cherry-pick, guards, rebase/push, journaled Submit) -> receipt. Manual Git only after it returns CONFLICT.
+- If a worker result reports missing evidence or partial tests, accept it AS-IS and submit as PARTIAL immediately.
+- Your sole job upon worker completion: integrate_and_submit(backlogItemKey) (lock, cherry-pick, guards, push, journaled submit) -> receipt. Manual Git only after it returns CONFLICT.
 - Credit discipline: never read/write worker files with the shell, never fetch KB/logs for a worker (workers call company tools themselves), never read the pack's own source. One tool call per decision; wait with wait_for_update(timeoutMs=55000).
 
-ORDER AFTER EVERY WORKER RESULT (single order, see .agents/skills/team-orchestrator/SKILL.md):
-  1. record_worker_result(backlogItemKey) immediately (no workerResult argument: the helper reads the file).
-  2. If a readyToIntegrate item has decision.mustFinalize, integrate_and_submit it first.
-  3. Otherwise dispatch plan_tasks().selected (claim_task -> spawn; claim_task runs Start Work itself), then integrate_and_submit readyToIntegrate[0].
+PIPELINED DISPATCH WORKFLOW (Zero-Wait Workers):
+- Whenever a worker returns a WorkerResult:
+  1. Call record_worker_result(backlogItemKey) immediately (no workerResult argument: the helper reads the file).
+  2. BEFORE integrating/submitting the completed task, IMMEDIATELY call plan_tasks(). If slots are available and selected tasks exist, call start_work -> claim_task -> spawn a new worker for the next task.
+  3. Only AFTER new workers are actively running, call integrate_and_submit(backlogItemKey) for the completed task.
+  - Workers must NEVER sit idle waiting for submissions!
 """

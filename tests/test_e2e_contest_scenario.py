@@ -142,7 +142,7 @@ def test_section_10_full_contest_simulation_scenario(tmp_path):
                 task_id=task_id,
                 status=WorkerStatus.READY_FOR_REVIEW,
                 changed_files=["payment.py"],
-                test_results=[{"command": "pytest -k test_refund", "passed": True}],
+                test_results=[{"command": "pytest", "passed": True}],
                 evidence_paths=["pi_trace.log"],
                 elapsed_seconds=15.0,
             ), ExecutionTrace(input_tokens=10000, output_tokens=5000), ws_path
@@ -156,7 +156,7 @@ def test_section_10_full_contest_simulation_scenario(tmp_path):
                 task_id=task_id,
                 status=WorkerStatus.READY_FOR_REVIEW,
                 changed_files=["payment.py"],
-                test_results=[{"command": "pytest -k test_charge", "passed": True}],
+                test_results=[{"command": "pytest", "passed": True}],
                 evidence_paths=["test_evidence.log"],
                 elapsed_seconds=22.0,
             ), ExecutionTrace(input_tokens=10000, output_tokens=8000), ws_path

@@ -18,16 +18,9 @@ description: Capture, validate, and reference official MTM evidence artifacts an
     `python3 "<metadata.project_runtime_path>" --match-root "<match_root>" --match-id "<metadata.match_id>" --worker-id "<worker_id>" session -- node <capture_script.mjs>`
   - Inside `<capture_script.mjs>`, connect to `http://127.0.0.1:${process.env.PORT || 3000}`.
 - **Authentication & Fast Playwright Capture**:
-  - Use the credentials the project README/seed defines (the earlier Solova project seeded `morpheusadam95` / `change-me-please`; Actual Budget runs need no login unless its README says so).
+  - Default seed credentials: username/email `morpheusadam95`, password `change-me-please`.
   - Use desktop viewport `{ width: 1440, height: 900 }` (or `{ width: 390, height: 844 }` when mobile is required).
   - Use `{ waitUntil: "domcontentloaded" }` plus `await page.waitForTimeout(800)` instead of `networkidle` whenever possible.
   - Seed required records directly into PostgreSQL via Prisma BEFORE running `session` so the browser only has to log in, navigate to the URL, and take screenshots in < 15 seconds.
 - **Honest Fallback**:
   - Never generate fake/synthetic placeholder PNGs. If a browser check fails after retry, mark that specific test case `NOT_RUN` in `submit.json` (`status: "PARTIAL"`) while keeping all passing code/unit-test scenarios as `PASS`.
-- **Graded lessons**:
-  - A row reported `NOT_RUN` scores 0 even when the function works; a required screenshot is often the cheapest
-    10–15 points of an item, so capture every required PNG (valid, at the stated viewport) before polishing.
-  - Evidence content is checked against YOUR team's official fixture: a fixture that is not the QA store's file
-    zeroes every scenario that uses it.
-  - The grader re-runs the MVS test file, the whole test suite and the type check itself on the submitted revision;
-    logs alone never earn points for those checks.

@@ -31,20 +31,9 @@ def test_invalid_task_envelope_missing_fields():
 def test_invalid_task_envelope_bad_type():
     path = FIXTURES / "sample_task_envelope.json"
     data = json.loads(path.read_text(encoding="utf-8"))
-    data["task_type"] = "not a type!"
+    data["task_type"] = "INVALID_TYPE"
     with pytest.raises(Exception):
         validate_task_envelope(data)
-
-
-def test_heavy_task_type_is_accepted():
-    # Heavy items may arrive with a type other than BUG/CR/TASK/PI.
-    path = FIXTURES / "sample_task_envelope.json"
-    data = json.loads(path.read_text(encoding="utf-8"))
-    data["task_type"] = "HEAVY"
-    try:
-        validate_task_envelope(data)
-    except Exception as exc:  # repository_path of the fixture may not exist here; only the type matters
-        assert "task_type" not in str(exc)
 
 
 def test_valid_worker_result():

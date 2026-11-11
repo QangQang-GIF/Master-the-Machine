@@ -147,7 +147,7 @@ class ProjectRuntime:
     def _build_env(self) -> dict[str, str]:
         # Shell/process configuration is the caller's final override over files.
         env = {**self._raw_env, **os.environ}
-        # Windows workers hit UnicodeDecodeError in Python checks without UTF-8 mode (K2EMUW3I BUG-09 rework).
+        # Windows workers hit UnicodeDecodeError in Python checks without UTF-8 mode.
         env.setdefault("PYTHONUTF8", "1")
         env.setdefault("PYTHONIOENCODING", "utf-8")
         d_temp = Path("D:/Temp")
@@ -263,8 +263,8 @@ class ProjectRuntime:
             raise ValueError("command cwd must stay inside match_root")
         return path
 
-    def run(self, argv: Sequence[str], cwd: str | Path | None = None, timeout: float = 300,
-            _env_overrides: dict[str, str] | None = None) -> CommandResult:
+    def run(self, argv: Sequence[str], cwd: str | Path | None = None, timeout: float = 180,
+            _env_overrides: dict[str, str] | None = None, _setup: bool = False) -> CommandResult:
         if not argv:
             raise ValueError("argv cannot be empty")
         workdir = self._resolve_cwd(cwd)
@@ -279,6 +279,11 @@ class ProjectRuntime:
                 if str(bin_dir) not in path_value.split(os.pathsep):
                     env["PATH"] = str(bin_dir) + (os.pathsep + path_value if path_value else "")
             cmd_args = list(args)
+            bundled = self._bundled_yarn() if cmd_args and Path(cmd_args[0]).name.lower() in {"yarn", "yarn.cmd"} else None
+            if bundled and not shutil.which("yarn"):
+                # RQ3I4OHX: the project ships Yarn 4 (.yarn/releases/yarn-4.x.cjs) and no global yarn exists;
+                # Popen("yarn") raised FileNotFoundError and preparation crashed.
+                cmd_args = [shutil.which("node") or "node", str(bundled), *cmd_args[1:]]
             if sys.platform == "win32" and cmd_args:
                 base_name = cmd_args[0]
                 resolved = None
@@ -294,13 +299,15 @@ class ProjectRuntime:
                         cmd_args = ["cmd.exe", "/c", resolved] + cmd_args[1:]
                     elif Path(resolved).suffix.lower() == ".exe":
                         cmd_args[0] = resolved
-            # Always watched: a hung command (no output) and its whole process tree are stopped. P2RJ4BZU: a
-            # vitest child kept the pipes open past the 300 s timeout (346 s), and a foreground server ran 526 s.
-            # Enabled by the installer (MTM_RUN_IDLE_TIMEOUT=150 in the workspace shell environment).
+            # Enabled by the installer (MTM_RUN_IDLE_TIMEOUT=90 in the workspace shell environment).
             idle = float(os.environ.get("MTM_RUN_IDLE_TIMEOUT", "0") or 0)
-            if idle > 0:
-                idle = min(max(idle, 1.0), float(os.environ.get("MTM_RUN_IDLE_MAX", "300")))
-                timeout = min(float(timeout), float(os.environ.get("MTM_RUN_TIMEOUT_MAX", "900")))
+            if idle > 0 and _setup:
+                # Preparation (install/build) may be silent for minutes (dependency fetch) and run past 10 min:
+                # only a generous hang guard, no worker caps.
+                idle = max(idle, float(os.environ.get("MTM_SETUP_IDLE_TIMEOUT", "600")))
+            elif idle > 0:
+                idle = min(max(idle, 1.0), float(os.environ.get("MTM_RUN_IDLE_MAX", "180")))
+                timeout = min(float(timeout), float(os.environ.get("MTM_RUN_TIMEOUT_MAX", "600")))
                 code, out, err, why = _run_watched(cmd_args, workdir, env, max(0.1, timeout), idle)
                 if why:
                     err = (err + ("\n" if err and not err.endswith("\n") else "")
@@ -310,6 +317,10 @@ class ProjectRuntime:
             result = subprocess.run(cmd_args, cwd=workdir, env=env, shell=False, capture_output=True,
                                     text=True, timeout=max(0.1, timeout), check=False)
             return CommandResult(tuple(self._redact(a) for a in args), str(workdir), result.returncode, self._redact(result.stdout), self._redact(result.stderr))
+        except (FileNotFoundError, PermissionError) as exc:
+            # A missing program is a command result (exit 127), never a crash of the caller.
+            return CommandResult(tuple(self._redact(a) for a in args), str(workdir), 127, "",
+                                 self._redact(f"[mtm] cannot start {args[0]!r}: {exc}. Is it installed / on PATH?\n"))
         except subprocess.TimeoutExpired as exc:
             out = exc.stdout or ""
             err = exc.stderr or ""
@@ -349,6 +360,24 @@ class ProjectRuntime:
             return self.match_root
         return self.app_root
 
+    def _bundled_yarn(self) -> Path | None:
+        """Yarn release committed with the project: .yarnrc.yml yarnPath, else the newest .yarn/releases/*.cjs."""
+        for base in (self.app_root, self.match_root, self.match_root / "src"):
+            rc = base / ".yarnrc.yml"
+            try:
+                if rc.is_file():
+                    for line in rc.read_text(encoding="utf-8").splitlines():
+                        if line.strip().startswith("yarnPath:"):
+                            cand = (base / line.split(":", 1)[1].strip().strip("'\"")).resolve()
+                            if cand.is_file():
+                                return cand
+                releases = sorted((base / ".yarn" / "releases").glob("yarn-*.cjs"))
+                if releases:
+                    return releases[-1]
+            except OSError:
+                continue
+        return None
+
     def _package_manager(self) -> str:
         manifest = self._manifest()
         manager = str(manifest.get("packageManager", ""))
@@ -387,189 +416,65 @@ class ProjectRuntime:
                 results.append(create)
         return results
 
-    # ---- Per-worker application database -------------------------------------------------
-    # Workers used to share one DATABASE_URL (<base>_<match>): every worker's QA seed, dev server
-    # and screenshots read and wrote the same rows, so one item's fixture data polluted another's
-    # evidence. A worker now gets its own copy, cloned from a pristine template the root prepares.
-    # The shared database remains the fallback whenever a private copy cannot be made.
-
-    def worker_db_isolation_enabled(self) -> bool:
-        return (self.worker_id != "main" and bool(self.env.get("DATABASE_URL"))
-                and os.environ.get("MTM_WORKER_DB_ISOLATION", "1") != "0")
-
-    def _db_target(self, url: str) -> dict:
-        parts = urlsplit(url)
-        name = (parts.path or "").lstrip("/")
-        if not _IDENT.fullmatch(name):
-            raise ValueError("invalid derived database name")
-        return {"parts": parts, "name": name, "user": parts.username or "",
-                "host": parts.hostname or "localhost", "port": str(parts.port or 5432),
-                "pw": {"PGPASSWORD": parts.password} if parts.password else None}
-
-    def _with_db_name(self, url: str, name: str) -> str:
-        parts = urlsplit(url)
-        return urlunsplit((parts.scheme, parts.netloc, "/" + name, parts.query, parts.fragment))
-
-    def template_db_name(self, shared_url: str | None = None) -> str:
-        return self._bounded_db_name(self._db_target(shared_url or self.env["DATABASE_URL"])["name"], "tpl")
-
-    def worker_app_db_name(self, shared_url: str | None = None) -> str:
-        return self._bounded_db_name(self._db_target(shared_url or self.env["DATABASE_URL"])["name"], f"{self.worker_id}_app")
-
-    def _pg(self, tool: str, t: dict, *args: str, timeout: float = 15) -> CommandResult:
-        return self.run([tool, "-w", "-h", t["host"], "-p", t["port"], "-U", t["user"], *args],
-                        timeout=timeout, _env_overrides=t["pw"])
-
-    def _db_exists(self, t: dict, name: str) -> bool:
-        res = self._pg("psql", t, "-d", "postgres", "-Atqc", f"SELECT 1 FROM pg_database WHERE datname = '{name}'", timeout=5)
-        return res.ok and res.stdout.strip() == "1"
-
-    def refresh_template_database(self) -> CommandResult | None:
-        """Root only, right after migrate+seed: snapshot the pristine shared DB as the worker template."""
-        if self.worker_id != "main" or not self.env.get("DATABASE_URL") or os.environ.get("MTM_WORKER_DB_ISOLATION", "1") == "0":
-            return None
-        try:
-            t = self._db_target(self.env["DATABASE_URL"])
-            if not t["user"]:
-                return None
-            tpl = self.template_db_name()
-            self._pg("dropdb", t, "--if-exists", tpl, timeout=20)
-            return self._pg("createdb", t, "-T", t["name"], tpl, timeout=60)
-        except Exception as exc:  # never fail preparation because of the optional template
-            sys.stderr.write(f"[mtm] worker template database not created: {exc}\n")
-            return None
-
-    def ensure_worker_app_database(self) -> str:
-        """Point DATABASE_URL at this worker's private copy, creating it on first use.
-
-        Order: existing copy -> clone of the pristine template -> clone of the shared DB -> empty DB
-        with migrate + seed. If all of these fail the shared database is kept (previous behaviour),
-        so a worker is never left without a database. Returns what happened, for diagnostics.
-        """
-        if not self.worker_db_isolation_enabled():
-            return "disabled"
-        shared_url = self.env["DATABASE_URL"]
-        try:
-            t = self._db_target(shared_url)
-            if not t["user"]:
-                return "shared:no-role"
-            name = self.worker_app_db_name(shared_url)
-            worker_url = self._with_db_name(shared_url, name)
-            if self._db_exists(t, name):
-                self.env["DATABASE_URL"] = worker_url
-                return "existing"
-            for source in (self.template_db_name(shared_url), t["name"]):
-                if not self._db_exists(t, source):
-                    continue
-                for attempt in range(3):
-                    if self._pg("createdb", t, "-T", source, name, timeout=60).ok or self._db_exists(t, name):
-                        self.env["DATABASE_URL"] = worker_url
-                        return f"cloned:{'template' if source != t['name'] else 'shared'}"
-                    time.sleep(0.5 * (attempt + 1))  # template briefly in use by a parallel clone
-            created = self._pg("createdb", t, name, timeout=30)
-            if not (created.ok or self._db_exists(t, name)):
-                return "shared:create-failed"
-            self.env["DATABASE_URL"] = worker_url
-            scripts = self._manifest().get("scripts", {})
-            steps = []
-            if "db:deploy" in scripts:
-                steps.append(self._package_cmd("run", "db:deploy"))
-            elif (self.app_root / "prisma" / "migrations").is_dir():
-                steps.append(self._package_cmd("exec", "prisma", "migrate", "deploy"))
-            if "db:seed" in scripts:
-                steps.append(self._package_cmd("run", "db:seed"))
-            for step in steps:
-                if not self.run(step, timeout=300).ok:
-                    self.env["DATABASE_URL"] = shared_url
-                    self._pg("dropdb", t, "--if-exists", name, timeout=20)
-                    return "shared:migrate-failed"
-            return "created:migrated"
-        except Exception as exc:
-            self.env["DATABASE_URL"] = shared_url
-            return f"shared:error:{type(exc).__name__}"
-
-    # ---- prisma generate in workers ------------------------------------------------------
-    # Worker worktrees link src/node_modules to the root checkout, so the generated Prisma client
-    # is shared and the root already generated it during preparation. Regenerating from a worker
-    # rewrites the shared engine DLL while other workers' servers hold it open (EPERM on Windows)
-    # and costs time. Workers therefore skip it unless they changed the Prisma schema.
-
-    @staticmethod
-    def is_prisma_generate(argv: Sequence[str]) -> bool:
-        words = [str(a).lower() for a in argv]
-        return "prisma" in words and words.index("prisma") + 1 < len(words) and words[words.index("prisma") + 1] == "generate"
-
-    def worker_schema_changed(self) -> bool:
-        try:
-            res = subprocess.run(["git", "-C", str(self.app_root), "status", "--porcelain", "--", "prisma"],
-                                 capture_output=True, text=True, timeout=10, check=False)
-            if res.returncode != 0:
-                return True  # cannot tell: be safe and generate
-            if res.stdout.strip():
-                return True
-            # Committed schema changes: compare with the commit this worktree started from
-            # (the oldest entry of the worktree's HEAD reflog).
-            log = subprocess.run(["git", "-C", str(self.app_root), "reflog", "--format=%H", "HEAD"],
-                                 capture_output=True, text=True, timeout=10, check=False)
-            entries = log.stdout.split() if log.returncode == 0 else []
-            if not entries:
-                return False
-            diff = subprocess.run(["git", "-C", str(self.app_root), "diff", "--name-only", entries[-1], "HEAD", "--", "prisma"],
-                                  capture_output=True, text=True, timeout=10, check=False)
-            return diff.returncode != 0 or bool(diff.stdout.strip())
-        except (OSError, subprocess.TimeoutExpired):
-            return True
-
-    def skip_worker_prisma_generate(self) -> bool:
-        return (self.worker_id != "main" and os.environ.get("MTM_WORKER_PRISMA_GENERATE", "0") != "1"
-                and not self.worker_schema_changed())
-
     def prepare(self) -> list[CommandResult]:
         """Install dependencies; only the root worker provisions/migrates/seeds and builds."""
         results: list[CommandResult] = []
         manifest = self._manifest()
+        env_dir = self.match_root / "env-require"
+        ps1, sh = env_dir / "prepare-source.ps1", env_dir / "prepare-source.sh"
+        official = None
+        if sys.platform == "win32" and ps1.is_file():
+            shell = shutil.which("pwsh") or shutil.which("powershell") or "pwsh"
+            official = [shell, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(ps1)]
+        elif sh.is_file():
+            official = [shutil.which("bash") or "bash", str(sh)]
+        elif ps1.is_file() and shutil.which("pwsh"):
+            official = [shutil.which("pwsh"), "-NoProfile", "-File", str(ps1)]
+        if self.worker_id == "main" and official:
+            # The exam's own documented setup (RQ3I4OHX: bundled Yarn install + build) beats a generic guess.
+            results.append(self.run(official, cwd=self.match_root, timeout=1800, _setup=True))
+            if not results[-1].ok:
+                return results
+            doctor = self.doctor_command()
+            if doctor:
+                results.append(self.run(doctor, cwd=self.doctor_cwd(), timeout=120, _setup=True))
+            return results
         if manifest:
             pm = self._package_manager()
             if pm == "pnpm": install = ["pnpm", "install", "--frozen-lockfile"]
             elif pm == "npm": install = ["npm", "ci"] if (self.app_root / "package-lock.json").exists() else ["npm", "install"]
             elif pm == "yarn": install = ["yarn", "install", "--immutable"]
             else: install = [pm, "install"]
-            results.append(self.run(install, timeout=600))
+            results.append(self.run(install, timeout=600, _setup=True))
             if not results[-1].ok: return results
             if any((self.app_root / p).exists() for p in ("prisma/schema.prisma", "prisma/schema")):
                 if self.worker_id != "main":
-                    if self.skip_worker_prisma_generate():
-                        print("[mtm] prisma generate skipped: the root already generated the shared client and the schema is unchanged", file=sys.stderr)
-                    else:
-                        results.append(self.run(self._package_cmd("exec", "prisma", "generate"), timeout=180))
+                    results.append(self.run(self._package_cmd("exec", "prisma", "generate"), timeout=180, _setup=True))
                     return results
                 results.extend(self._ensure_scoped_databases())
                 for script in ("db:generate",):
                     if script in manifest.get("scripts", {}):
-                        results.append(self.run(self._package_cmd("run", script), timeout=180))
+                        results.append(self.run(self._package_cmd("run", script), timeout=180, _setup=True))
                         if not results[-1].ok: return results
-                results.append(self.run(self._package_cmd("exec", "prisma", "generate"), timeout=180))
+                results.append(self.run(self._package_cmd("exec", "prisma", "generate"), timeout=180, _setup=True))
                 if not results[-1].ok: return results
                 if "db:deploy" in manifest.get("scripts", {}):
-                    results.append(self.run(self._package_cmd("run", "db:deploy"), timeout=300))
+                    results.append(self.run(self._package_cmd("run", "db:deploy"), timeout=300, _setup=True))
                 elif (self.app_root / "prisma" / "migrations").is_dir():
-                    results.append(self.run(self._package_cmd("exec", "prisma", "migrate", "deploy"), timeout=300))
+                    results.append(self.run(self._package_cmd("exec", "prisma", "migrate", "deploy"), timeout=300, _setup=True))
                 if results and not results[-1].ok: return results
                 if "db:seed" in manifest.get("scripts", {}):
-                    results.append(self.run(self._package_cmd("run", "db:seed"), timeout=300))
+                    results.append(self.run(self._package_cmd("run", "db:seed"), timeout=300, _setup=True))
                     if not results[-1].ok: return results
-                tpl = self.refresh_template_database()
-                if tpl is not None and not tpl.ok:
-                    sys.stderr.write(f"[mtm] worker template database not created: {tpl.stderr[:200]}\n")
         if self.worker_id != "main":
             return results
         doctor = self.doctor_command()
         if doctor:
-            results.append(self.run(doctor, cwd=self.doctor_cwd(), timeout=120))
+            results.append(self.run(doctor, cwd=self.doctor_cwd(), timeout=120, _setup=True))
             if not results[-1].ok: return results
         build = self.build_command()
         if build:
-            results.append(self.run(build, timeout=600))
+            results.append(self.run(build, timeout=600, _setup=True))
         return results
 
 
@@ -582,31 +487,20 @@ def main(argv: Sequence[str] | None = None) -> int:
     sub.add_parser("prepare")
     run_parser = sub.add_parser("run")
     run_parser.add_argument("--cwd")
-    run_parser.add_argument("--timeout", type=float, default=300)
-    run_parser.add_argument("--idle-timeout", type=float, help="Stop the command after this many seconds without output (default MTM_RUN_IDLE_TIMEOUT)")
+    run_parser.add_argument("--timeout", type=float, default=180)
+    run_parser.add_argument("--idle-timeout", type=float, help="Stop after this many seconds without output (capped)")
     run_parser.add_argument("--log", help="Also write the full output to this file (e.g. an evidence log)")
     run_parser.add_argument("--full", action="store_true", help="Print the full output instead of a summary")
     run_parser.add_argument("command", nargs=argparse.REMAINDER)
     session_parser = sub.add_parser("session", help="Run one local server and evidence/check command with shared ephemeral config")
     session_parser.add_argument("--server-script", default="dev")
     session_parser.add_argument("--url")
-    session_parser.add_argument("--timeout", type=float, default=300)
+    session_parser.add_argument("--timeout", type=float, default=180)
     session_parser.add_argument("--log", help="Also write the full output to this file")
     session_parser.add_argument("--full", action="store_true", help="Print the full output instead of a summary")
     session_parser.add_argument("command", nargs=argparse.REMAINDER)
-    serve_parser = sub.add_parser("serve-start", help="Start (or reuse) one local server for this worker and leave it running")
-    serve_parser.add_argument("--server-script", default="dev")
-    serve_parser.add_argument("--url")
-    serve_parser.add_argument("--timeout", type=float, default=90)
-    serve_parser.add_argument("command", nargs=argparse.REMAINDER,
-                              help="Optional server command after --, when the project has no suitable package script")
-    sub.add_parser("serve-stop", help="Stop this worker's persistent server")
     args = parser.parse_args(argv)
     runtime = ProjectRuntime(args.match_root, args.match_id, args.worker_id)
-    if runtime.worker_db_isolation_enabled():
-        outcome = runtime.ensure_worker_app_database()
-        if outcome != "existing":
-            print(f"[mtm] worker app database: {outcome}", file=sys.stderr)
     if args.action == "prepare":
         results = runtime.prepare()
         for result in results:
@@ -614,44 +508,22 @@ def main(argv: Sequence[str] | None = None) -> int:
             emit_output(result.stdout, result.stderr, result.returncode, None, label="prepare", runtime=runtime)
             if not result.ok: return result.returncode or 1
         return 0
-    def server_command(script: str) -> list[str]:
+    command = list(args.command)
+    if command[:1] == ["--"]: command = command[1:]
+    started = time.monotonic()
+    if args.action == "session":
         scripts = runtime._manifest().get("scripts", {})
-        if script not in scripts:
+        if args.server_script not in scripts:
             raise ValueError("Server script must be declared by the current project")
-        server = runtime._package_cmd("run", script)
+        server = runtime._package_cmd("run", args.server_script)
         manifest = runtime._manifest()
         if "next" in {**manifest.get("dependencies", {}), **manifest.get("devDependencies", {})}:
             if runtime._package_manager() == "npm":
                 server.append("--")
             server.extend(["--hostname", "127.0.0.1", "--port", runtime.env["PORT"]])
-        return server
-
-    if args.action in ("serve-start", "serve-stop"):
-        import json as _json
-        sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-        from runner.web_session import start_background_server, stop_background_server
-        if args.action == "serve-stop":
-            print(_json.dumps(stop_background_server(runtime)))
-            return 0
-        custom = list(getattr(args, "command", []) or [])
-        if custom[:1] == ["--"]:
-            custom = custom[1:]
-        res = start_background_server(runtime, custom or server_command(args.server_script), readiness_url=args.url,
-                                      readiness_timeout=args.timeout)
-        print(_json.dumps(res))
-        return 0 if res.get("status") == "READY" else 1
-    command = list(args.command)
-    if command[:1] == ["--"]: command = command[1:]
-    started = time.monotonic()
-    if args.action == "session":
-        server = server_command(args.server_script)
         sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
         from runner.web_session import run_web_session
         result = run_web_session(runtime, server, command, readiness_url=args.url, timeout=args.timeout)
-    elif runtime.is_prisma_generate(command) and runtime.skip_worker_prisma_generate():
-        print("[mtm] prisma generate skipped: the root already generated the shared client and the schema is unchanged; "
-              "run it only after changing prisma/ (set MTM_WORKER_PRISMA_GENERATE=1 to force)")
-        return 0
     else:
         if getattr(args, "idle_timeout", None) is not None:
             os.environ["MTM_RUN_IDLE_TIMEOUT"] = str(args.idle_timeout)

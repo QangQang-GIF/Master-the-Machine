@@ -208,51 +208,48 @@ def install_pack(source_dir: Path, workspace_dir: Path) -> None:
     src_posix = (target_pack_dir / "src").as_posix()
     sep = ";" if sys.platform.startswith("win") else ":"
 
-    # Worker capacity: 3 ordinary workers + up to 5 PI workers (ordinary items never use PI slots).
-    # NORMAL < MAX is required: the one shared slot above NORMAL plus PI_BURST slots give PIs 1 + 4 = 5,
-    # and MTM_PI_MAX_WORKERS caps PIs at 5 even when ordinary slots are idle.
-    normal_workers = int(os.environ.get("MTM_INSTALL_NORMAL_WORKERS", "3"))
-    pi_max = int(os.environ.get("MTM_INSTALL_PI_WORKERS", "5"))
-    max_workers = normal_workers + 1
-    pi_burst = max(0, min(8, pi_max - 1))
-    worker_model = os.environ.get("MTM_INSTALL_WORKER_MODEL", "gpt-6.1-sol")
-    worker_effort = os.environ.get("MTM_INSTALL_WORKER_EFFORT", "low")
-    threads = normal_workers + pi_max + 2   # workers + root + one spare
+    # Three lanes, every worker on gpt-6.1-sol medium: 3 normal slots (any item), 3 slots only for items
+    # with a deadline, 3 slots only for PIs; deadline/PI items overflow into normal (10 threads = 9 + root). Credit/latency limits from the K2EMUW3I/P2RJ4BZU fixes.
     codex_toml = f"""[features]
 multi_agent = true
 multi_agent_v2 = true
 
 [agents]
 enabled = true
-max_concurrent_threads_per_session = {threads}
-default_subagent_model = "{worker_model}"
-default_subagent_reasoning_effort = "{worker_effort}"
+max_concurrent_threads_per_session = 10
+default_subagent_model = "gpt-6.1-sol"
+default_subagent_reasoning_effort = "medium"
 
 [shell_environment_policy]
-set = {{ PYTHONUTF8 = "1", PYTHONIOENCODING = "utf-8", MTM_RUN_IDLE_TIMEOUT = "150" }}
+set = {{ PYTHONUTF8 = "1", PYTHONIOENCODING = "utf-8", MTM_RUN_IDLE_TIMEOUT = "90" }}
 
 [mcp_servers.mtm_minimal]
 command = "{python_exe}"
 args = ["-m", "runner.mcp_server"]
 cwd = "{target_posix}"
 startup_timeout_sec = 15
-tool_timeout_sec = 120
+tool_timeout_sec = 300
+# The pack's own helper: its tools run without the per-call auto-review (2SAFTO0S: 161 reviews, all allowed,
+# ~2.4 s each before every Root and worker MCP call).
+default_tools_approval_mode = "approve"
 
 [mcp_servers.mtm_minimal.env]
 PYTHONPATH = "{src_posix}{sep}{target_posix}"
 MTM_NATIVE_COORDINATION = "1"
-MTM_NATIVE_MAX_WORKERS = "{max_workers}"
-MTM_NATIVE_NORMAL_WORKERS = "{normal_workers}"
-MTM_PI_BURST_SLOTS = "{pi_burst}"
-MTM_PI_MAX_WORKERS = "{pi_max}"
-MTM_EXPECTED_WORKER_CONFIG = "{max_workers}/{normal_workers}/{pi_burst}"
-MTM_WORKER_MODEL = "{worker_model}"
-MTM_WORKER_EFFORT = "{worker_effort}"
+MTM_NATIVE_MAX_WORKERS = "4"
+MTM_NATIVE_NORMAL_WORKERS = "3"
+MTM_DEADLINE_SLOTS = "3"
+MTM_PI_BURST_SLOTS = "3"
+MTM_WORKER_MODEL = "gpt-6.1-sol"
+MTM_WORKER_EFFORT = "medium"
 MTM_ENV = "production"
 PYTHONUTF8 = "1"
 MTM_COMPANY_TOOL_TIMEOUT = "10"
-MTM_SUBMIT_UNKNOWN_TTL = "30"
-MTM_RUN_IDLE_TIMEOUT = "150"
+MTM_RUN_IDLE_TIMEOUT = "90"
+MTM_GM_SUBMIT_TIMEOUT = "30"
+MTM_GM_START_TIMEOUT = "30"
+MTM_DEADLINE_FLUSH_SECONDS = "240"
+MTM_LANE_BORROW = "0"
 """
     (codex_dir / "config.toml").write_text(codex_toml, encoding="utf-8")
     (target_pack_dir / ".codex").mkdir(parents=True, exist_ok=True)

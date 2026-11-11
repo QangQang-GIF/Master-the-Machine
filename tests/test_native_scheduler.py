@@ -116,15 +116,14 @@ def test_official_clock_required_and_deadline_excludes_closed(coordinator):
     c = coordinator
     c.register_projection({'status': 'RUNNING', 'items': [item()]})
     assert not c.plan_tasks()['selected']
-    projection(c, item(deadline_epoch=999_999), item('TASK-01', status='CLOSED'), item('PI-01', deadline_epoch=1_000_150))
+    projection(c, item(deadline_epoch=999_999), item('TASK-01', status='CLOSED'), item('PI-01', deadline_epoch=1_000_400))
     assert [t['key'] for t in c.plan_tasks()['selected']] == ['PI-01']
 
 
 def test_nearest_urgent_deadline_precedes_score(coordinator):
     c = coordinator
-    c.max_workers, c.normal_workers = 4, 3
-    projection(c, item(deadline_epoch=1_000_500, points=1000), item('CR-01', deadline_epoch=1_000_200, points=1))
-    assert [t['key'] for t in c.plan_tasks()['selected']] == ['CR-01', 'BUG-01']   # least time left, points ignored
+    projection(c, item(deadline_epoch=1_000_900, points=1000), item('CR-01', deadline_epoch=1_000_400, points=1))
+    assert [t['key'] for t in c.plan_tasks()['selected']] == ['CR-01', 'BUG-01']
 
 
 def test_dependency_and_path_overlap(coordinator):
@@ -174,13 +173,11 @@ def test_symlink_evidence_escape(coordinator, tmp_path):
 
 def test_lock_survives_restart_until_receipt(coordinator):
     c = coordinator
-    c.pi_integration_gate_seconds = 0   # this test is about lock ownership, not PI-first ordering
     projection(c, item(), item('PI-01'))
     for key in ['BUG-01', 'PI-01']:
         start(c, key); c.claim_task(key, key); c.record_worker_result(key, result(key))
     c.begin_integration('BUG-01'); c.end_integration('BUG-01')
-    other = NativeTaskCoordinator(c.db_path.parent, c.checkout_root, c.match_root, 'source', 'MATCH',
-                                  pi_integration_gate_seconds=0)
+    other = NativeTaskCoordinator(c.db_path.parent, c.checkout_root, c.match_root, 'source', 'MATCH')
     with pytest.raises(NativeCoordinationError, match='lock'):
         other.begin_integration('PI-01')
     with pytest.raises(NativeCoordinationError, match='receipt'):
@@ -368,7 +365,6 @@ def test_paused_ready_omitted_from_dispatch_preserving_diagnostics(coordinator):
 
 def test_closed_live_integration_keeps_lock_until_explicit_recovery(coordinator):
     c = coordinator
-    c.pi_integration_gate_seconds = 0   # this test is about lock ownership, not PI-first ordering
     projection(c, item(), item('PI-01'))
     complete(c, 'BUG-01', 'one'); complete(c, 'PI-01', 'two')
     c.begin_integration('BUG-01')
@@ -394,8 +390,7 @@ def test_stale_clock_does_not_terminalize_ready_result(coordinator):
     assert c.task_details('BUG-01')['phase'] == 'READY_TO_INTEGRATE'
 
 
-def test_overdue_worker_retains_slot_until_confirmed_native_stop(coordinator, monkeypatch):
-    monkeypatch.setenv('MTM_WORKER_BUDGET_MODE', 'estimate')  # exercises the estimate-based budget
+def test_overdue_worker_retains_slot_until_confirmed_native_stop(coordinator):
     c = coordinator
     projection(c, item(), item('TASK-01'))
     start(c, 'BUG-01'); c.claim_task('BUG-01', 'worker', estimated_seconds=10)
@@ -411,8 +406,7 @@ def test_overdue_worker_retains_slot_until_confirmed_native_stop(coordinator, mo
         c.reconcile_worker('BUG-01', confirmed_stopped=False, reason='budget exceeded', requeue=True)
 
 
-def test_overdue_budget_excludes_official_pause_duration(coordinator, monkeypatch):
-    monkeypatch.setenv('MTM_WORKER_BUDGET_MODE', 'estimate')  # exercises the estimate-based budget
+def test_overdue_budget_excludes_official_pause_duration(coordinator):
     c = coordinator
     projection(c, item()); start(c, 'BUG-01'); c.claim_task('BUG-01', 'worker', estimated_seconds=10)
     c.register_projection({'status': 'PAUSED', 'server_epoch': 1_000_005,

@@ -163,7 +163,7 @@ def test_worker_prepare_installs_and_generates_without_database_mutations(tmp_pa
     runtime = ProjectRuntime(root, "m1", "worker-1")
     calls = []
 
-    def fake_run(argv, cwd=None, timeout=300, _env_overrides=None):
+    def fake_run(argv, cwd=None, timeout=300, _env_overrides=None, _setup=False):
         calls.append(list(argv))
         return CommandResult(tuple(argv), str(cwd or app), 0, "", "")
 

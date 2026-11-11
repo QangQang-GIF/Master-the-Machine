@@ -15,7 +15,7 @@ from pathlib import Path
 import pytest
 
 from runner.mcp_server import MCPHelperServer, compact_plan, kb_article_ids
-from mtm_competition.scheduling.native import NativeTaskCoordinator, normalize_test_row, describe_test_row_problem
+from mtm_competition.scheduling.native import NativeTaskCoordinator, normalize_test_row, passing_row_problem
 from mtm_competition.integration.git_guard import PreSubmissionGitGuard
 from mtm_competition.tasks.journal import SubmissionJournal
 
@@ -153,17 +153,6 @@ def test_submit_work_fills_answer_revision_and_id_from_disk(native_server):
     assert server.native.task_details("TASK-01")["phase"] == "SUBMITTED"
 
 
-def test_test_row_normalization_is_lossless():
-    assert normalize_test_row({"command": "x", "passed": "false", "exit_code": "1"}) == \
-        {"command": "x", "passed": False, "exit_code": 1}
-    assert normalize_test_row({"command": "x", "passed": True, "exit_code": 0.0})["exit_code"] == 0
-    # nothing is invented
-    assert "exit_code" not in normalize_test_row({"command": "x", "passed": False})
-    assert describe_test_row_problem({"command": "x", "passed": True, "exit_code": 2}) == "passed=true needs exit_code=0"
-    assert describe_test_row_problem({"command": "", "passed": True, "exit_code": 0}) == "missing command"
-    assert describe_test_row_problem({"command": "x", "passed": "yes", "exit_code": 0}) == "passed must be true/false"
-
-
 def test_company_tool_bridge_serves_worker_sessions(tmp_path, monkeypatch):
     bridge = tmp_path / "bridge"
     monkeypatch.setenv("MTM_COMPANY_BRIDGE_DIR", str(bridge))
@@ -237,34 +226,6 @@ def test_compact_plan_has_no_paths_duplicates_or_empty_lists():
     assert "worktreeRoot" not in json.dumps(out)
 
 
-def test_pi_worker_cap(tmp_path):
-    repo = tmp_path / "checkout"
-    (repo / "project").mkdir(parents=True)
-    git(repo, "init", "-b", "main")
-    git(repo, "config", "user.email", "t@example.invalid")
-    git(repo, "config", "user.name", "t")
-    (repo / "project" / "a.txt").write_text("a")
-    git(repo, "add", ".")
-    git(repo, "commit", "-m", "base")
-    c = NativeTaskCoordinator(tmp_path / "state", repo, repo / "project", "project", "MATCH",
-                              max_workers=4, normal_workers=3, pi_burst_slots=4, pi_max_workers=5)
-    items = [{"key": f"PI-{i:02d}", "type": "PI", "status": "OPEN", "points": 10} for i in range(1, 8)]
-    items += [{"key": f"TASK-{i:02d}", "type": "TASK", "status": "OPEN", "points": 10} for i in range(1, 5)]
-    c.register_projection({"status": "RUNNING", "server_epoch": time.time(), "remaining_seconds": 2400, "items": items})
-    selected = c.plan_tasks()["selected"]
-    assert sum(t["type"] == "PI" for t in selected) == 5
-    assert sum(t["type"] != "PI" for t in selected) <= 3
-
-
-def test_claim_task_starts_work_itself(native_server):
-    """The Root dispatches with one call: claim_task runs Start Work when it has not run yet."""
-    server = native_server
-    assert [t["key"] for t in server.plan_tasks()["selected"]] == ["TASK-01"]
-    claim = server.claim_task("TASK-01", "worker-01", 120)
-    assert (Path(claim["matchRoot"]) / "challenge/TASK-01-spec.md").read_text() == "Document the new behavior."
-    assert server.native.task_details("TASK-01")["phase"] == "RUNNING"
-
-
 def test_long_command_output_is_summarised_with_full_log(tmp_path, monkeypatch, capsys):
     from runner import project_runtime as pr
     big = "\n".join(f"test case {i} ... ok" for i in range(5000)) + \
@@ -333,3 +294,166 @@ def test_watchdog_caps_worker_overrides(tmp_path, monkeypatch):
     t0 = time.monotonic()
     res = rt.run([_sys.executable, "-c", "import time; time.sleep(30)"], timeout=60)
     assert res.timed_out and time.monotonic() - t0 < 15
+
+
+def test_test_row_normalization_is_lossless():
+    assert normalize_test_row({"command": "x", "passed": "true", "exit_code": "0"}) == \
+        {"command": "x", "passed": True, "exit_code": 0}
+    assert "exit_code" not in normalize_test_row({"command": "x", "passed": True})       # nothing invented
+    assert passing_row_problem({"command": "x", "passed": True, "exit_code": 2}) == "exit_code must be the integer 0"
+    assert passing_row_problem({"command": "", "passed": True, "exit_code": 0}) == "missing command"
+
+
+def test_pi_burst_slots_add_workers_only_for_pi(tmp_path, monkeypatch):
+    monkeypatch.setenv("MTM_PI_BURST_SLOTS", "2")
+    repo = tmp_path / "checkout"
+    (repo / "project").mkdir(parents=True)
+    git(repo, "init", "-b", "main")
+    git(repo, "config", "user.email", "t@example.invalid")
+    git(repo, "config", "user.name", "t")
+    (repo / "project" / "a.txt").write_text("a")
+    git(repo, "add", ".")
+    git(repo, "commit", "-m", "base")
+    c = NativeTaskCoordinator(tmp_path / "state", repo, repo / "project", "project", "MATCH",
+                              max_workers=5, normal_workers=4)
+    items = [{"key": f"TASK-{i:02d}", "type": "TASK", "status": "OPEN", "points": 10} for i in range(1, 8)]
+    items += [{"key": "PI-02", "type": "PI", "status": "OPEN", "points": 90},
+              {"key": "PI-03", "type": "PI", "status": "OPEN", "points": 80}]
+    c.register_projection({"status": "RUNNING", "server_epoch": time.time(), "remaining_seconds": 2400, "items": items})
+    sel = c.plan_tasks()["selected"]
+    assert {t["key"] for t in sel if t["type"] == "PI"} == {"PI-02", "PI-03"}
+    assert sum(t["type"] != "PI" for t in sel) == 4          # ordinary capacity unchanged (normal_workers=4)
+    assert len(sel) == 6
+
+
+def _lane_coordinator(tmp_path, monkeypatch):
+    monkeypatch.setenv("MTM_DEADLINE_SLOTS", "3")
+    monkeypatch.setenv("MTM_PI_BURST_SLOTS", "3")
+    repo = tmp_path / "checkout"
+    (repo / "project").mkdir(parents=True)
+    git(repo, "init", "-b", "main")
+    git(repo, "config", "user.email", "t@example.invalid")
+    git(repo, "config", "user.name", "t")
+    (repo / "project" / "a.txt").write_text("a")
+    git(repo, "add", ".")
+    git(repo, "commit", "-m", "base")
+    return NativeTaskCoordinator(tmp_path / "state", repo, repo / "project", "project", "MATCH",
+                                 max_workers=4, normal_workers=3)
+
+
+def test_three_lanes_normal_deadline_pi(tmp_path, monkeypatch):
+    c = _lane_coordinator(tmp_path, monkeypatch)
+    now = time.time()
+    items = [{"key": f"TASK-{i:02d}", "type": "TASK", "status": "OPEN", "points": 10} for i in range(1, 6)]
+    items += [{"key": f"CR-0{i}", "type": "CR", "status": "OPEN", "points": 100, "deadlineMinutes": 20} for i in range(1, 5)]
+    items += [{"key": f"PI-0{i}", "type": "PI", "status": "OPEN", "points": 90} for i in range(1, 5)]
+    c.register_projection({"status": "RUNNING", "server_epoch": now, "remaining_seconds": 2400, "items": items})
+    plan = c.plan_tasks()
+    assert plan["laneSlotsFree"] == {"normal": 3, "deadline": 3, "pi": 3}
+    by_lane = {}
+    for t in plan["selected"]:
+        by_lane.setdefault(t["laneSlot"], []).append(t["key"])
+    assert len(by_lane["pi"]) == 3 and all(k.startswith("PI-") for k in by_lane["pi"])
+    assert len(by_lane["deadline"]) == 3 and all(k.startswith("CR-") for k in by_lane["deadline"])
+    assert len(by_lane["normal"]) == 3                  # 4th PI / 4th CR overflow before ordinary items
+    assert len(plan["selected"]) == 9
+
+
+def test_ordinary_items_never_use_deadline_or_pi_lanes(tmp_path, monkeypatch):
+    monkeypatch.delenv("MTM_LANE_BORROW", raising=False)          # default: no borrowing (3 / 3 / 3 strict)
+    c = _lane_coordinator(tmp_path, monkeypatch)
+    items = [{"key": f"TASK-{i:02d}", "type": "TASK", "status": "OPEN", "points": 10} for i in range(1, 8)]
+    c.register_projection({"status": "RUNNING", "server_epoch": time.time(), "remaining_seconds": 2400, "items": items})
+    sel = c.plan_tasks()["selected"]
+    assert len(sel) == 3 and {t["laneSlot"] for t in sel} == {"normal"}
+    for t in sel:                                        # claiming fills the normal lane
+        c.register_started(t["key"], {"files": {}})
+        c.claim_task(t["key"], t["key"].lower(), 300)
+    assert c.plan_tasks()["laneSlotsFree"] == {"normal": 0, "deadline": 3, "pi": 3}
+
+
+def test_replay_after_another_push_resends_journal_unchanged(native_server, monkeypatch):
+    """Unknown outcome, then another commit lands on the branch: the replay must send the journaled bytes,
+    not re-run Git/guard/auto-heal (which would change the answer or revision and block the item)."""
+    monkeypatch.setenv("MTM_SUBMIT_FAST_REPLAYS", "0")
+    server = native_server
+    finish_worker(server)
+    server.record_worker_result("TASK-01")
+    board, sent = server.adapter, []
+    real = board.submit_work
+
+    def flaky(**kwargs):
+        sent.append(kwargs)
+        if len(sent) == 1:
+            raise TimeoutError("The read operation timed out")
+        return real(**kwargs)
+
+    board.submit_work = flaky
+    with pytest.raises(TimeoutError):
+        server.integrate_and_submit("TASK-01")
+    # another item's commit is pushed meanwhile
+    (server.match_root / "other.txt").write_text("x")
+    git(server.checkout_root, "add", "-A")
+    git(server.checkout_root, "commit", "-m", "other item")
+    git(server.checkout_root, "push", "origin", "main")
+    out = server.integrate_and_submit("TASK-01")
+    assert out["status"] == "ACCEPTED" and len(sent) == 2
+    assert sent[0]["serialized_body_bytes"] == sent[1]["serialized_body_bytes"]
+
+
+def test_422_keeps_item_open_for_one_fix(native_server):
+    class GameMasterError(Exception):
+        def __init__(self, msg, status_code, error_code):
+            super().__init__(msg)
+            self.status_code, self.error_code = status_code, error_code
+    server = native_server
+    finish_worker(server)
+    server.record_worker_result("TASK-01")
+
+    def reject(**kwargs):
+        raise GameMasterError("evidence missing", status_code=422, error_code="VALIDATION_ERROR")
+
+    real = server.adapter.submit_work
+    server.adapter.submit_work = reject
+    with pytest.raises(GameMasterError):
+        server.integrate_and_submit("TASK-01")
+    assert server.native.task_details("TASK-01")["phase"] == "READY_TO_INTEGRATE"   # not CLOSED
+    server.adapter.submit_work = real
+    assert server.integrate_and_submit("TASK-01")["status"] == "ACCEPTED"
+
+def test_bridge_starts_empty_and_keys_cache_by_match(tmp_path, monkeypatch):
+    bridge = tmp_path / "bridge"
+    bridge.mkdir()
+    (bridge / "res-oldmatchresult000.json").write_text('{"ok": true, "result": "stale"}')
+    (bridge / "req-oldmatchrequest00.json").write_text('{"op": "call", "args": {}}')
+    monkeypatch.setenv("MTM_COMPANY_BRIDGE_DIR", str(bridge))
+    root = MCPHelperServer(workspace_root=tmp_path / "ws")
+    root.match_code, root.bearer_token = "NEW1", "t"
+    root.company_tools_client = type("C", (), {"call_tool": lambda self, n, a: {"match": "NEW1"}})()
+    root._ensure_company_bridge()
+    try:
+        assert not list(bridge.glob("res-*")) and not list(bridge.glob("req-*"))
+    finally:
+        root.running = False
+
+
+def test_ordinary_items_borrow_idle_special_slots_keeping_one_free(tmp_path, monkeypatch):
+    """Optional (MTM_LANE_BORROW=1, off by default): ordinary items borrow idle special slots."""
+    monkeypatch.setenv("MTM_LANE_BORROW", "1")
+    c = _lane_coordinator(tmp_path, monkeypatch)
+    items = [{"key": f"TASK-{i:02d}", "type": "TASK", "status": "OPEN", "points": 10} for i in range(1, 10)]
+    c.register_projection({"status": "RUNNING", "server_epoch": time.time(), "remaining_seconds": 2400, "items": items})
+    sel = c.plan_tasks()["selected"]
+    lanes = [t["laneSlot"] for t in sel]
+    assert lanes.count("normal") == 3 and lanes.count("deadline") == 2 and lanes.count("pi") == 2
+    for t in sel:
+        c.register_started(t["key"], {"files": {}})
+        c.claim_task(t["key"], t["key"].lower(), 300)
+    assert c.plan_tasks()["laneSlotsFree"] == {"normal": 0, "deadline": 1, "pi": 1}
+    # the kept slot still takes a PI / a deadline item at once
+    c.register_projection({"status": "RUNNING", "server_epoch": time.time(), "remaining_seconds": 2400,
+                           "items": items + [{"key": "PI-01", "type": "PI", "status": "OPEN", "points": 100},
+                                             {"key": "BUG-09", "type": "BUG", "status": "OPEN", "points": 50,
+                                              "deadline_epoch": time.time() + 1200}]})
+    picked = {t["key"]: t["laneSlot"] for t in c.plan_tasks()["selected"]}
+    assert picked == {"PI-01": "pi", "BUG-09": "deadline"}
