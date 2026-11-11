@@ -87,7 +87,11 @@ class NativeTaskCoordinator:
         #    or the match end is this close;
         #  - finish_margin: a worker's time budget ends this long before the deadline/match end, leaving room for
         #    record + integrate + push + submit.
-        self.flush_seconds = max(30, int(os.environ.get("MTM_DEADLINE_FLUSH_SECONDS", "240") or 240))
+        # Item deadline: cut off 150 s (2.5 min) before the Game Master closes the item (user decision 2026-11-11,
+        # was 240 s). The match end keeps its own, larger margin.
+        self.flush_seconds = max(30, int(os.environ.get("MTM_DEADLINE_FLUSH_SECONDS", "150") or 150))
+        self.match_end_flush_seconds = max(self.flush_seconds,
+                                           int(os.environ.get("MTM_MATCH_END_FLUSH_SECONDS", "240") or 240))
         self.finish_margin = max(self.reserve, self.flush_seconds + 60,
                                  int(os.environ.get("MTM_FINISH_MARGIN_SECONDS", "0") or 0))
         # Idle deadline/PI slots may take ordinary items, always keeping `lane_keep_free` slots open in each
@@ -303,9 +307,11 @@ class NativeTaskCoordinator:
         for row in list(active):
             task = json.loads(row["data"])
             deadline = task.get("deadline_epoch")
-            slack = (min(remaining, float(deadline) - now if deadline is not None else remaining)
-                     if clock_ready else None)
-            if clock_ready and slack is not None and 0 < slack <= self.flush_seconds:
+            item_slack = (float(deadline) - now) if (clock_ready and deadline is not None) else None
+            slack = (min(remaining, item_slack if item_slack is not None else remaining) if clock_ready else None)
+            due = clock_ready and ((item_slack is not None and 0 < item_slack <= self.flush_seconds)
+                                   or (remaining is not None and 0 < remaining <= self.match_end_flush_seconds))
+            if due:
                 key = row["key"]
                 wt = Path(row["worktree"]) / self.repository_folder
                 ans_file = wt / "answers" / key / "submit.json"
@@ -428,7 +434,9 @@ class NativeTaskCoordinator:
                 continue
             deadline = task.get("deadline_epoch")
             slack = min(remaining, float(deadline) - now if deadline is not None else remaining)
-            if slack <= max(self.reserve + 10, self.flush_seconds + 30):
+            item_left = (float(deadline) - now) if deadline is not None else None
+            if (item_left is not None and item_left <= max(self.reserve + 10, self.flush_seconds + 30)) or \
+                    remaining <= max(self.reserve + 10, self.match_end_flush_seconds + 30):
                 continue                      # it would be flushed before a worker could deliver anything
             urgent = self._urgent(task, now)
             estimate = max(10, float(task.get("estimated_seconds", 420)))

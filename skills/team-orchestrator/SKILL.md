@@ -26,7 +26,7 @@ For PREPARE/RESUME, follow `game-preparation`/`team-recovery`. For `START_GAME`,
 
 ## Deadlines (items with `deadlineMinutes`; the clock runs from the item's RELEASE, not from Start Work)
 - A deadline item is worth nothing once the Game Master closes it. Dispatch it the moment it is selected; never queue it behind a running integration you could finish later.
-- When `plan_tasks`/`wait_for_update` reports `deadlineFlushed` (<= 4 min left), the helper has already committed the worker's `answers/<key>` and marked its last commit ready: call `integrate_and_submit(key)` immediately (before anything else), then interrupt that worker. Do not call `record_worker_result` for a flushed item unless the worker has finished after the flush.
+- When `plan_tasks`/`wait_for_update` reports `deadlineFlushed` (about 2.5 min before an item deadline, 4 min before the match end), the helper has already committed the worker's `answers/<key>` and marked its last commit ready: call `integrate_and_submit(key)` immediately (before anything else), then interrupt that worker. Do not call `record_worker_result` for a flushed item unless the worker has finished after the flush.
 - For `overdueWorkers`, checkpoint/interrupt with native tools, confirm the worker stopped, then call `reconcile_worker` before retry/reassignment. Never release a live worker's capacity or discard artifacts.
 
 ## Integration and submission

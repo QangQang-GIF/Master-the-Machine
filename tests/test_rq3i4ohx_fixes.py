@@ -204,8 +204,12 @@ def test_deadline_flush_commits_answers_and_reports_it(native_server, monkeypatc
     match, worker = Path(claim["matchRoot"]), Path(claim["worktreeRoot"])
     (match / "answers/TASK-01").mkdir(parents=True, exist_ok=True)
     (match / "answers/TASK-01/submit.json").write_text(json.dumps({"status": "PARTIAL"}))
-    # 200 s left (<= 240 s flush): the uncommitted answer is committed and the item becomes ready
+    # 200 s before the item deadline: no flush any more (item deadlines flush at 150 s, 2026-11-11)
     server.adapter.items[0]["deadlineEpoch"] = Board.server_epoch + 200
+    server.refresh_match()
+    assert server.native.plan_tasks().get("deadlineFlushed", []) == []
+    # 140 s left (<= 150 s flush): the uncommitted answer is committed and the item becomes ready
+    server.adapter.items[0]["deadlineEpoch"] = Board.server_epoch + 140
     server.refresh_match()
     plan = server.native.plan_tasks()
     assert [r["key"] for r in plan.get("deadlineFlushed", [])] == ["TASK-01"]
@@ -222,9 +226,29 @@ def test_deadline_flush_commits_answers_and_reports_it(native_server, monkeypatc
 
 
 def test_items_too_close_to_their_deadline_are_not_started(native_server):
-    server = _deadline_server(native_server, 200)
+    server = _deadline_server(native_server, 170)          # < 150 s flush + 30 s
     server.refresh_match()
     assert server.native.plan_tasks()["selected"] == []
+
+
+def test_item_with_200_seconds_left_is_still_started(native_server):
+    server = _deadline_server(native_server, 200)
+    server.refresh_match()
+    assert [t["key"] for t in server.native.plan_tasks()["selected"]] == ["TASK-01"]
+
+
+def test_match_end_keeps_the_four_minute_flush(native_server):
+    server = native_server
+    server.start_work("TASK-01")
+    claim = server.claim_task("TASK-01", "worker-01")
+    match = Path(claim["matchRoot"])
+    (match / "answers/TASK-01").mkdir(parents=True, exist_ok=True)
+    (match / "answers/TASK-01/submit.json").write_text(json.dumps({"status": "PARTIAL"}))
+    server.adapter.get_match_projection = lambda _: {"matchUuid": server.match_uuid, "matchCode": "TEST1234",
+                                                     "status": "RUNNING", "remainingSec": 230,
+                                                     "backlogItems": server.adapter.items}
+    server.refresh_match()
+    assert [r["key"] for r in server.native.plan_tasks().get("deadlineFlushed", [])] == ["TASK-01"]
 
 
 # 6. Root output and waiting --------------------------------------------------------------------------------

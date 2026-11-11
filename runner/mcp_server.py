@@ -1819,7 +1819,7 @@ class MCPHelperServer:
                 return True
         except Exception:
             return False
-        return slack is not None and slack <= float(getattr(self.native, "flush_seconds", 240) or 240) + 120
+        return slack is not None and slack <= float(getattr(self.native, "flush_seconds", 150) or 150) + 120
 
     def _write_root_answer(self, key: str, answer: Any) -> None:
         try:

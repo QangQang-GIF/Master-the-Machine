@@ -43,12 +43,14 @@ def test_emergency_cutoff_at_120s(tmp_path):
     wt_2 = Path(claim_2["worktreeRoot"]) / "source"
     (wt_2 / "main.py").write_text("print(2)\n")
 
-    # Run plan_tasks
+    # 60 s later: BUG-01 has 240 s left (> 150 s item flush), BUG-02 has 140 s left (<= 150 s)
+    c.register_projection({"status": "RUNNING", "server_epoch": server_now + 60, "remaining_seconds": 2340,
+                           "items": items})
     plan = c.plan_tasks()
-    
-    # BUG-01 has 300s slack (> 240 s flush) -> stays RUNNING
+
+    # BUG-01 stays RUNNING
     assert c.task_details("BUG-01")["phase"] == "RUNNING"
-    # BUG-02 has 200s slack <= 240s -> auto-promoted to READY_TO_INTEGRATE with the deadline flush
+    # BUG-02 is auto-promoted to READY_TO_INTEGRATE with the deadline flush
     assert c.task_details("BUG-02")["phase"] == "READY_TO_INTEGRATE"
     res = c.task_details("BUG-02")["workerResult"]
     assert res["status"] == "PARTIAL"
