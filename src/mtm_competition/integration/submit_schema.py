@@ -53,18 +53,60 @@ def _pointer(path) -> str:
     return "/" + "/".join(str(p) for p in path) if path else "/"
 
 
-def schema_errors(answer: Any, schema: dict, limit: int = 30) -> List[Dict[str, str]]:
+def _local_ids_removed(node: Any) -> Any:
+    """Drop relative "$id" values. The exam schemas carry "$id": "MTM-26-xxx/KEY-submit.schema.json"; older
+    jsonschema releases then resolve "#/$defs/..." against that id as a URL and raise RefResolutionError
+    (seen with jsonschema 3.2 on the 39PSWT5C schemas). All exam refs are local, so the id is not needed."""
+    if isinstance(node, dict):
+        out = {}
+        for k, v in node.items():
+            if k == "$id" and isinstance(v, str) and ":" not in v.split("/", 1)[0]:
+                continue
+            out[k] = _local_ids_removed(v)
+        return out
+    if isinstance(node, list):
+        return [_local_ids_removed(v) for v in node]
+    return node
+
+
+def _validator(schema: dict):
+    """(validator instance, prepared schema) for the installed jsonschema, or (None, schema)."""
+    import warnings
     try:
+        import jsonschema
         from jsonschema import validators
-    except ImportError:                                   # pragma: no cover - jsonschema ships with the pack
-        return _fallback_errors(answer, schema, schema, [], limit)
-    cls = validators.validator_for(schema)
+    except ImportError:                                   # pragma: no cover
+        return None, schema
+    prepared = _local_ids_removed(schema)
+    declared = str(prepared.get("$schema", ""))
+    cls = None
+    if "2020-12" in declared:
+        cls = getattr(jsonschema, "Draft202012Validator", None)
+    elif "2019-09" in declared:
+        cls = getattr(jsonschema, "Draft201909Validator", None)
+    if cls is None:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            cls = validators.validator_for(prepared, default=getattr(jsonschema, "Draft7Validator", None))
+    if cls is None:
+        return None, prepared
     try:
-        cls.check_schema(schema)
+        cls.check_schema(prepared)
     except Exception:
-        return []                                         # an unusable schema is not the worker's fault
+        return None, prepared
+    return cls(prepared), prepared
+
+
+def schema_errors(answer: Any, schema: dict, limit: int = 30) -> List[Dict[str, str]]:
+    validator, prepared = _validator(schema)
+    if validator is None:
+        return _fallback_errors(answer, prepared, prepared, [], limit)
     out = []
-    for err in sorted(cls(schema).iter_errors(answer), key=lambda e: list(map(str, e.absolute_path))):
+    try:
+        errors = sorted(validator.iter_errors(answer), key=lambda e: list(map(str, e.absolute_path)))
+    except Exception:                                     # ref/format machinery of an old jsonschema
+        return _fallback_errors(answer, prepared, prepared, [], limit)
+    for err in errors:
         out.append({"path": _pointer(err.absolute_path), "keyword": str(err.validator),
                     "message": err.message[:300]})
         if len(out) >= limit:
@@ -205,19 +247,16 @@ def _coerce(value: Any, node: dict, root: dict) -> Any:
 
 def autofill(answer: Any, schema: dict, rounds: int = 8) -> Tuple[Any, List[Dict[str, str]]]:
     """Return (fixed answer, changes). Only locations reported invalid are touched."""
-    try:
-        from jsonschema import validators
-    except ImportError:                                   # pragma: no cover
-        return answer, []
-    cls = validators.validator_for(schema)
-    try:
-        cls.check_schema(schema)
-    except Exception:
+    validator, schema = _validator(schema)
+    if validator is None:
         return answer, []
     doc = copy.deepcopy(answer) if isinstance(answer, dict) else default_for(schema, schema)
     changes: List[Dict[str, str]] = []
     for _ in range(rounds):
-        errors = list(cls(schema).iter_errors(doc))
+        try:
+            errors = list(validator.iter_errors(doc))
+        except Exception:
+            break
         if not errors:
             break
         progressed = False

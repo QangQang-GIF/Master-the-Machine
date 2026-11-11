@@ -221,3 +221,23 @@ def test_mvs_parser_and_worker_check_command(tmp_path):
     report = json.loads(res.stdout)
     assert res.returncode == 1 and report["errors"]
     assert report["mvsEvidence"]["rowsMissingRequiredFile"] == [{"id": "TASK-01-TC-01", "file": "mvs-tests.log"}]
+
+
+def test_exam_schema_with_relative_id_and_defs_refs():
+    """The 39PSWT5C schemas carry "$id": "MTM-26-8VYPR3/KEY-submit.schema.json" and "$ref": "#/$defs/..."; an
+    older jsonschema raised RefResolutionError on them, which would have silently skipped the gate."""
+    from mtm_competition.integration.submit_schema import autofill, schema_errors
+    schema = {"$schema": "https://json-schema.org/draft/2020-12/schema", "$id": "MTM-26-8VYPR3/BUG-11-submit.schema.json",
+              "type": "object", "additionalProperties": False, "required": ["status", "testResults"],
+              "properties": {"status": {"enum": ["DONE", "PARTIAL"]},
+                             "testResults": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/result"}}},
+              "$defs": {"result": {"type": "object", "required": ["id", "result", "evidence"],
+                                   "properties": {"id": {"type": "string"}, "result": {"enum": ["PASS", "FAIL", "NOT_RUN"]},
+                                                  "evidence": {"type": "array", "items": {"$ref": "#/$defs/evidencePath"}}}},
+                        "evidencePath": {"type": "string", "pattern": "^evidence/[^/]+$"}}}
+    good = {"status": "DONE", "testResults": [{"id": "BUG-11-TC-01", "result": "PASS", "evidence": ["evidence/mvs-tests.log"]}]}
+    assert schema_errors(good, schema) == []
+    bad = {"status": "DONE", "testResults": [{"id": "BUG-11-TC-01", "result": "OK"}]}
+    assert {e["keyword"] for e in schema_errors(bad, schema)} >= {"enum", "required"}
+    fixed, _ = autofill(bad, schema)
+    assert schema_errors(fixed, schema) == []
