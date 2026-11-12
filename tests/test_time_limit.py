@@ -40,7 +40,9 @@ def _worker_with_answer(server, answer=None):
 
 def test_no_deadline_item_gets_10_minutes_and_is_submitted_at_the_limit(native_server):
     server = native_server
-    claim, match, worker = _worker_with_answer(server)
+    claim, match, worker = _worker_with_answer(server, {        # not complete: no early submit at 8 min
+        "status": "PARTIAL", "testResults": [{"id": "TC-01", "result": "NOT_RUN", "evidence": []}],
+        "evidenceFiles": []})
     assert claim["taskEnvelope"]["time_budget_seconds"] == 600
     _clock(server, 2400 - 590)
     assert "timeLimitFlushed" not in server.native.plan_tasks()
@@ -149,3 +151,47 @@ def test_deadline_flush_still_wins_when_the_deadline_comes_first(native_server):
     _clock(server, 2400 - 260)
     plan = server.native.plan_tasks()
     assert [r["key"] for r in plan.get("deadlineFlushed", [])] == ["TASK-01"] and "timeLimitFlushed" not in plan
+
+
+# --- Early submit at 8 minutes when the answer is already complete ---------------------------------------
+
+def test_complete_answer_is_submitted_at_8_minutes(native_server):
+    server = native_server
+    claim, match, worker = _worker_with_answer(server)            # DONE, TC-01 PASS with evidence, committed
+    _clock(server, 2400 - 470)
+    assert "timeLimitFlushed" not in server.native.plan_tasks()
+    _clock(server, 2400 - 485)
+    plan = server.native.plan_tasks()
+    assert plan["timeLimitFlushed"][0]["key"] == "TASK-01" and plan["timeLimitFlushed"][0]["early"] is True
+    assert server.integrate_and_submit("TASK-01")["status"] == "ACCEPTED"
+
+
+@pytest.mark.parametrize("answer, uncommitted", [
+    ({"status": "PARTIAL", "testResults": [{"id": "TC-01", "result": "PASS", "evidence": ["evidence/check.txt"]}],
+      "evidenceFiles": []}, False),
+    ({"status": "DONE", "testResults": [{"id": "TC-01", "result": "NOT_RUN", "evidence": []}], "evidenceFiles": []}, False),
+    ({"status": "DONE", "testResults": [{"id": "TC-01", "result": "PASS", "evidence": ["evidence/missing.png"]}],
+      "evidenceFiles": []}, False),
+    (None, True),                                               # complete, but the worker is still writing
+])
+def test_incomplete_answer_keeps_working_until_10_minutes(native_server, answer, uncommitted):
+    server = native_server
+    claim, match, worker = _worker_with_answer(server, answer)
+    if uncommitted:
+        (match / "README.md").write_text("more\n")
+    _clock(server, 2400 - 540)
+    assert "timeLimitFlushed" not in server.native.plan_tasks()
+    if uncommitted:
+        git(worker, "add", "project/README.md")
+        git(worker, "commit", "-m", "more")
+    _clock(server, 2400 - 605)
+    plan = server.native.plan_tasks()
+    assert plan["timeLimitFlushed"][0]["key"] == "TASK-01" and "early" not in plan["timeLimitFlushed"][0]
+
+
+def test_schema_invalid_done_answer_is_not_submitted_early(native_server):
+    server = native_server
+    publish(server, {"challenge/TASK-01-submit.schema.json": json.dumps(SCHEMA)})
+    _worker_with_answer(server)                                   # no auditSummary
+    _clock(server, 2400 - 540)
+    assert "timeLimitFlushed" not in server.native.plan_tasks()
