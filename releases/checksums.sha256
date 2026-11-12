@@ -1,6 +1,6 @@
 71934e924832c5329664af9c5f61acbf5023f504b920d03793130d087f926669  .agents/skills/game-preparation/SKILL.md
 dcca6e20e7b7f48af9925c15fe965612dddd7a305cb354e3db0988f104836ffe  .agents/skills/mtm-bug-worker/SKILL.md
-e326553400e9a81b610315d24d938a8b7a9cca0f75a3eb1d602d118561892208  .agents/skills/mtm-cr-worker/SKILL.md
+b1fce204d225575a7e68d3628c73da65015fe9f9928a3537cd740d4ce1efa3d0  .agents/skills/mtm-cr-worker/SKILL.md
 88cf89f98b211f9876cbbf16888ecb6b761d6d27b20f28f7231f648ad66c25a8  .agents/skills/mtm-evidence/SKILL.md
 0592f2a15a8c8d9a3befabb1e220055bef2df3ce0a6230ae150986851989baa4  .agents/skills/mtm-init/SKILL.md
 9af94d0c8ad4b7a3ea639b8af4697e0f91ecdd609d61ee2e479bd6c9b1874829  .agents/skills/mtm-init/references/competition-rules.md
@@ -12,7 +12,7 @@ b2a89c4c97a33b1bf28fc48d2ee94dddf8124b2099325f54733270cdb16513a4  .agents/skills
 dad3d968301aab614a9a3dd43373c24f79418207251c7ba48ece1a3b2953c1eb  .agents/skills/mtm-pi-worker/SKILL.md
 ef82afd6775da8b55fe094749827d2d8fb872cc0231f0d2c79605bfa9ec0b1e2  .agents/skills/mtm-task-worker/SKILL.md
 9629a1b905b547c04a4fd99c0f0cc25713a1ef22023f991c9f155deb442fde25  .agents/skills/mtm-verification/SKILL.md
-ad8dc7233f69c7ae5ea7396b67b30eaa0ac2a6403b0a81a110a1e69f4a017dea  .agents/skills/mtm-worker/SKILL.md
+7df56e66c4124d0b596b03a362a227f1755581923bdc5ad5256dfdfddf68fda6  .agents/skills/mtm-worker/SKILL.md
 620576b8528964d703fbbb7737ffb320b79b78d3310d62fae35aaeb02a940553  .agents/skills/team-orchestrator/SKILL.md
 fc205500f0bf7da267d5c395c30e0ea8c7efc0051d228ce7d9b73b66da9d16c5  .agents/skills/team-recovery/SKILL.md
 f52634d5c28d649d68dfd104d19fb34d4c4e9d217a39042ba0100b78aab9a46e  agents/team-business-analyst.toml
