@@ -98,6 +98,10 @@ class NativeTaskCoordinator:
         # item goes back to the same worker with the exact errors and `time_limit_grace_seconds` more; at the end
         # of the grace it is flushed like a deadline (gates relaxed). 0 disables the limit.
         self.worker_max_seconds = max(0, int(os.environ.get("MTM_WORKER_MAX_SECONDS", "600") or 0))
+        # Early submit (user decision 2026-11-12): from 8 minutes a worker whose answer is already complete
+        # (status DONE, every row PASS with its evidence on disk, submit schema valid, work committed) is submitted
+        # at once; an incomplete one keeps working up to the 10-minute limit.
+        self.worker_early_seconds = max(0, int(os.environ.get("MTM_WORKER_EARLY_SECONDS", "480") or 0))
         self.time_limit_grace_seconds = max(60, int(os.environ.get("MTM_TIME_LIMIT_GRACE_SECONDS", "300") or 300))
         self.finish_margin = max(self.reserve, self.flush_seconds + 60,
                                  int(os.environ.get("MTM_FINISH_MARGIN_SECONDS", "0") or 0))
@@ -344,15 +348,21 @@ class NativeTaskCoordinator:
             if not (lease.get("time_limited") and clock_ready and lease.get("start_remaining_seconds") is not None):
                 continue
             elapsed = max(0.0, float(lease["start_remaining_seconds"]) - remaining)
-            if elapsed < float(lease.get("budget_seconds", float("inf"))):
-                continue
             key = row["key"]
+            early = False
+            if elapsed < float(lease.get("budget_seconds", float("inf"))):
+                stage1 = int(lease.get("time_limit_stage", 1)) < 2
+                if not (stage1 and self.worker_early_seconds and elapsed >= self.worker_early_seconds
+                        and self._answer_complete(Path(row["worktree"]) / self.repository_folder, key, task)):
+                    continue
+                early = True
             final = int(lease.get("time_limit_stage", 1)) >= 2
             extra = ({"deadline_flush": True, "time_limit_flush": True,
                       "note": f"Time limit + grace used ({int(elapsed)} s): final submit of the last commit"}
                      if final else
                      {"time_limit_flush": True,
-                      "note": f"Time limit used ({int(elapsed)} s): the last commit is submitted"})
+                      "note": (f"Complete answer at {int(elapsed)} s (early submit): the last commit is submitted"
+                               if early else f"Time limit used ({int(elapsed)} s): the last commit is submitted")})
             if not (self._time_limit_ready(Path(row["worktree"]) / self.repository_folder, task, key)
                     and self._flush_to_ready(db, row, task, "time-limit flush", extra)):
                 continue                      # no committed work yet: it keeps working (deadline flush still applies)
@@ -365,6 +375,7 @@ class NativeTaskCoordinator:
             ready.append({**row, "phase": "READY_TO_INTEGRATE", "data": json.dumps(task)})
             response["timeLimitFlushed"].append({
                 "key": key, "workerId": row["worker_id"], "elapsedSeconds": int(elapsed), "final": final,
+                **({"early": True} if early else {}),
                 "requiredAction": (
                     "integrate_and_submit(key, schemaAutofill=true) now; then stop this worker" if final else
                     "integrate_and_submit(key) now. ACCEPTED: stop this worker. Rejected by a gate "
@@ -543,6 +554,43 @@ class NativeTaskCoordinator:
             return True
         except Exception:
             return False
+
+    def _answer_complete(self, wt: Path, key: str, task: dict) -> bool:
+        """The worker's answer is ready to submit as is: its own submit.json says DONE, every testResults row is
+        PASS and cites evidence that exists, the submit schema (when one is published) validates, and the work is
+        committed (see _time_limit_ready). Anything less keeps the worker going to the time limit."""
+        try:
+            answer = json.loads((wt / "answers" / key / "submit.json").read_text(encoding="utf-8-sig"))
+        except (OSError, ValueError):
+            return False
+        if not isinstance(answer, dict) or str(answer.get("status", "")).upper() != "DONE":
+            return False
+        base = wt / "answers" / key
+        for r in answer.get("testResults") or []:
+            if not isinstance(r, dict) or str(r.get("result", "")).upper() != "PASS":
+                return False
+            ev = r.get("evidence") or []
+            ev = [ev] if isinstance(ev, str) else ev
+            if not ev or not all(isinstance(e, str) and (base / e).is_file() for e in ev):
+                return False
+        try:
+            from mtm_competition.integration.submit_schema import find_schema, schema_errors
+            schema, _ = find_schema(wt, key, task.get("start_details") or {})
+            if schema and schema_errors(answer, schema, limit=1):
+                return False
+        except Exception:
+            pass
+        status = subprocess.run(["git", "-C", str(wt), "status", "--porcelain", "--untracked-files=all", "--", "."],
+                                capture_output=True, text=True, timeout=10, check=False)
+        if status.returncode != 0:
+            return False
+        prefix = self.repository_folder.strip("/") + "/"
+        for line in status.stdout.splitlines():
+            path = line[3:].strip().strip('"').split(" -> ")[-1]
+            rel = path[len(prefix):] if path.startswith(prefix) else path
+            if not (rel.startswith("challenge/") or rel == "worker_result.json"):
+                return False                  # something not committed yet: the worker is still writing
+        return self._time_limit_ready(wt, task, key)
 
     def _flush_to_ready(self, db, row: dict, task: dict, label: str, extra: dict) -> bool:
         """Commit the worker's answers/<key> (not half-written source edits) and mark its last commit
@@ -799,6 +847,8 @@ class NativeTaskCoordinator:
                                             "mtm-verification", "mtm-evidence"],
                         "time_budget_seconds": budget,
                         **({"time_limit_rule": (
+                            f"From {self.worker_early_seconds // 60} min, as soon as your committed answer is complete "
+                            f"(submit.json DONE, every row PASS with its evidence, schema valid) the helper submits it. "
                             f"Time limit: after about {budget // 60} min of match time the helper submits your LAST "
                             f"COMMIT (code + answers/{key}). Commit working code, a complete answers/{key}/submit.json "
                             f"and its evidence early (by ~{max(1, budget // 60 - 2)} min). If the submit gates reject it "
@@ -815,6 +865,9 @@ class NativeTaskCoordinator:
                                      "project_runtime_path": str(Path(__file__).resolve().parents[3] / "runner" / "project_runtime.py"),
                                      "submit_schema_check": (f'python "{Path(__file__).resolve().parents[1] / "integration" / "submit_schema.py"}" '
                                                              f'"{worker_match}" {key}'),
+                                     # statement packs / import manifests: order-independence + predicted counts
+                                     "import_pack_check": (f'python "{Path(__file__).resolve().parents[1] / "integration" / "import_pack_check.py"}" '
+                                                           f'<path to manifest.json>'),
                                      "match_id": self.match_id, "worker_id": worker_id,
                                      "submit_template": details.get("submitTemplate"),
                                      "worker_result_path": str(worker_match / "worker_result.json"),
